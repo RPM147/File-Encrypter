@@ -25,7 +25,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Callable, Any
 
-from crypto_core import VaultCrypto, VaultHeader, AuthenticationError, VaultFormatError
+from crypto_core import (
+    VaultCrypto, VaultHeader, AuthenticationError, VaultFormatError,
+    OperationCancelledError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,91 @@ WIPE_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
 # M4 FIX: Hard ceiling on total uncompressed size during extraction to defeat
 # zip bombs (a small archive that expands to fill the disk).
 MAX_EXTRACT_SIZE = 10 * 1024 * 1024 * 1024  # 10 GiB
+
+
+def _raise_if_cancelled(cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise OperationCancelledError("Operation cancelled by user.")
+
+
+# ------------------------------------------------------------------------------
+# ATOMIC VAULT OUTPUT (Phase 6 / SEC-04)
+# ------------------------------------------------------------------------------
+
+def atomic_output(final_path: Path, write_fn: Callable[[Path], None]) -> None:
+    """
+    Phase 6 (SEC-04): write a vault atomically.
+
+    Creates a recognizable temp file IN THE SAME DIRECTORY as ``final_path`` (so the
+    final rename is atomic — ``os.replace`` is only atomic within one filesystem),
+    invokes ``write_fn(temp_path)`` to produce the complete vault, then atomically
+    swaps it onto ``final_path``. If ``write_fn`` raises for ANY reason, the partial
+    temp is removed so nothing is ever left under the real ``.vault`` name.
+
+    The temp is CIPHERTEXT, so a plain unlink is the correct cleanup (no secure wipe).
+    """
+    final_path = Path(final_path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".rpm_vaulttmp_", suffix=".part", dir=str(final_path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        write_fn(tmp_path)                 # caller writes the full vault into tmp_path
+        os.replace(tmp_path, final_path)   # atomic swap on the same volume
+    except BaseException:
+        # Never leave a partial output. The temp is ciphertext → plain unlink
+        # (do NOT secure-wipe and do NOT route through SecureWiper / .rpm_pack_).
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+# DATA-01 (Phase 11): map a flat list of selected files to collision-safe zip
+# arcnames. Unique basenames are kept; colliding ones are prefixed with their
+# sanitized parent-folder name; a numeric suffix is the final guaranteed-unique
+# fallback. Loss-proof: every input maps to a distinct arcname.
+_UNSAFE_NAME_CHARS = set('<>:"/\\|?*') | {chr(c) for c in range(0x20)}
+
+
+def _safe_component(name: str) -> str:
+    """Reduce a folder/file name to one safe path component."""
+    cleaned = "".join("_" if ch in _UNSAFE_NAME_CHARS else ch for ch in (name or ""))
+    return cleaned.strip(" .")
+
+
+def assign_unique_arcnames(paths):
+    """
+    Return a list of (Path, arcname) in the same order as ``paths``.
+
+    Guarantees all arcnames are distinct, preventing zip entry overwrite and
+    data loss when selected files share a basename.
+    """
+    from collections import Counter
+
+    paths = [Path(p) for p in paths]
+    counts = Counter(p.name for p in paths)
+    used = set()
+    result = []
+
+    for p in paths:
+        if counts[p.name] == 1:
+            arc = p.name
+        else:
+            parent = _safe_component(p.parent.name) or "root"
+            arc = f"{parent}_{p.name}"
+
+        candidate = arc
+        i = 1
+        while candidate in used:
+            candidate = f"{Path(arc).stem}_{i}{Path(arc).suffix}"
+            i += 1
+        used.add(candidate)
+        result.append((p, candidate))
+
+    return result
 
 
 # ------------------------------------------------------------------------------
@@ -70,7 +158,7 @@ class SecureWiper:
         """
         self.passes = passes
 
-    def wipe_file(self, path: Path) -> None:
+    def wipe_file(self, path: Path, on_skip: Optional[Callable[[str], None]] = None) -> None:
         """
         Overwrite a single file with random bytes, then delete it.
 
@@ -82,6 +170,20 @@ class SecureWiper:
             5. Close and `unlink()` the file.
         """
         path = Path(path)
+        # Phase 5 (SEC-03): never follow a symlink. Opening it 'r+b' would scribble
+        # random bytes over the TARGET (possibly a file outside the selected folder).
+        # Remove the link itself only; leave the target untouched. is_symlink() uses
+        # lstat, so a broken/dangling link is handled too — do NOT gate this behind
+        # exists() (which follows the link and is False for a broken one).
+        if path.is_symlink():
+            try:
+                path.unlink()
+                logger.warning("Secure-wipe skipped symlink (removed link, target kept): %s", path)
+                if on_skip:
+                    on_skip(f"Skipped symlink (removed link, target kept): {path}")
+            except OSError as exc:
+                logger.error("Failed to unlink symlink %s: %s", path, exc)
+            return
         if not path.exists() or not path.is_file():
             logger.warning("Wipe target does not exist or is not a file: %s", path)
             return
@@ -126,7 +228,7 @@ class SecureWiper:
                 )
                 raise OSError(f"Secure wipe failed for {path}. File remains on disk.")
 
-    def wipe_folder(self, path: Path) -> None:
+    def wipe_folder(self, path: Path, on_skip: Optional[Callable[[str], None]] = None) -> None:
         """
         Recursively wipe all files in a directory tree, then remove directories.
 
@@ -134,29 +236,62 @@ class SecureWiper:
         that still contains files.
         """
         path = Path(path)
+        # Phase 5 (SEC-03): if the folder handle itself is a symlink, remove only the
+        # link and return — never walk into / wipe the target tree (it may live
+        # outside the selected folder). is_symlink() uses lstat, so a broken link is
+        # handled too; do NOT gate behind exists() (which follows the link).
+        if path.is_symlink():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            logger.warning("Secure-wipe skipped symlink folder (removed link, target kept): %s", path)
+            if on_skip:
+                on_skip(f"Skipped symlink folder (removed link, target kept): {path}")
+            return
         if not path.exists():
             return
         if not path.is_dir():
-            self.wipe_file(path)
+            self.wipe_file(path, on_skip=on_skip)
             return
 
-        for file_path in path.rglob('*'):
-            if file_path.is_file():
-                self.wipe_file(file_path)
-
-        dirs = sorted(
-            [p for p in path.rglob('*') if p.is_dir()],
-            key=lambda p: len(p.parts),
-            reverse=True
-        )
-        for dir_path in dirs:
-            try:
-                dir_path.rmdir()
-            except OSError:
-                pass
+        # Phase 5 (SEC-03): walk bottom-up WITHOUT following symlinks. os.walk with
+        # followlinks=False never descends into symlinked subdirs; pathlib.rglob WOULD
+        # descend into them on Python 3.12 (recurse_symlinks=False is 3.13+). Wipe real
+        # files, unlink symlinks (file or dir) without touching their targets, and
+        # rmdir emptied real dirs.
+        for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
+            for fname in files:
+                full = Path(root) / fname
+                if full.is_symlink():
+                    try: full.unlink()
+                    except OSError: pass
+                    logger.warning("Secure-wipe skipped symlink file (removed link, target kept): %s", full)
+                    if on_skip:
+                        on_skip(f"Skipped symlink file (removed link, target kept): {full}")
+                else:
+                    self.wipe_file(full, on_skip=on_skip)
+            for dname in dirs:
+                full = os.path.join(root, dname)
+                if os.path.islink(full):
+                    # Remove the link only, never the target. POSIX: os.unlink removes
+                    # a symlink-to-dir. Windows: os.unlink raises OSError on a directory
+                    # symlink and os.rmdir is required (it STILL removes only the reparse
+                    # point, not the target's contents) — try unlink first, then rmdir.
+                    try:
+                        os.unlink(full)
+                    except OSError:
+                        try: os.rmdir(full)
+                        except OSError: pass
+                    logger.warning("Secure-wipe skipped symlink dir (removed link, target kept): %s", full)
+                    if on_skip:
+                        on_skip(f"Skipped symlink dir (removed link, target kept): {full}")
+                else:
+                    try: os.rmdir(full)
+                    except OSError: pass
 
         try:
-            path.rmdir()
+            os.rmdir(path)
         except OSError:
             pass
 
@@ -181,7 +316,9 @@ class FolderPackager:
         source_path: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         exclude_paths: Optional[List[Path]] = None,
-        compress: bool = False
+        compress: bool = False,
+        on_skip: Optional[Callable[[str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> Path:
         """
         Recursively zip a folder into a temporary archive.
@@ -197,7 +334,7 @@ class FolderPackager:
         if not source_path.is_dir():
             raise ValueError(f"Source must be a directory: {source_path}")
 
-        temp_fd, temp_name = tempfile.mkstemp(suffix='.zip', dir=source_path.parent)
+        temp_fd, temp_name = tempfile.mkstemp(prefix='.rpm_pack_', suffix='.zip', dir=tempfile.gettempdir())
         temp_path = Path(temp_name)
 
         exclude_set = set(Path(p).resolve() for p in (exclude_paths or []))
@@ -206,20 +343,116 @@ class FolderPackager:
             res = p.resolve()
             return any(res == ex or ex in res.parents for ex in exclude_set)
 
-        total_size = sum(
-            f.stat().st_size
-            for f in source_path.rglob('*')
-            if f.is_file() and not is_excluded(f)
-        )
+        # Phase 5 (SEC-03): build the real-file list ONCE with os.walk(followlinks=
+        # False) so the size total and the zip contents can never disagree, and so we
+        # never follow symlinks. rglob would descend into symlinked dirs on Python
+        # 3.12, and is_file() follows a symlinked file. Symlinked files are skipped
+        # and symlinked subdirs are pruned (never recursed into); both are reported.
+        skipped_symlinks: List[Path] = []
+        real_files: List[Path] = []
+        for root, dirs, files in os.walk(source_path, followlinks=False):
+            kept_dirs = []
+            for dname in dirs:
+                full = os.path.join(root, dname)
+                if os.path.islink(full):
+                    skipped_symlinks.append(Path(full))
+                else:
+                    kept_dirs.append(dname)
+            dirs[:] = kept_dirs  # do not descend into symlinked dirs
+            for fname in files:
+                full = Path(root) / fname
+                if full.is_symlink():
+                    skipped_symlinks.append(full)
+                    continue
+                if not is_excluded(full):
+                    real_files.append(full)
+        total_size = sum(f.stat().st_size for f in real_files)
         processed = 0
 
         try:
             with os.fdopen(temp_fd, 'wb') as temp_file:
                 compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
                 with zipfile.ZipFile(temp_file, 'w', compression) as zf:
-                    for file_path in source_path.rglob('*'):
-                        if file_path.is_file() and not is_excluded(file_path):
-                            arcname = str(file_path.relative_to(source_path))
+                    for file_path in real_files:
+                        _raise_if_cancelled(cancel_check)
+                        arcname = str(file_path.relative_to(source_path))
+                        zf.write(file_path, arcname)
+                        processed += file_path.stat().st_size
+                        if progress_callback:
+                            try:
+                                progress_callback(processed, total_size)
+                            except Exception as exc:
+                                logger.warning("Progress callback failed: %s", exc)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            raise
+
+        # Phase 5 (SEC-03): report any skipped symlinks — their targets were NOT
+        # archived (they may point outside the selected folder).
+        for s in skipped_symlinks:
+            logger.warning("Packaging skipped symlink (target NOT archived): %s", s)
+            if on_skip:
+                on_skip(f"Skipped symlink (not archived): {s}")
+
+        logger.info("Packaged folder '%s' -> '%s' (%d bytes)", source_path, temp_path, total_size)
+        return temp_path
+
+    def package_files(
+        self,
+        file_paths: List[Path],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        exclude_paths: Optional[List[Path]] = None,
+        compress: bool = False,
+        on_skip: Optional[Callable[[str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
+    ) -> Path:
+        """
+        Create a zip archive containing multiple individual files.
+
+        Args:
+            file_paths: List of file paths to include.
+            progress_callback: (bytes_processed, total_bytes) -> None
+
+        Returns:
+            Path to the temporary zip file.
+        """
+        if not file_paths:
+            raise ValueError("file_paths cannot be empty")
+
+        temp_fd, temp_name = tempfile.mkstemp(prefix='.rpm_pack_', suffix='.zip', dir=tempfile.gettempdir())
+        temp_path = Path(temp_name)
+
+        # Phase 5 (SEC-03): detect symlinks BEFORE resolve()/exclude (resolve() follows
+        # the link, defeating detection). These are explicit user selections, but we
+        # still must not silently archive an out-of-tree symlink target. DATA-01
+        # (Phase 11): build one ordered real-file list, then assign loss-proof
+        # flat arcnames so duplicate basenames cannot overwrite each other in zip.
+        exclude_set = set(Path(p).resolve() for p in (exclude_paths or []))
+        skipped_symlinks: List[Path] = []
+        selected: List[Path] = []
+        for f in file_paths:
+            f = Path(f)
+            if f.is_symlink():
+                skipped_symlinks.append(f)
+                continue
+            if f.is_file() and f.resolve() not in exclude_set:
+                selected.append(f)
+
+        pairs = assign_unique_arcnames(selected)
+        total_size = sum(f.stat().st_size for f in selected)
+        processed = 0
+
+        try:
+            with os.fdopen(temp_fd, 'wb') as temp_file:
+                compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+                with zipfile.ZipFile(temp_file, 'w', compression) as zf:
+                    for file_path, arcname in pairs:
+                        _raise_if_cancelled(cancel_check)
+                        if file_path.exists() and file_path.is_file():
                             zf.write(file_path, arcname)
                             processed += file_path.stat().st_size
                             if progress_callback:
@@ -235,59 +468,11 @@ class FolderPackager:
                     pass
             raise
 
-        logger.info("Packaged folder '%s' -> '%s' (%d bytes)", source_path, temp_path, total_size)
-        return temp_path
-
-    def package_files(
-        self,
-        file_paths: List[Path],
-        progress_callback: Optional[Callable[[int, int], None]] = None,
-        exclude_paths: Optional[List[Path]] = None,
-        compress: bool = False
-    ) -> Path:
-        """
-        Create a zip archive containing multiple individual files.
-
-        Args:
-            file_paths: List of file paths to include.
-            progress_callback: (bytes_processed, total_bytes) -> None
-
-        Returns:
-            Path to the temporary zip file.
-        """
-        if not file_paths:
-            raise ValueError("file_paths cannot be empty")
-
-        temp_dir = Path(file_paths[0]).parent
-        temp_fd, temp_name = tempfile.mkstemp(suffix='.zip', dir=temp_dir)
-        temp_path = Path(temp_name)
-
-        exclude_set = set(Path(p).resolve() for p in (exclude_paths or []))
-        valid_files = [Path(f) for f in file_paths if Path(f).resolve() not in exclude_set]
-        
-        total_size = sum(f.stat().st_size for f in valid_files if f.is_file())
-        processed = 0
-
-        try:
-            with os.fdopen(temp_fd, 'wb') as temp_file:
-                compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
-                with zipfile.ZipFile(temp_file, 'w', compression) as zf:
-                    for file_path in valid_files:
-                        if file_path.exists() and file_path.is_file():
-                            zf.write(file_path, file_path.name)
-                            processed += file_path.stat().st_size
-                            if progress_callback:
-                                try:
-                                    progress_callback(processed, total_size)
-                                except Exception as exc:
-                                    logger.warning("Progress callback failed: %s", exc)
-        except Exception:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
-            raise
+        # Phase 5 (SEC-03): report any skipped symlinks — their targets were NOT archived.
+        for s in skipped_symlinks:
+            logger.warning("Packaging skipped symlink (target NOT archived): %s", s)
+            if on_skip:
+                on_skip(f"Skipped symlink (not archived): {s}")
 
         logger.info("Packaged %d files -> '%s' (%d bytes)", len(file_paths), temp_path, total_size)
         return temp_path
@@ -318,15 +503,25 @@ class FolderPackager:
                 total_size = source_path.stat().st_size
             source_type = "file"
         elif source_path.is_dir():
-            for file_path in source_path.rglob('*'):
-                if file_path.is_file() and not is_excluded(file_path):
-                    rel_path = str(file_path.relative_to(source_path))
-                    files.append({
-                        "path": rel_path,
-                        "size": file_path.stat().st_size,
-                        "mtime": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
-                    })
-                    total_size += file_path.stat().st_size
+            # Phase 5 (SEC-03): walk WITHOUT following symlinks and skip symlinked
+            # files / prune symlinked dirs, so the manifest matches EXACTLY what
+            # package_folder() archives. The manifest lives in the encrypted metadata
+            # block and is read by the Vault Info / Vault Diff tools; if it listed a
+            # skipped symlink it would describe a file that is not in the archive.
+            for root, dirs, files_in in os.walk(source_path, followlinks=False):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                for fname in files_in:
+                    file_path = Path(root) / fname
+                    if file_path.is_symlink():
+                        continue
+                    if not is_excluded(file_path):
+                        rel_path = str(file_path.relative_to(source_path))
+                        files.append({
+                            "path": rel_path,
+                            "size": file_path.stat().st_size,
+                            "mtime": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+                        })
+                        total_size += file_path.stat().st_size
             source_type = "folder"
         else:
             raise ValueError(f"Source does not exist: {source_path}")
@@ -341,17 +536,29 @@ class FolderPackager:
 
     def get_manifest_multiple(self, file_paths: list, exclude_paths: list = None) -> dict:
         exclude_set = set(Path(p).resolve() for p in (exclude_paths or []))
-        files = []
-        total_size = 0
+        selected: List[Path] = []
         for fp in file_paths:
             fp = Path(fp)
+            # Phase 5 (SEC-03): skip symlinks so the manifest matches what
+            # package_files() archives (it also skips symlinked selections).
+            # DATA-01 (Phase 11): use the same ordered real-file selection as
+            # package_files(), then store the assigned arcname under "path".
+            if fp.is_symlink():
+                continue
             if fp.is_file() and fp.resolve() not in exclude_set:
-                files.append({
-                    "path": fp.name,
-                    "size": fp.stat().st_size,
-                    "mtime": datetime.fromtimestamp(fp.stat().st_mtime).isoformat()
-                })
-                total_size += fp.stat().st_size
+                selected.append(fp)
+
+        pairs = assign_unique_arcnames(selected)
+        files = []
+        total_size = 0
+        for fp, arcname in pairs:
+            files.append({
+                "path": arcname,
+                "size": fp.stat().st_size,
+                "mtime": datetime.fromtimestamp(fp.stat().st_mtime).isoformat(),
+                "original_name": fp.name,
+            })
+            total_size += fp.stat().st_size
         return {
             "file_count": len(files),
             "total_size": total_size,
@@ -364,7 +571,8 @@ class FolderPackager:
         self,
         archive_path: Path,
         output_dir: Path,
-        progress_callback: Optional[Callable[[int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> None:
         """
         Extract a zip archive to the specified output directory.
@@ -386,6 +594,7 @@ class FolderPackager:
         with zipfile.ZipFile(archive_path, 'r') as zf:
             total = len(zf.namelist())
             for idx, member in enumerate(zf.namelist(), 1):
+                _raise_if_cancelled(cancel_check)
                 info = zf.getinfo(member)
 
                 # M4 FIX: Reject archives whose declared uncompressed size exceeds

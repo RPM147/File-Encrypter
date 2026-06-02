@@ -1,0 +1,13 @@
+# Fully pinned runtime dependency closure for reproducible release builds.
+# Generated from the tested environment (Python 3.12.10). Do not edit by hand;
+# regenerate via:  pip install -r requirements.txt && pip freeze > requirements.lock
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0
+cffi==2.0.0
+cryptography==46.0.5
+customtkinter==5.2.2
+darkdetect==0.8.0
+packaging==26.0
+pycparser==3.0
+tkinterdnd2==0.4.3
+zxcvbn==4.5.0

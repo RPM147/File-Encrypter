@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 import struct
 
 from crypto_core import (
-    VAULT_MAGIC, VAULT_VERSION, VaultFormatError, MAX_HEADER_SIZE
+    VAULT_MAGIC, VaultFormatError, MAX_HEADER_SIZE, is_supported_vault_version
 )
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class VaultScanner:
         Extract the limited, non-sensitive metadata available from a vault header
         WITHOUT a password.
 
-        F1/C2 FIX: format v3 keeps the original filename, the full file manifest
+        F1/C2 FIX: current format keeps the original filename, the full file manifest
         AND the true payload size inside an AES-256-GCM block sealed under the
         DEK, NOT in the cleartext header. Without the password the scanner can
         therefore only report the on-disk ``.vault`` name and the (cleartext)
@@ -49,37 +49,47 @@ class VaultScanner:
             if magic != VAULT_MAGIC:
                 raise VaultFormatError("Invalid vault magic bytes")
 
-            (version,) = struct.unpack("!B", f.read(1))
-            if version != VAULT_VERSION:
+            version_data = f.read(1)
+            if len(version_data) != 1:
+                raise VaultFormatError("Vault file truncated: missing version byte.")
+            (version,) = struct.unpack("!B", version_data)
+            if not is_supported_vault_version(version):
                 raise VaultFormatError(f"Unsupported vault version: {version}")
 
-            (header_len,) = struct.unpack("!I", f.read(4))
+            header_len_data = f.read(4)
+            if len(header_len_data) != 4:
+                raise VaultFormatError("Vault file truncated: missing header length.")
+            (header_len,) = struct.unpack("!I", header_len_data)
             # M1 FIX: Bound the attacker-controlled header length before reading.
             # Without this, a malicious/corrupted vault declaring a multi-gigabyte
             # header would make the background scan allocate gigabytes and crash.
             if header_len > MAX_HEADER_SIZE:
                 raise VaultFormatError(f"Vault header length ({header_len}) exceeds maximum allowed size")
             header_json_bytes = f.read(header_len)
+            if len(header_json_bytes) != header_len:
+                raise VaultFormatError("Vault file truncated: header block incomplete.")
 
-            header_dict = json.loads(header_json_bytes.decode('utf-8'))
+            try:
+                header_dict = json.loads(header_json_bytes.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise VaultFormatError(f"Invalid vault header JSON: {exc}") from exc
             payload = header_dict.get("payload", {})
 
-            # F1/C2 FIX: v3 vaults expose no filenames, manifests, timestamps, or
+            # F1/C2 FIX: supported vaults expose no filenames, manifests, timestamps, or
             # true payload size in the cleartext header. Do NOT attempt to read
             # them — return a generic, locked entry. The only cleartext size is
             # the bucketed container_size, reported under its own key. The Library
             # still has a stale-cache fallback for older cache entries.
-            if version == 3:
-                try:
-                    container_size = int(payload.get("container_size", 0))
-                except (TypeError, ValueError):
-                    container_size = 0
-                return {
-                    "filename": path.name,  # Only the .vault file name on disk is known
-                    "container_size": container_size,  # = bucketed size; no real-size leak
-                    "source_type": "Encrypted Metadata",
-                    "created_at": "Requires Password",
-                }
+            try:
+                container_size = int(payload.get("container_size", 0))
+            except (TypeError, ValueError):
+                container_size = 0
+            return {
+                "filename": path.name,  # Only the .vault file name on disk is known
+                "container_size": container_size,  # = bucketed size; no real-size leak
+                "source_type": "Encrypted Metadata",
+                "created_at": "Requires Password",
+            }
 
     def scan_directories(self, directories: List[str]) -> List[Dict[str, Any]]:
         """

@@ -1,0 +1,28 @@
+# Project metadata and tooling config for RPM Encrypter.
+#
+# RPM Encrypter is distributed as a PyInstaller executable, NOT as a pip-installable
+# wheel, so no build-system table or build backend is configured. Runtime dependencies are
+# declared with loose floors here for humans; the EXACT, reproducible versions used to
+# build a release live in requirements.lock.
+
+[project]
+name = "rpm-encrypter"
+version = "3.0.0"
+description = "Local-only desktop file encryption (AES-256-GCM + Argon2id) with a CustomTkinter GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "RPM Encrypter maintainers" }]
+dependencies = [
+    "customtkinter>=5.2.2",
+    "argon2-cffi>=23.1.0",
+    "cryptography>=41.0.3",
+    "tkinterdnd2>=0.3.0",
+    "zxcvbn>=4.4.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

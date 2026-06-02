@@ -60,7 +60,20 @@ logger = logging.getLogger(__name__)
 
 # Vault file format identifiers
 VAULT_MAGIC = b'RPMV'      # 4-byte magic for file type identification
-VAULT_VERSION = 3          # Format v3: universal padding / size bucketing (no v2 compatibility)
+VAULT_VERSION = 4          # On-disk vault format version this app writes.
+
+# Vault compatibility policy (COMPAT-01): this application reads and writes
+# ONLY format v4. Earlier development formats (v1/v2/v3) were never released and
+# are NOT supported; any other version byte is rejected cleanly as unsupported.
+# This frozenset + helper are the SINGLE SOURCE OF TRUTH for version support;
+# every reader (crypto_core._read_header, vault_scanner, the GUI integrity
+# check) gates on is_supported_vault_version().
+SUPPORTED_VAULT_VERSIONS = frozenset({VAULT_VERSION})
+
+
+def is_supported_vault_version(version: int) -> bool:
+    """Single source of truth for vault-version support (policy: v4 only)."""
+    return version in SUPPORTED_VAULT_VERSIONS
 
 # AES-256-GCM constants
 AES_KEY_SIZE = 32          # 256 bits (32 bytes)
@@ -73,6 +86,22 @@ ARGON2_TIME_COST = 3       # 3 iterations
 ARGON2_PARALLELISM = 4     # 4 parallel lanes
 ARGON2_HASH_LENGTH = 32      # 256-bit KEK output
 
+# ------------------------------------------------------------------------------
+# KDF PARAMETER BOUNDS (Phase 7 / SEC-05)
+# ------------------------------------------------------------------------------
+# Attacker-controlled Argon2 parameters from a vault header are validated against
+# this policy BEFORE any derivation, to prevent a denial-of-service (e.g. a vault
+# demanding tens of GiB of memory). The range is deliberately WIDER than the
+# Settings UI offers (16 MiB-512 MiB / 1-10 / 1-16) and also accepts the fast test
+# fixture (8 MiB / 1 / 1), so the app can always open any vault it could create.
+MIN_ARGON2_MEMORY      = 8192            # 8 MiB  (KiB) - fast_crypto floor; rejects tiny/0/neg
+MAX_ARGON2_MEMORY      = 4 * 1024 * 1024 # 4 GiB  (KiB) - well above the 512 MiB UI max; rejects OOM/DoS
+MIN_ARGON2_TIME        = 1               # Argon2 floor; UI + fast fixture min
+MAX_ARGON2_TIME        = 64              # generous over the UI max of 10
+MIN_ARGON2_PARALLELISM = 1               # Argon2 floor; UI + fast fixture min
+MAX_ARGON2_PARALLELISM = 64              # generous over the UI max of 16
+# Hash length is pinned to exactly AES_KEY_SIZE (32) in _validate_kdf_params.
+
 # Streaming chunk size: 1 MiB is optimal for modern SSD/NVMe
 CHUNK_SIZE = 1 * 1024 * 1024  # 1048576 bytes
 
@@ -82,6 +111,18 @@ MAX_HEADER_SIZE = 1048576  # 1 MiB sanity limit
 MAX_FILENAME_LEN = 255
 MAX_METADATA_FIELDS = 100
 MAX_FIELD_VALUE_LEN = 10000
+
+# ------------------------------------------------------------------------------
+# MAX PAYLOAD SIZE (Phase 8 / SEC-06)
+# ------------------------------------------------------------------------------
+# A single AES-256-GCM stream (96-bit nonce -> 32-bit counter) can safely cover at
+# most 2^36 bytes = 64 GiB of plaintext before the counter wraps and keystream is
+# reused. The v4 format encrypts each payload as ONE GCM stream, so we cap the
+# plaintext payload at 32 GiB -- exactly half the structural ceiling (2x margin).
+# This bounds the PLAINTEXT (original_size); trailing random padding up to
+# container_size is NOT part of the GCM stream and is unaffected. Larger files are
+# a future chunked-AEAD concern.
+MAX_PAYLOAD_SIZE = 32 * 1024 * 1024 * 1024  # 32 GiB
 
 # ------------------------------------------------------------------------------
 # CUSTOM EXCEPTIONS
@@ -103,9 +144,24 @@ class AuthenticationError(CryptoError):
     pass
 
 
+class PayloadTooLargeError(CryptoError):
+    """Raised when a payload exceeds the single-stream AES-GCM size policy."""
+    pass
+
+
+class OperationCancelledError(CryptoError):
+    """Raised when a long operation is cancelled mid-stream by the user."""
+    pass
+
+
 class VaultFormatError(CryptoError):
     """Raised when the vault file structure is invalid or unsupported."""
     pass
+
+
+def _raise_if_cancelled(cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise OperationCancelledError("Operation cancelled by user.")
 
 
 # ------------------------------------------------------------------------------
@@ -120,6 +176,11 @@ class KDFParams:
     Storing these alongside the salt ensures that future versions of the
     application can always reconstruct the KEK with the exact same parameters
     that were used during vault creation.
+
+    Phase 2 deniability note: ``hidden_salt`` is always populated. For
+    hidden-bearing vaults it is the real hidden KEK salt; for normal vaults it
+    is a random probe salt so the cleartext header shape does not reveal
+    hidden-vault existence.
     """
     algorithm: str = "Argon2id"
     salt: str = ""           # base64-encoded random salt (minimum 256 bits)
@@ -127,8 +188,7 @@ class KDFParams:
     iterations: int = ARGON2_TIME_COST
     parallelism: int = ARGON2_PARALLELISM
     length: int = ARGON2_HASH_LENGTH
-    hidden_salt: str = ""    # F2 FIX: base64-encoded independent random salt for the hidden vault KEK
-                             # (mirrors the recovery_salt pattern; "" for vaults without a hidden compartment)
+    hidden_salt: str = ""    # base64 hidden-trial salt; real for hidden vaults, random probe for normal vaults
 
 
 @dataclass
@@ -142,7 +202,7 @@ class EnvelopeParams:
     algorithm: str = "AES-256-GCM"
     dek_nonce: str = ""      # base64-encoded 12-byte nonce
     encrypted_dek: str = ""  # base64-encoded ciphertext + 16-byte auth tag
-    recovery_salt: str = ""  # base64-encoded independent salt for the recovery KEK ("" = legacy vault)
+    recovery_salt: str = ""  # base64-encoded independent salt for the recovery KEK
 
 
 @dataclass
@@ -159,7 +219,7 @@ class PayloadParams:
     ``VaultHeader.encrypted_meta_nonce``), so the cleartext header leaks neither
     the original name nor the file manifest.
 
-    C2 FIX (format v3): ``original_size`` is ALSO removed from the cleartext
+    C2 FIX (format v4): ``original_size`` is ALSO removed from the cleartext
     header -- the true payload size is a deniability/size-leak vector, so it now
     lives ONLY inside the encrypted metadata block. The cleartext header instead
     carries ``container_size``: the bucketed, padded on-disk file size (a value
@@ -329,176 +389,57 @@ def mnemonic_to_entropy(mnemonic: str) -> bytes:
         
     return entropy
 
-# ------------------------------------------------------------------------------
-# CORE CRYPTOGRAPHIC ENGINE
-# ------------------------------------------------------------------------------
 
-class VaultCrypto:
+def _validate_kdf_params(kdf: "KDFParams") -> None:
     """
-    High-level, thread-safe cryptographic engine for RPM Vault operations.
-
-    All public methods are stateless with respect to the vault payload, making
-    this class safe to share across multiple background worker threads in a GUI.
-
-    Usage:
-        crypto = VaultCrypto()
-
-        # Encrypt
-        with open('archive.zip', 'rb') as src, open('data.vault', 'wb') as dst:
-            crypto.encrypt_stream(src, dst, password="Secret123!", ...)
-
-        # Decrypt
-        with open('data.vault', 'rb') as src, open('restored.zip', 'wb') as dst:
-            crypto.decrypt_stream(src, dst, password="Secret123!", ...)
+    Phase 7 (SEC-05): reject attacker-controlled Argon2 parameters that are
+    non-integer, out of policy, or absurd, BEFORE any derivation. Raises
+    VaultFormatError (a safe, already-UI-surfaced error). Does not leak
+    secrets: these values are cleartext header fields.
     """
+    def _check_int(name: str, value, lo: int, hi: int) -> None:
+        # bool is a subclass of int -- reject it explicitly (a JSON `true`
+        # would otherwise sneak through as 1).
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise VaultFormatError(
+                f"Vault rejected: Argon2 {name} is not an integer "
+                f"({value!r}). The file is malformed or tampered."
+            )
+        if value < lo or value > hi:
+            raise VaultFormatError(
+                f"Vault rejected: Argon2 {name} ({value}) is outside the "
+                f"allowed range [{lo}, {hi}]. Refusing to derive keys to "
+                f"avoid resource exhaustion."
+            )
 
-    # --- Hidden Vault Constants ---
-    HIDDEN_SALT_SUFFIX = b"RPM_HIDDEN_SALT"
-    HIDDEN_OFFSET_MSG = b"RPM_OFFSET"
-    HIDDEN_MINI_HEADER_SIZE = 512
-    HIDDEN_MINI_HEADER_CIPHERTEXT_SIZE = 512 + 16  # 512 + 16 byte tag
-    HIDDEN_MINI_HEADER_NONCE_SIZE = 12
-    HIDDEN_TOTAL_HEADER_BYTES = 12 + 512 + 16
-
-    def __init__(
-        self,
-        argon_memory: int = ARGON2_MEMORY_COST,
-        argon_iterations: int = ARGON2_TIME_COST,
-        argon_parallelism: int = ARGON2_PARALLELISM
-    ):
-        """
-        Initialize the crypto engine with configurable Argon2id parameters.
-
-        Args:
-            argon_memory: Memory cost in KiB (e.g., 65536 = 64 MiB).
-            argon_iterations: Time cost (number of passes over memory).
-            argon_parallelism: Number of parallel threads (lanes).
-        """
-        self.argon_memory = argon_memory
-        self.argon_iterations = argon_iterations
-        self.argon_parallelism = argon_parallelism
-
-    # --------------------------------------------------------------------------
-    # Internal Helpers
-    # --------------------------------------------------------------------------
-
-    @staticmethod
-    def _secure_random(size: int) -> bytes:
-        """
-        Generate cryptographically secure random bytes.
-
-        Uses `os.urandom`, which draws from the operating system's CSPRNG
-        (/dev/urandom on Unix, CryptGenRandom on Windows, getentropy where
-        available). This is suitable for generating keys, salts, and nonces.
-        """
-        return os.urandom(size)
-
-    @staticmethod
-    def _calculate_container_size(total_size: int, min_container_mb: int = 0) -> int:
-        """
-        C2 FIX: Snap a vault's on-disk size to a coarse, shared "ladder" so the
-        file length leaks (almost) nothing about the true payload size and all
-        vaults of a similar magnitude look identical.
-
-        Args:
-            total_size: The FULL pre-padding on-disk size
-                (MAGIC + version + header-length field + header JSON +
-                meta-length prefix + encrypted-metadata block + payload + tag).
-            min_container_mb: Optional floor in MiB (the user's explicit
-                "Container Size" choice; 0 = "Auto" / no floor).
-
-        Returns:
-            The bucketed container size in bytes (>= total_size and >= the
-            floor). The result is idempotent: feeding a ladder value back in
-            returns that same value.
-        """
-        min_bytes = min_container_mb * 1024 * 1024
-        target = max(total_size, min_bytes)
-
-        # For very large files (> 10 GiB) use fixed 1 GiB steps to bound absolute waste.
-        if target > 10 * 1024 * 1024 * 1024:
-            gb = 1024 * 1024 * 1024
-            return ((target + gb - 1) // gb) * gb
-
-        # Multiplicative ladder (1.25x). Minimum bucket = 1 MiB.
-        bucket = 1 * 1024 * 1024
-        while bucket < target:
-            bucket = int(math.ceil(bucket * 1.25))
-        return bucket
-
-    def _derive_kek(
-        self,
-        password: str,
-        salt: bytes,
-        memory_cost: Optional[int] = None,
-        time_cost: Optional[int] = None,
-        parallelism: Optional[int] = None,
-        hash_len: Optional[int] = None,
-    ) -> bytes:
-        """
-        Derive the Key Encryption Key (KEK) from a user password and salt.
-
-        We use the low-level `hash_secret_raw` API to obtain raw bytes suitable
-        for direct use as an AES-256 key, rather than the high-level
-        `PasswordHasher` which embeds parameters into an ASCII hash string.
-
-        Args:
-            password:     Plaintext user password.
-            salt:         Unique per-vault salt (minimum 32 bytes).
-            memory_cost:  Argon2 memory in KiB. If None, uses self.argon_memory.
-            time_cost:    Argon2 iterations. If None, uses self.argon_iterations.
-            parallelism:  Argon2 lanes. If None, uses self.argon_parallelism.
-            hash_len:     Output key length in bytes. If None, uses ARGON2_HASH_LENGTH.
-
-        Returns:
-            KEK of length `hash_len` bytes.
-        """
-        kek = argon2.low_level.hash_secret_raw(
-            secret=password.encode('utf-8'),
-            salt=salt,
-            memory_cost=memory_cost if memory_cost is not None else self.argon_memory,
-            time_cost=time_cost     if time_cost    is not None else self.argon_iterations,
-            parallelism=parallelism if parallelism  is not None else self.argon_parallelism,
-            hash_len=hash_len       if hash_len     is not None else ARGON2_HASH_LENGTH,
-            type=argon2.Type.ID
+    _check_int("memory", kdf.memory, MIN_ARGON2_MEMORY, MAX_ARGON2_MEMORY)
+    _check_int("iterations", kdf.iterations, MIN_ARGON2_TIME, MAX_ARGON2_TIME)
+    _check_int(
+        "parallelism",
+        kdf.parallelism,
+        MIN_ARGON2_PARALLELISM,
+        MAX_ARGON2_PARALLELISM
+    )
+    if kdf.length != AES_KEY_SIZE:
+        raise VaultFormatError(
+            f"Vault rejected: KDF hash length is {kdf.length} bytes "
+            f"(expected exactly {AES_KEY_SIZE})."
         )
-        return kek
 
-    @staticmethod
-    def _encrypt_dek(dek: bytes, kek: bytes) -> Tuple[bytes, bytes]:
-        """
-        Encrypt the DEK using AES-256-GCM with the KEK.
 
-        Args:
-            dek: 32-byte Data Encryption Key.
-            kek: 32-byte Key Encryption Key.
+# ------------------------------------------------------------------------------
+# VAULT HEADER I/O  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+# ------------------------------------------------------------------------------
 
-        Returns:
-            Tuple of (nonce, ciphertext_with_tag).
-        """
-        nonce = VaultCrypto._secure_random(AES_NONCE_SIZE)
-        aesgcm = AESGCM(kek)
-        ciphertext = aesgcm.encrypt(nonce, dek, None)
-        return nonce, ciphertext
-
-    @staticmethod
-    def _decrypt_dek(encrypted_dek: bytes, nonce: bytes, kek: bytes) -> bytes:
-        """
-        Decrypt the DEK. Raises AuthenticationError on any integrity failure.
-        """
-        aesgcm = AESGCM(kek)
-        try:
-            dek = aesgcm.decrypt(nonce, encrypted_dek, None)
-        except InvalidTag:
-            raise AuthenticationError(
-                "DEK decryption failed: invalid password or corrupted vault envelope."
-            )
-        if len(dek) != AES_KEY_SIZE:
-            raise AuthenticationError(
-                f"DEK has unexpected length {len(dek)} (expected {AES_KEY_SIZE}). "
-                f"Vault envelope is corrupted."
-            )
-        return dek
+class HeaderMixin:
+    """
+    Stateless vault-header parsing/validation, split out of VaultCrypto
+    (Phase 27 ARCH-02). Holds ONLY @staticmethods -- no instance state and no
+    __init__ -- so it composes into VaultCrypto purely via the MRO without
+    affecting construction or the M2 derivation path. Every existing caller
+    (`self._read_header(...)`, `VaultCrypto._read_header(...)`) resolves here
+    unchanged.
+    """
 
     @staticmethod
     def _read_header(input_stream: BinaryIO) -> Tuple[VaultHeader, int]:
@@ -522,10 +463,10 @@ class VaultCrypto:
         if len(version_data) != 1:
             raise VaultFormatError("Vault file truncated: missing version byte.")
         (version,) = struct.unpack('!B', version_data)
-        if version != VAULT_VERSION:
+        if not is_supported_vault_version(version):
             raise VaultFormatError(
-                f"Unsupported vault version {version}. "
-                f"This application supports version {VAULT_VERSION}."
+                f"Unsupported vault version {version}. This application supports "
+                f"vault format version(s): {sorted(SUPPORTED_VAULT_VERSIONS)}."
             )
 
         header_len_data = input_stream.read(4)
@@ -588,12 +529,7 @@ class VaultCrypto:
                 f"(expected {AES_NONCE_SIZE})."
             )
 
-        if header.kdf.length != AES_KEY_SIZE:
-            raise VaultFormatError(
-                f"KDF hash_len in header is {header.kdf.length} bytes "
-                f"(expected exactly {AES_KEY_SIZE}). "
-                f"This may indicate a tampered or malformed vault."
-            )
+        _validate_kdf_params(header.kdf)
 
         payload_offset = input_stream.tell()
         return header, payload_offset
@@ -656,9 +592,162 @@ class VaultCrypto:
             raise VaultFormatError(f"Invalid encrypted metadata block: {exc}") from exc
         return meta_dict, offset + 4 + meta_len
 
-    # --------------------------------------------------------------------------
-    # Public API: Encryption
-    # --------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# DEK ENVELOPE  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+# ------------------------------------------------------------------------------
+
+class EnvelopeMixin:
+    """
+    Stateless DEK-envelope helpers, split out of VaultCrypto (Phase 27 ARCH-02).
+    AES-256-GCM wrap/unwrap of the Data Encryption Key under an already-derived
+    Key Encryption Key. Holds ONLY @staticmethods -- no instance state and no
+    __init__ -- so it composes into VaultCrypto purely via the MRO. These are
+    NOT key-derivation methods (no Argon2), so they carry no M2 surface. Note
+    `_encrypt_dek` deliberately calls `VaultCrypto._secure_random(...)` by class
+    name; `_secure_random` remains a VaultCrypto @staticmethod.
+    """
+
+    @staticmethod
+    def _encrypt_dek(dek: bytes, kek: bytes) -> Tuple[bytes, bytes]:
+        """
+        Encrypt the DEK using AES-256-GCM with the KEK.
+
+        Args:
+            dek: 32-byte Data Encryption Key.
+            kek: 32-byte Key Encryption Key.
+
+        Returns:
+            Tuple of (nonce, ciphertext_with_tag).
+        """
+        nonce = VaultCrypto._secure_random(AES_NONCE_SIZE)
+        aesgcm = AESGCM(kek)
+        ciphertext = aesgcm.encrypt(nonce, dek, None)
+        return nonce, ciphertext
+
+    @staticmethod
+    def _decrypt_dek(encrypted_dek: bytes, nonce: bytes, kek: bytes) -> bytes:
+        """
+        Decrypt the DEK. Raises AuthenticationError on any integrity failure.
+        """
+        aesgcm = AESGCM(kek)
+        try:
+            dek = aesgcm.decrypt(nonce, encrypted_dek, None)
+        except InvalidTag:
+            raise AuthenticationError(
+                "DEK decryption failed: invalid password or corrupted vault envelope."
+            )
+        if len(dek) != AES_KEY_SIZE:
+            raise AuthenticationError(
+                f"DEK has unexpected length {len(dek)} (expected {AES_KEY_SIZE}). "
+                f"Vault envelope is corrupted."
+            )
+        return dek
+
+
+# ------------------------------------------------------------------------------
+# KEY DERIVATION  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+#
+# M2: these are the TWO Argon2 derivations performed on every unlock (main KEK,
+# then hidden KEK). They are relocated verbatim; the call SEQUENCE and COUNT in
+# decrypt_stream are unchanged. The hidden-KEK dummy-salt branch preserves
+# constant work whether or not a hidden vault exists.
+# ------------------------------------------------------------------------------
+
+class DerivationMixin:
+    """
+    Argon2id key-derivation, split out of VaultCrypto (Phase 27 ARCH-02).
+    Holds the two M2-counted derivations as INSTANCE methods (they compose into
+    VaultCrypto via the MRO; `_derive_kek` reads self.argon_* on the VaultCrypto
+    instance). No __init__. Bodies are byte-identical to the originals so the M2
+    constant-work invariant (exactly two derivations per unlock, fixed order) is
+    untouched.
+    """
+
+    def _derive_kek(
+        self,
+        password: str,
+        salt: bytes,
+        memory_cost: Optional[int] = None,
+        time_cost: Optional[int] = None,
+        parallelism: Optional[int] = None,
+        hash_len: Optional[int] = None,
+    ) -> bytes:
+        """
+        Derive the Key Encryption Key (KEK) from a user password and salt.
+
+        We use the low-level `hash_secret_raw` API to obtain raw bytes suitable
+        for direct use as an AES-256 key, rather than the high-level
+        `PasswordHasher` which embeds parameters into an ASCII hash string.
+
+        Args:
+            password:     Plaintext user password.
+            salt:         Unique per-vault salt (minimum 32 bytes).
+            memory_cost:  Argon2 memory in KiB. If None, uses self.argon_memory.
+            time_cost:    Argon2 iterations. If None, uses self.argon_iterations.
+            parallelism:  Argon2 lanes. If None, uses self.argon_parallelism.
+            hash_len:     Output key length in bytes. If None, uses ARGON2_HASH_LENGTH.
+
+        Returns:
+            KEK of length `hash_len` bytes.
+        """
+        kek = argon2.low_level.hash_secret_raw(
+            secret=password.encode('utf-8'),
+            salt=salt,
+            memory_cost=memory_cost if memory_cost is not None else self.argon_memory,
+            time_cost=time_cost     if time_cost    is not None else self.argon_iterations,
+            parallelism=parallelism if parallelism  is not None else self.argon_parallelism,
+            hash_len=hash_len       if hash_len     is not None else ARGON2_HASH_LENGTH,
+            type=argon2.Type.ID
+        )
+        return kek
+
+    def _derive_hidden_kek(self, password: str, main_header_kdf: KDFParams) -> bytes:
+        """
+        Derive the hidden-vault KEK exactly once using the visible header's KDF
+        parameters.
+
+        M2 FIX: every password unlock path must perform two Argon2 derivations.
+        Normal vaults carry a random probe hidden_salt too, so a non-empty
+        value is not proof of hidden data. If a malformed current-format header
+        leaves it empty, derive over a deterministic dummy salt so the M2
+        constant-work invariant is still preserved.
+        """
+        try:
+            if main_header_kdf.hidden_salt:
+                hidden_salt_bytes = base64.b64decode(main_header_kdf.hidden_salt)
+            else:
+                main_salt = base64.b64decode(main_header_kdf.salt)
+                hidden_salt_bytes = hashlib.sha256(
+                    main_salt + b"RPM_DUMMY_HIDDEN_SALT"
+                ).digest()
+
+            return argon2.low_level.hash_secret_raw(
+                secret=password.encode('utf-8'),
+                salt=hidden_salt_bytes,
+                time_cost=main_header_kdf.iterations,
+                memory_cost=main_header_kdf.memory,
+                parallelism=main_header_kdf.parallelism,
+                hash_len=main_header_kdf.length,
+                type=argon2.Type.ID
+            )
+        except Exception as exc:
+            raise AuthenticationError("Failed to derive hidden KEK") from exc
+
+
+# ------------------------------------------------------------------------------
+# STANDARD VAULT  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+# Stage 4a/4b: encrypt_stream + decrypt_stream (the M2 orchestrator).
+# ------------------------------------------------------------------------------
+
+class StandardVaultMixin:
+    """
+    Standard (non-hidden) vault stream encryption AND decryption, split out of VaultCrypto
+    (Phase 27 ARCH-02). INSTANCE method that composes into VaultCrypto via the
+    MRO; it reads self.argon_* and calls self._secure_random / self._derive_kek
+    / self._encrypt_dek / self._calculate_container_size, all resolved on the
+    VaultCrypto instance. No __init__.
+    """
 
     def encrypt_stream(
         self,
@@ -670,10 +759,11 @@ class VaultCrypto:
         metadata: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         recovery_key: Optional[bytes] = None,
-        hidden_salt: str = "",
+        hidden_salt: Optional[str] = None,
         target_container_mb: int = 0,
         apply_padding: bool = True,
-        forced_container_size: Optional[int] = None
+        forced_container_size: Optional[int] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> VaultHeader:
         """
         Encrypt a binary stream into the RPM Vault format.
@@ -701,8 +791,10 @@ class VaultCrypto:
             metadata: Optional dict with file manifest, timestamps, etc.
             progress_callback: Optional callable(bytes_processed, total_bytes)
                 for GUI progress bars. Called after every chunk.
-            hidden_salt: base64 independent salt for a hidden compartment (F2);
-                "" for normal vaults.
+            hidden_salt: Optional base64 hidden-trial salt. If None or empty,
+                generate a fresh random probe salt for a normal vault. If
+                non-empty, preserve it exactly (hidden-vault writer passes the
+                real hidden KEK salt here).
             target_container_mb: Minimum container size in MiB the user requested
                 (0 = "Auto"). The final size is bucketed to the 1.25x ladder.
             apply_padding: If True, write trailing random padding up to
@@ -715,9 +807,22 @@ class VaultCrypto:
         original_filename = sanitize_filename(original_filename)
         metadata = sanitize_metadata(metadata)
 
+        if original_size > MAX_PAYLOAD_SIZE:
+            raise PayloadTooLargeError(
+                f"Payload is {original_size:,} bytes, which exceeds the "
+                f"{MAX_PAYLOAD_SIZE:,} byte (32 GiB) limit of the single-stream "
+                f"AES-GCM vault format. Encrypt a smaller selection or split the data."
+            )
+
         salt = self._secure_random(MIN_SALT_SIZE)
         dek = self._secure_random(AES_KEY_SIZE)
         payload_nonce = self._secure_random(AES_NONCE_SIZE)
+        if hidden_salt:
+            b64_hidden_salt = hidden_salt
+        else:
+            b64_hidden_salt = base64.b64encode(
+                self._secure_random(MIN_SALT_SIZE)
+            ).decode('ascii')
 
         kek = self._derive_kek(password, salt)
         dek_nonce, encrypted_dek = self._encrypt_dek(dek, kek)
@@ -770,7 +875,7 @@ class VaultCrypto:
                     memory=self.argon_memory,
                     iterations=self.argon_iterations,
                     parallelism=self.argon_parallelism,
-                    hidden_salt=hidden_salt
+                    hidden_salt=b64_hidden_salt
                 ),
                 envelope=EnvelopeParams(
                     dek_nonce=base64.b64encode(dek_nonce).decode('ascii'),
@@ -859,6 +964,7 @@ class VaultCrypto:
 
         bytes_processed = 0
         while True:
+            _raise_if_cancelled(cancel_check)
             chunk = input_stream.read(CHUNK_SIZE)
             if not chunk:
                 break
@@ -889,6 +995,7 @@ class VaultCrypto:
             if padding_needed > 0:
                 written = 0
                 while written < padding_needed:
+                    _raise_if_cancelled(cancel_check)
                     chunk = min(CHUNK_SIZE, padding_needed - written)
                     output_stream.write(os.urandom(chunk))
                     written += chunk
@@ -904,9 +1011,7 @@ class VaultCrypto:
         )
         return header
 
-    # --------------------------------------------------------------------------
-    # Public API: Decryption
-    # --------------------------------------------------------------------------
+
 
     def decrypt_stream(
         self,
@@ -914,7 +1019,8 @@ class VaultCrypto:
         output_stream: BinaryIO,
         password: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-        recovery_key: Optional[bytes] = None
+        recovery_key: Optional[bytes] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> VaultHeader:
         """
         Decrypt an RPM Vault stream back to its original plaintext.
@@ -953,9 +1059,9 @@ class VaultCrypto:
             try:
                 if not header.recovery_envelope:
                     raise AuthenticationError("No recovery phrase exists for this vault.")
-                # C1 FIX: New vaults store an independent recovery salt in the
-                # header. Legacy vaults (Phases 1-13) have an empty recovery_salt
-                # field, so fall back to the old salt + b"RECOVERY" derivation.
+                # C1 FIX: Recovery-enabled vaults store an independent recovery
+                # salt in the header. If absent, fall back to the historical
+                # deterministic branch to keep the authentication path bounded.
                 if header.recovery_envelope.recovery_salt:
                     recovery_salt = base64.b64decode(header.recovery_envelope.recovery_salt)
                 else:
@@ -1007,15 +1113,15 @@ class VaultCrypto:
                     # this path must not derive again.
                     input_stream.seek(0, os.SEEK_END)
                     total_size = input_stream.tell()
-                    if header.kdf.hidden_salt and total_size >= payload_offset + self.HIDDEN_TOTAL_HEADER_BYTES + AES_TAG_SIZE:
-                        dek, payload_nonce, h_offset, metadata = self._open_hidden_vault(
+                    if total_size >= payload_offset + self.HIDDEN_TOTAL_HEADER_BYTES + AES_TAG_SIZE:
+                        dek, payload_nonce, hidden_payload_offset, metadata = self._open_hidden_vault(
                             input_stream, password, total_size, hidden_kek
                         )
                         header.payload.nonce = base64.b64encode(payload_nonce).decode('utf-8')
                         header.payload.original_size = metadata.get('original_size', 0)
                         header.payload.filename = metadata.get('filename', '')
                         header.payload.metadata = metadata.get('metadata', None)
-                        payload_offset = h_offset + self.HIDDEN_TOTAL_HEADER_BYTES
+                        payload_offset = hidden_payload_offset
                     else:
                         raise AuthenticationError("Vault access denied: Invalid password or corrupted vault envelope.")
             except AuthenticationError as exc:
@@ -1071,6 +1177,7 @@ class VaultCrypto:
 
         bytes_processed = 0
         while input_stream.tell() < tag_offset:
+            _raise_if_cancelled(cancel_check)
             remaining = tag_offset - input_stream.tell()
             read_size = min(CHUNK_SIZE, remaining)
             chunk = input_stream.read(read_size)
@@ -1104,6 +1211,132 @@ class VaultCrypto:
         )
         return header
 
+# ------------------------------------------------------------------------------
+# CORE CRYPTOGRAPHIC ENGINE
+# ------------------------------------------------------------------------------
+
+class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixin):
+    """
+    High-level, thread-safe cryptographic engine for RPM Vault operations.
+
+    All public methods are stateless with respect to the vault payload, making
+    this class safe to share across multiple background worker threads in a GUI.
+
+    Usage:
+        crypto = VaultCrypto()
+
+        # Encrypt
+        with open('archive.zip', 'rb') as src, open('data.vault', 'wb') as dst:
+            crypto.encrypt_stream(src, dst, password="Secret123!", ...)
+
+        # Decrypt
+        with open('data.vault', 'rb') as src, open('restored.zip', 'wb') as dst:
+            crypto.decrypt_stream(src, dst, password="Secret123!", ...)
+    """
+
+    # --- Hidden Vault Constants ---
+    HIDDEN_SALT_SUFFIX = b"RPM_HIDDEN_SALT"
+    HIDDEN_OFFSET_MSG = b"RPM_OFFSET"
+    HIDDEN_MINI_HEADER_SIZE = 512
+    HIDDEN_MINI_HEADER_CIPHERTEXT_SIZE = 512 + 16  # 512 + 16 byte tag
+    HIDDEN_MINI_HEADER_NONCE_SIZE = 12
+    HIDDEN_TOTAL_HEADER_BYTES = 12 + 512 + 16
+    HIDDEN_INTERNAL_MAGIC = b"RPMH"
+    HIDDEN_INTERNAL_VERSION = 1
+    HIDDEN_MINI_FIXED_HEADER_SIZE = 4 + 1 + 3 + 4 + AES_KEY_SIZE + AES_NONCE_SIZE + AES_NONCE_SIZE
+    HIDDEN_METADATA_AAD = b"RPM_ENCRYPTER_HIDDEN_METADATA_V1"
+
+    def __init__(
+        self,
+        argon_memory: int = ARGON2_MEMORY_COST,
+        argon_iterations: int = ARGON2_TIME_COST,
+        argon_parallelism: int = ARGON2_PARALLELISM
+    ):
+        """
+        Initialize the crypto engine with configurable Argon2id parameters.
+
+        Args:
+            argon_memory: Memory cost in KiB (e.g., 65536 = 64 MiB).
+            argon_iterations: Time cost (number of passes over memory).
+            argon_parallelism: Number of parallel threads (lanes).
+        """
+        def _clamp(name, value, lo, hi, default):
+            if isinstance(value, bool) or not isinstance(value, int):
+                logger.warning("Argon2 %s is not an int (%r); using default %d", name, value, default)
+                return default
+            if value < lo:
+                logger.warning("Argon2 %s %d below policy min %d; clamping", name, value, lo)
+                return lo
+            if value > hi:
+                logger.warning("Argon2 %s %d above policy max %d; clamping", name, value, hi)
+                return hi
+            return value
+
+        self.argon_memory = _clamp(
+            "memory", argon_memory,
+            MIN_ARGON2_MEMORY, MAX_ARGON2_MEMORY, ARGON2_MEMORY_COST
+        )
+        self.argon_iterations = _clamp(
+            "iterations", argon_iterations,
+            MIN_ARGON2_TIME, MAX_ARGON2_TIME, ARGON2_TIME_COST
+        )
+        self.argon_parallelism = _clamp(
+            "parallelism", argon_parallelism,
+            MIN_ARGON2_PARALLELISM, MAX_ARGON2_PARALLELISM, ARGON2_PARALLELISM
+        )
+
+    # --------------------------------------------------------------------------
+    # Internal Helpers
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _secure_random(size: int) -> bytes:
+        """
+        Generate cryptographically secure random bytes.
+
+        Uses `os.urandom`, which draws from the operating system's CSPRNG
+        (/dev/urandom on Unix, CryptGenRandom on Windows, getentropy where
+        available). This is suitable for generating keys, salts, and nonces.
+        """
+        return os.urandom(size)
+
+    @staticmethod
+    def _calculate_container_size(total_size: int, min_container_mb: int = 0) -> int:
+        """
+        C2 FIX: Snap a vault's on-disk size to a coarse, shared "ladder" so the
+        file length leaks (almost) nothing about the true payload size and all
+        vaults of a similar magnitude look identical.
+
+        Args:
+            total_size: The FULL pre-padding on-disk size
+                (MAGIC + version + header-length field + header JSON +
+                meta-length prefix + encrypted-metadata block + payload + tag).
+            min_container_mb: Optional floor in MiB (the user's explicit
+                "Container Size" choice; 0 = "Auto" / no floor).
+
+        Returns:
+            The bucketed container size in bytes (>= total_size and >= the
+            floor). The result is idempotent: feeding a ladder value back in
+            returns that same value.
+        """
+        min_bytes = min_container_mb * 1024 * 1024
+        target = max(total_size, min_bytes)
+
+        # For very large files (> 10 GiB) use fixed 1 GiB steps to bound absolute waste.
+        if target > 10 * 1024 * 1024 * 1024:
+            gb = 1024 * 1024 * 1024
+            return ((target + gb - 1) // gb) * gb
+
+        # Multiplicative ladder (1.25x). Minimum bucket = 1 MiB.
+        bucket = 1 * 1024 * 1024
+        while bucket < target:
+            bucket = int(math.ceil(bucket * 1.25))
+        return bucket
+
+    # --------------------------------------------------------------------------
+    # Public API: Decryption
+    # --------------------------------------------------------------------------
+
     # --------------------------------------------------------------------------
     # Hidden Vault Internal Logic
     # --------------------------------------------------------------------------
@@ -1115,36 +1348,6 @@ class VaultCrypto:
             return 0
         return offset_int % (total_file_size - self.HIDDEN_TOTAL_HEADER_BYTES)
 
-    def _derive_hidden_kek(self, password: str, main_header_kdf: KDFParams) -> bytes:
-        """
-        Derive the hidden-vault KEK exactly once using the visible header's KDF
-        parameters.
-
-        M2 FIX: every password unlock path must perform two Argon2 derivations.
-        Normal vaults have no hidden_salt, so derive over a deterministic dummy
-        salt with the same Argon2 cost parameters and discard the result later.
-        """
-        try:
-            if main_header_kdf.hidden_salt:
-                hidden_salt_bytes = base64.b64decode(main_header_kdf.hidden_salt)
-            else:
-                main_salt = base64.b64decode(main_header_kdf.salt)
-                hidden_salt_bytes = hashlib.sha256(
-                    main_salt + b"RPM_DUMMY_HIDDEN_SALT"
-                ).digest()
-
-            return argon2.low_level.hash_secret_raw(
-                secret=password.encode('utf-8'),
-                salt=hidden_salt_bytes,
-                time_cost=main_header_kdf.iterations,
-                memory_cost=main_header_kdf.memory,
-                parallelism=main_header_kdf.parallelism,
-                hash_len=main_header_kdf.length,
-                type=argon2.Type.ID
-            )
-        except Exception as exc:
-            raise AuthenticationError("Failed to derive hidden KEK") from exc
-
     def _open_hidden_vault(
         self,
         input_stream: BinaryIO,
@@ -1152,7 +1355,7 @@ class VaultCrypto:
         total_file_size: int,
         hidden_kek: bytes
     ) -> Tuple[bytes, bytes, int, dict]:
-        import json
+        """Open a hidden compartment and return its DEK, nonce, payload offset, and metadata."""
         hidden_offset = self._derive_hidden_offset(password, total_file_size)
 
         input_stream.seek(hidden_offset)
@@ -1170,19 +1373,57 @@ class VaultCrypto:
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         except InvalidTag:
             raise AuthenticationError("Hidden mini-header tag invalid")
-            
-        hidden_dek = plaintext[:32]
-        hidden_payload_nonce = plaintext[32:44]
-        json_bytes = plaintext[44:].rstrip(b'\x00')
-        
+
+        if len(plaintext) != self.HIDDEN_MINI_HEADER_SIZE:
+            raise AuthenticationError("Invalid hidden mini-header length")
+
+        fixed_len = self.HIDDEN_MINI_FIXED_HEADER_SIZE
+        fixed = plaintext[:fixed_len]
+        hidden_magic = fixed[:4]
+        hidden_version = fixed[4]
+        reserved = fixed[5:8]
+        encrypted_meta_len = struct.unpack("!I", fixed[8:12])[0]
+        hidden_dek = fixed[12:12 + AES_KEY_SIZE]
+        nonce_start = 12 + AES_KEY_SIZE
+        hidden_payload_nonce = fixed[nonce_start:nonce_start + AES_NONCE_SIZE]
+        meta_nonce_start = nonce_start + AES_NONCE_SIZE
+        hidden_meta_nonce = fixed[meta_nonce_start:meta_nonce_start + AES_NONCE_SIZE]
+
+        if (
+            hidden_magic != self.HIDDEN_INTERNAL_MAGIC
+            or hidden_version != self.HIDDEN_INTERNAL_VERSION
+            or reserved != b"\x00\x00\x00"
+        ):
+            raise AuthenticationError("Invalid hidden mini-header layout")
+        if encrypted_meta_len <= AES_TAG_SIZE or encrypted_meta_len > MAX_HEADER_SIZE:
+            raise AuthenticationError("Invalid hidden metadata length")
+
+        hidden_meta_offset = hidden_offset + self.HIDDEN_TOTAL_HEADER_BYTES
+        hidden_payload_offset = hidden_meta_offset + encrypted_meta_len
+        if hidden_payload_offset + AES_TAG_SIZE > total_file_size:
+            raise AuthenticationError("Invalid hidden metadata extent")
+
+        input_stream.seek(hidden_meta_offset)
+        encrypted_meta = input_stream.read(encrypted_meta_len)
+        if len(encrypted_meta) != encrypted_meta_len:
+            raise AuthenticationError("Truncated hidden metadata block")
+
         try:
-            metadata = json.loads(json_bytes.decode('utf-8'))
+            meta_bytes = AESGCM(hidden_dek).decrypt(
+                hidden_meta_nonce,
+                encrypted_meta,
+                self.HIDDEN_METADATA_AAD,
+            )
+            metadata = json.loads(meta_bytes.decode('utf-8'))
+            if not isinstance(metadata, dict):
+                raise ValueError("hidden metadata must be a JSON object")
         except Exception:
             raise AuthenticationError("Invalid hidden metadata JSON")
-            
-        return hidden_dek, hidden_payload_nonce, hidden_offset, metadata
+
+        return hidden_dek, hidden_payload_nonce, hidden_payload_offset, metadata
 
     def _try_hidden_vault(self, input_stream: BinaryIO, password: str, total_file_size: int, main_header_kdf: KDFParams) -> Tuple[bytes, bytes, int, dict]:
+        """Derive the hidden KEK once and open the hidden compartment."""
         hidden_kek = self._derive_hidden_kek(password, main_header_kdf)
         return self._open_hidden_vault(input_stream, password, total_file_size, hidden_kek)
 
@@ -1205,12 +1446,13 @@ class VaultCrypto:
         hidden_metadata: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         recovery_key: Optional[bytes] = None,
-        target_container_mb: int = 0
+        target_container_mb: int = 0,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> VaultHeader:
         """
         Creates a plausible deniability vault containing both Decoy and Hidden data.
 
-        C2 FIX (format v3): the final on-disk size is snapped to a 1.25x ladder
+        C2 FIX (format v4): the final on-disk size is snapped to a 1.25x ladder
         bucket (>= the user's explicit ``target_container_mb`` floor), so a hidden
         vault is size-indistinguishable from a normal padded vault. The decoy
         header advertises the WHOLE-file container size, leaving no size mismatch
@@ -1221,14 +1463,6 @@ class VaultCrypto:
         if hmac.compare_digest(password_a.encode('utf-8'), password_b.encode('utf-8')):
             raise ValueError("Decoy and Hidden passwords must be different.")
 
-        # F2 FIX: Generate a cryptographically independent random salt for the
-        # hidden compartment (mirrors the recovery-salt design). It is stored in
-        # the decoy's cleartext header (KDFParams.hidden_salt) and preserved
-        # byte-for-byte through re-key, so rotating the decoy password can never
-        # destroy the hidden data.
-        hidden_salt_bytes = self._secure_random(MIN_SALT_SIZE)
-        b64_hidden_salt = base64.b64encode(hidden_salt_bytes).decode('ascii')
-
         # 1. Determine sizes
         decoy_input_stream.seek(0, os.SEEK_END)
         decoy_size = decoy_input_stream.tell()
@@ -1237,7 +1471,40 @@ class VaultCrypto:
         decoy_input_stream.seek(0)
         hidden_input_stream.seek(0)
 
-        hidden_section_total = self.HIDDEN_TOTAL_HEADER_BYTES + hidden_size + AES_TAG_SIZE
+        if decoy_size > MAX_PAYLOAD_SIZE or hidden_size > MAX_PAYLOAD_SIZE:
+            raise PayloadTooLargeError(
+                f"Hidden-vault compartment too large: decoy={decoy_size:,} bytes, "
+                f"hidden={hidden_size:,} bytes; each must be <= {MAX_PAYLOAD_SIZE:,} "
+                f"bytes (32 GiB)."
+            )
+
+        # F2 FIX: Generate a cryptographically independent random salt for the
+        # hidden compartment (mirrors the recovery-salt design). It is stored in
+        # the decoy's cleartext header (KDFParams.hidden_salt) and preserved
+        # byte-for-byte through re-key, so rotating the decoy password can never
+        # destroy the hidden data.
+        hidden_salt_bytes = self._secure_random(MIN_SALT_SIZE)
+        b64_hidden_salt = base64.b64encode(hidden_salt_bytes).decode('ascii')
+
+        h_meta = {
+            "original_size": hidden_size,
+            "filename": hidden_filename,
+            "metadata": hidden_metadata
+        }
+        h_meta_json = json.dumps(h_meta, separators=(',', ':')).encode('utf-8')
+        hidden_meta_ciphertext_len = len(h_meta_json) + AES_TAG_SIZE
+        if hidden_meta_ciphertext_len > MAX_HEADER_SIZE:
+            raise VaultFormatError(
+                f"Hidden metadata block ({hidden_meta_ciphertext_len:,} bytes) exceeds "
+                f"the {MAX_HEADER_SIZE:,} byte sanity limit."
+            )
+
+        hidden_section_total = (
+            self.HIDDEN_TOTAL_HEADER_BYTES
+            + hidden_meta_ciphertext_len
+            + hidden_size
+            + AES_TAG_SIZE
+        )
         min_slack = 1024
         # The hidden offset is deterministically derived from password_b and the
         # (bucketed) total file size, identical to _derive_hidden_offset.
@@ -1278,7 +1545,8 @@ class VaultCrypto:
                 recovery_key=recovery_key,
                 hidden_salt=b64_hidden_salt,
                 apply_padding=False,
-                forced_container_size=final_container
+                forced_container_size=final_container,
+                cancel_check=cancel_check
             )
             decoy_end = output_stream.tell()
 
@@ -1313,6 +1581,7 @@ class VaultCrypto:
         if padding_size > 0:
             written = 0
             while written < padding_size:
+                _raise_if_cancelled(cancel_check)
                 chunk = min(CHUNK_SIZE, padding_size - written)
                 output_stream.write(os.urandom(chunk))
                 written += chunk
@@ -1335,17 +1604,25 @@ class VaultCrypto:
         hidden_dek = os.urandom(AES_KEY_SIZE)
         hidden_mini_nonce = os.urandom(self.HIDDEN_MINI_HEADER_NONCE_SIZE)
         hidden_payload_nonce = os.urandom(AES_NONCE_SIZE)
-        
-        h_meta = {
-            "original_size": hidden_size,
-            "filename": hidden_filename,
-            "metadata": hidden_metadata
-        }
-        h_meta_json = json.dumps(h_meta).encode('utf-8')
-        if len(h_meta_json) > 512 - 32 - 12:
-            raise ValueError("Hidden metadata too large for mini-header")
-            
-        mini_header_plaintext = hidden_dek + hidden_payload_nonce + h_meta_json.ljust(512 - 32 - 12, b'\x00')
+        hidden_meta_nonce = os.urandom(AES_NONCE_SIZE)
+        hidden_meta_ciphertext = AESGCM(hidden_dek).encrypt(
+            hidden_meta_nonce,
+            h_meta_json,
+            self.HIDDEN_METADATA_AAD,
+        )
+
+        mini_header_fixed = b"".join([
+            self.HIDDEN_INTERNAL_MAGIC,
+            struct.pack("!B", self.HIDDEN_INTERNAL_VERSION),
+            b"\x00\x00\x00",
+            struct.pack("!I", len(hidden_meta_ciphertext)),
+            hidden_dek,
+            hidden_payload_nonce,
+            hidden_meta_nonce,
+        ])
+        if len(mini_header_fixed) != self.HIDDEN_MINI_FIXED_HEADER_SIZE:
+            raise CryptoError("Internal hidden mini-header layout mismatch.")
+        mini_header_plaintext = mini_header_fixed.ljust(self.HIDDEN_MINI_HEADER_SIZE, b'\x00')
         
         cipher_mini = Cipher(algorithms.AES(hidden_kek), modes.GCM(hidden_mini_nonce), backend=default_backend())
         encryptor_mini = cipher_mini.encryptor()
@@ -1353,6 +1630,7 @@ class VaultCrypto:
         mini_tag = encryptor_mini.tag
         
         output_stream.write(hidden_mini_nonce + mini_ciphertext + mini_tag)
+        output_stream.write(hidden_meta_ciphertext)
         
         # 6. Encrypt Hidden Payload
         cipher_payload = Cipher(algorithms.AES(hidden_dek), modes.GCM(hidden_payload_nonce), backend=default_backend())
@@ -1369,6 +1647,7 @@ class VaultCrypto:
         encryptor_payload.authenticate_additional_data(payload_aad)
         
         while True:
+            _raise_if_cancelled(cancel_check)
             chunk = hidden_input_stream.read(CHUNK_SIZE)
             if not chunk:
                 break
@@ -1384,6 +1663,7 @@ class VaultCrypto:
         if final_padding_size > 0:
             written = 0
             while written < final_padding_size:
+                _raise_if_cancelled(cancel_check)
                 chunk = min(CHUNK_SIZE, final_padding_size - written)
                 output_stream.write(os.urandom(chunk))
                 written += chunk
@@ -1418,9 +1698,9 @@ class VaultCrypto:
             try:
                 if not header.recovery_envelope:
                     raise AuthenticationError("No recovery phrase exists for this vault.")
-                # C1 FIX: New vaults store an independent recovery salt in the
-                # header. Legacy vaults (Phases 1-13) have an empty recovery_salt
-                # field, so fall back to the old salt + b"RECOVERY" derivation.
+                # C1 FIX: Recovery-enabled vaults store an independent recovery
+                # salt in the header. If absent, fall back to the historical
+                # deterministic branch to keep the authentication path bounded.
                 if header.recovery_envelope.recovery_salt:
                     recovery_salt = base64.b64decode(header.recovery_envelope.recovery_salt)
                 else:
@@ -1468,7 +1748,7 @@ class VaultCrypto:
                 if not main_ok:
                     input_stream.seek(0, os.SEEK_END)
                     total_size = input_stream.tell()
-                    if header.kdf.hidden_salt and total_size >= payload_offset + self.HIDDEN_TOTAL_HEADER_BYTES + AES_TAG_SIZE:
+                    if total_size >= payload_offset + self.HIDDEN_TOTAL_HEADER_BYTES + AES_TAG_SIZE:
                         # Attempt hidden vault fallback with the already-derived
                         # hidden KEK. No Argon2 is allowed in this branch.
                         _, payload_nonce, _, metadata = self._open_hidden_vault(
@@ -1508,7 +1788,8 @@ class VaultCrypto:
         input_path: Path,
         output_path: Path,
         old_password: str,
-        new_password: str
+        new_password: str,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> None:
         """
         Change the password of a vault by re-encrypting only the DEK envelope.
@@ -1623,6 +1904,7 @@ class VaultCrypto:
                 f_in.seek(payload_offset)
                 remaining = payload_size
                 while remaining > 0:
+                    _raise_if_cancelled(cancel_check)
                     read_size = min(CHUNK_SIZE, remaining)
                     chunk = f_in.read(read_size)
                     if not chunk:
@@ -1648,7 +1930,8 @@ class VaultCrypto:
         metadata: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         recovery_key: Optional[bytes] = None,
-        target_container_mb: int = 0
+        target_container_mb: int = 0,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> None:
         """
         Convenience wrapper to encrypt a file on disk into a .vault file.
@@ -1664,7 +1947,8 @@ class VaultCrypto:
         with open(src_path, 'rb') as f_in, open(dst_path, 'wb') as f_out:
             self.encrypt_stream(
                 f_in, f_out, password, name, size, metadata, progress_callback, recovery_key,
-                target_container_mb=target_container_mb
+                target_container_mb=target_container_mb,
+                cancel_check=cancel_check
             )
 
     def decrypt_file(
@@ -1673,13 +1957,17 @@ class VaultCrypto:
         output_path: Path,
         password: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-        recovery_key: Optional[bytes] = None
+        recovery_key: Optional[bytes] = None,
+        cancel_check: Optional[Callable[[], bool]] = None
     ) -> VaultHeader:
         """
         Convenience wrapper to decrypt a .vault file back to its original form.
         """
         with open(input_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
-            return self.decrypt_stream(f_in, f_out, password, progress_callback, recovery_key)
+            return self.decrypt_stream(
+                f_in, f_out, password, progress_callback, recovery_key,
+                cancel_check=cancel_check
+            )
 
     def encrypt_note(
         self,
