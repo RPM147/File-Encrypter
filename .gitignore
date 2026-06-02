@@ -5,5 +5,8 @@ __pycache__/
 .rpm_encrypter/
 build/
 dist/
-*.spec
 .env
+.pytest_cache/
+FIX.md
+HEADER_FIX.md
+GUIDE.md
