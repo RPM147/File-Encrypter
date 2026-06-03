@@ -66,4 +66,39 @@ python -m pip install --upgrade "flet-cli==0.85.2"
 flet build windows
 if ($LASTEXITCODE -ne 0) { throw "flet build windows failed (exit code $LASTEXITCODE)" }
 
-Write-Host "Flet build complete: build\windows\"
+Write-Host "Flet build complete — compiling Unicode-path launcher..."
+
+# ---- Compile the launcher wrapper (handles non-ASCII directory paths) ----
+# The embedded CPython in serious_python crashes when the exe sits inside a
+# directory whose path contains non-ASCII characters (Turkish ü/ö/ş/ç/ğ/İ,
+# accented Latin, CJK …).  The launcher detects non-ASCII paths and copies
+# the app to %LOCALAPPDATA%\RPMEncrypter (ASCII-safe) before launching.
+#
+# Requires: Visual Studio or Build Tools with "Desktop development with C++"
+# (already needed for the Flutter build above), specifically cl.exe and rc.exe.
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) {
+    throw "vswhere.exe not found - is Visual Studio installed?"
+}
+# Search both full VS and Build Tools
+$vsInstall = & $vswhere -latest -products "*" -property installationPath -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+if (-not $vsInstall) {
+    throw "Visual Studio / Build Tools with C++ desktop tools not found (needed for launcher compilation)."
+}
+$vcvars = Join-Path $vsInstall "VC\Auxiliary\Build\vcvarsall.bat"
+
+# Compile launcher.rc (icon) + launcher.c → "RPM Encrypter.exe" in one cmd
+# session so vcvarsall environment is active for both rc.exe and cl.exe.
+$launcherOut = "build\windows\RPM Encrypter.exe"
+cmd /c "`"$vcvars`" amd64 && rc /nologo /fo launcher\launcher.res launcher\launcher.rc && cl /nologo /O2 launcher\launcher.c launcher\launcher.res /Fe`"$launcherOut`" /link /SUBSYSTEM:WINDOWS kernel32.lib user32.lib shell32.lib"
+if ($LASTEXITCODE -ne 0) { throw "Launcher compilation failed (exit code $LASTEXITCODE)" }
+
+# Clean up intermediate build artifacts
+Remove-Item "launcher\launcher.res" -ErrorAction SilentlyContinue
+Remove-Item "launcher\launcher.obj" -ErrorAction SilentlyContinue
+
+Write-Host "Build complete: build\windows\"
+Write-Host "  Launcher  : build\windows\RPM Encrypter.exe  (users should run THIS)"
+Write-Host "  Flet app  : build\windows\rpm-encrypter.exe  (launched by the wrapper)"
+

@@ -1,0 +1,8 @@
+// RPM Encrypter launcher resource file.
+// Embeds the application icon so the launcher exe shows the correct
+// icon in Explorer, the taskbar, and Alt-Tab.
+//
+// Note: paths in .rc files are resolved relative to the CWD of rc.exe
+// (the project root), NOT relative to this file's directory.
+
+1 ICON "icon.ico"
