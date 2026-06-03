@@ -57,10 +57,16 @@ Known limitation: for very large items the current format writes decrypted outpu
 
 This produces a native desktop bundle under `build\windows\`. The Flutter client is compiled into the app, so the result runs **fully offline** with no first-run download.
 
-Prerequisites: the [Flutter SDK](https://flutter.dev) and Visual Studio's **"Desktop development with C++"** workload. Verify your toolchain first:
+Prerequisites (Windows):
+- the [Flutter SDK](https://flutter.dev);
+- Visual Studio with the **"Desktop development with C++"** workload, **including the Windows 10/11 SDK component**;
+- **Windows Developer Mode enabled** — Flutter builds its plugins via symlinks, which Windows only allows in Developer Mode (`start ms-settings:developers`).
+
+Verify your toolchain first:
 ```powershell
-flet doctor
+flutter doctor
 ```
+> Note: on a non-UTF-8 console code page (e.g. Turkish cp1254), flet's progress UI can crash with a `UnicodeEncodeError`; `build.ps1` already forces UTF-8 to avoid this.
 Then build (Windows / PowerShell):
 ```powershell
 .\build.ps1

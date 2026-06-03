@@ -24,7 +24,8 @@ Local state files this app may create in your home directory (referenced through
 - [ ] *(automated)* `python crypto_core.py` → all core self-tests pass
 - [ ] App version bumped where applicable: `APP_VERSION` (About panel) and `[project].version` in `pyproject.toml` (the Flet build artifact version)
 - [ ] `requirements.txt` installs cleanly in a fresh virtual environment (includes `flet==0.85.2`)
-- [ ] *(Flet build only)* `flet doctor` reports a working Flutter SDK + Visual Studio "Desktop development with C++" workload
+- [ ] *(Flet build only)* Windows **Developer Mode** is ON (`start ms-settings:developers`) — Flutter plugin builds need symlink support
+- [ ] *(Flet build only)* `flutter doctor` shows Visual Studio with the **"Desktop development with C++"** workload **and the Windows 10/11 SDK** component (the SDK is installed separately from the compiler)
 
 ## 1. Build the release artifact(s)
 - [ ] **Primary (Flet):** `.\build.ps1` → produces `build\windows\` ; the app launches from there
