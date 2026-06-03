@@ -26,6 +26,7 @@ from widgets import RecentBar, PasswordEntry, LogBox
 from app_config import push_recent
 from recovery_dialog_copy import DECRYPT_RECOVERY_LABEL
 from crypto_core import OperationCancelledError, AuthenticationError, mnemonic_to_entropy
+from log_hygiene import redact_path
 
 logger = logging.getLogger("RPM_GUI")
 
@@ -342,9 +343,10 @@ class DecryptViewMixin:
                 _fname = header.payload.filename
                 _stem  = Path(_fname).stem if Path(_fname).suffix else _fname
                 extract_dir = output_dir / _stem
-                if extract_dir.exists():
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    extract_dir = output_dir / f"{_stem}_{ts}"
+                _counter = 1
+                while extract_dir.exists():
+                    extract_dir = output_dir / f"{_stem}_{_counter}"
+                    _counter += 1
 
                 self.packager.extract_archive(temp_zip, extract_dir, cancel_check=cancel_check)
 
@@ -382,7 +384,13 @@ class DecryptViewMixin:
                 break
 
             except Exception as exc:
-                logger.exception("Decryption failed for %s", path)
+                logger.exception("Decryption failed for %s", redact_path(path))
+                # Partial plaintext may have been written before the failure; shred it.
+                if extract_dir is not None and extract_dir.exists():
+                    try:
+                        self.wiper.wipe_folder(extract_dir)
+                    except Exception:
+                        shutil.rmtree(extract_dir, ignore_errors=True)
                 self._qlog(f"[{idx}/{total}] ✗ FAILED: {exc}")
                 self._log_activity("Decrypt", path.name, "Failed", str(exc))
 
@@ -403,7 +411,7 @@ class DecryptViewMixin:
                         if temp_zip.exists():
                             self.wiper.wipe_file(temp_zip)
                     except Exception as wipe_exc:
-                        logger.warning("Failed to securely wipe temp file %s: %s", temp_zip, wipe_exc)
+                        logger.warning("Failed to securely wipe temp file %s: %s", redact_path(temp_zip), wipe_exc)
 
         text = (
             f"Cancelled — {success}/{total} done"

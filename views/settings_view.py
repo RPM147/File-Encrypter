@@ -15,7 +15,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 import versioning
-from app_config import _load_cfg, _save_cfg, get_setting, save_setting
+from app_config import _load_cfg, _mutate_cfg, get_setting, save_setting
 from file_handler import FolderPackager, SecureWiper, VaultInspector
 from crypto_core import ARGON2_MEMORY_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM
 from app_constants import APP_NAME, APP_VERSION
@@ -384,28 +384,31 @@ class SettingsViewMixin:
             messagebox.showwarning("Reserved Name", "That profile name is reserved. Please choose another name.")
             return
         
-        cfg = _load_cfg()
-        profiles = cfg.setdefault("profiles", {})
-        
-        settings = cfg.get("settings", {})
-        profiles[name] = {
-            "argon2_memory": settings.get("argon2_memory", ARGON2_MEMORY_COST),
-            "argon2_time": settings.get("argon2_time", ARGON2_TIME_COST),
-            "argon2_par": settings.get("argon2_par", ARGON2_PARALLELISM),
-            "wipe_passes": settings.get("wipe_passes", 1),
-        }
-        _save_cfg(cfg)
+        def _save(cfg):
+            profiles = cfg.setdefault("profiles", {})
+            settings = cfg.get("settings", {})
+            profiles[name] = {
+                "argon2_memory": settings.get("argon2_memory", ARGON2_MEMORY_COST),
+                "argon2_time": settings.get("argon2_time", ARGON2_TIME_COST),
+                "argon2_par": settings.get("argon2_par", ARGON2_PARALLELISM),
+                "wipe_passes": settings.get("wipe_passes", 1),
+            }
+        _mutate_cfg(_save)
         self.profile_name_var.set("")
         self._update_profile_dropdowns()
         self._set_status(f"Profile '{name}' saved.")
 
     def _delete_profile(self):
         name = self.profile_select_var.get()
-        cfg = _load_cfg()
-        profiles = cfg.get("profiles", {})
-        if name in profiles:
-            del profiles[name]
-            _save_cfg(cfg)
+        deleted = False
+        def _delete(cfg):
+            nonlocal deleted
+            profiles = cfg.get("profiles", {})
+            if name in profiles:
+                del profiles[name]
+                deleted = True
+        _mutate_cfg(_delete)
+        if deleted:
             self._update_profile_dropdowns()
             self._set_status(f"Profile '{name}' deleted.")
 

@@ -28,6 +28,7 @@ from crypto_core import (
     MAX_PAYLOAD_SIZE, PayloadTooLargeError, OperationCancelledError,
 )
 from file_handler import atomic_output
+from log_hygiene import redact_path
 
 logger = logging.getLogger("RPM_GUI")
 
@@ -791,7 +792,7 @@ class EncryptViewMixin:
                     self._qlog("Cancelling and cleaning up…")
                     break
                 except Exception as exc:
-                    logger.exception("Encryption failed for %s", path)
+                    logger.exception("Encryption failed for %s", redact_path(path))
                     self._qlog(f"[{idx}/{total}] ✗ FAILED: {exc}")
                     self._log_activity("Encrypt", path.name, "Failed", str(exc))
                     try:
@@ -813,7 +814,7 @@ class EncryptViewMixin:
                             if temp_zip.exists():
                                 self.wiper.wipe_file(temp_zip)
                         except Exception as wipe_exc:
-                            logger.warning("Failed to wipe temp file %s: %s", temp_zip, wipe_exc)
+                            logger.warning("Failed to wipe temp file %s: %s", redact_path(temp_zip), wipe_exc)
                             try:
                                 temp_zip.unlink(missing_ok=True)
                             except Exception:

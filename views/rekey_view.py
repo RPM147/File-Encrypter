@@ -20,6 +20,7 @@ from widgets import RecentBar, PasswordEntry, LogBox
 from app_config import push_recent
 from app_constants import ZXCVBN_AVAILABLE, zxcvbn
 from crypto_core import OperationCancelledError, AuthenticationError, CryptoError
+from log_hygiene import redact_path
 
 logger = logging.getLogger("RPM_GUI")
 
@@ -386,30 +387,18 @@ class RekeyViewMixin:
             except queue.Full:
                 pass
         except CryptoError as exc:
-            # F2 FIX: Surface the hidden-compartment re-key guard (and any other
-            # CryptoError) with a clear, truthful message instead of a confusing
-            # generic failure. Routed through "batch_done" — like the other
-            # terminal outcomes in this worker — so the Re-Key button is
-            # re-enabled and the UI never looks frozen/broken to the user.
-            if "Re-Key is not supported for vaults containing a hidden compartment" in str(exc):
-                # Specific, clear error for the F2 guard.
-                self._qlog(f"✗ {exc}")
-                self._log_activity("Re-Key", vault.name, "Blocked", "Hidden compartment present")
-                text = str(exc)
-            else:
-                logger.exception("Re-key failed for %s", vault)
-                self._qlog(f"✗ FAILED: {exc}")
-                self._log_activity("Re-Key", vault.name, "Failed", str(exc))
-                text = f"Re-key failed: {exc}"
+            logger.exception("Re-key failed for %s", redact_path(vault))
+            self._qlog(f"✗ FAILED: {exc}")
+            self._log_activity("Re-Key", vault.name, "Failed", str(exc))
             try:
                 self.msg_queue.put({
                     "type": "batch_done",
-                    "text": text,
+                    "text": f"Re-key failed: {exc}",
                 }, timeout=1.0)
             except queue.Full:
                 pass
         except Exception as exc:
-            logger.exception("Re-key failed for %s", vault)
+            logger.exception("Re-key failed for %s", redact_path(vault))
             self._qlog(f"✗ FAILED: {exc}")
             self._log_activity("Re-Key", vault.name, "Failed", str(exc))
             try:

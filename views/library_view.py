@@ -10,7 +10,7 @@ import threading
 import customtkinter as ctk
 from tkinter import filedialog
 
-from app_config import _load_cfg, _save_cfg
+from app_config import _load_cfg, _mutate_cfg
 
 
 class LibraryViewMixin:
@@ -69,12 +69,16 @@ class LibraryViewMixin:
     def _add_library_dir(self):
         path = filedialog.askdirectory(title="Select Directory to Monitor")
         if not path: return
-        cfg = _load_cfg()
-        dirs = cfg.get("library_dirs", [])
-        if path not in dirs:
-            dirs.append(path)
-            cfg["library_dirs"] = dirs
-            _save_cfg(cfg)
+        added = False
+        def _add(cfg):
+            nonlocal added
+            dirs = cfg.get("library_dirs", [])
+            if path not in dirs:
+                dirs.append(path)
+                cfg["library_dirs"] = dirs
+                added = True
+        _mutate_cfg(_add)
+        if added:
             self._scan_library()
 
     def _scan_library(self):

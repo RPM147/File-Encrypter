@@ -24,7 +24,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 from widgets import PasswordEntry
-from app_config import _load_cfg, _save_cfg
+from app_config import _load_cfg, _mutate_cfg
 from recovery_dialog_copy import INSPECT_RECOVERY_LABEL
 from crypto_core import (
     AuthenticationError, OperationCancelledError, mnemonic_to_entropy,
@@ -171,9 +171,9 @@ class InspectViewMixin:
         if not messagebox.askyesno("Clear All Fingerprints",
                                    "Delete all saved SHA-256 fingerprint records?"):
             return
-        cfg = _load_cfg()
-        cfg["fingerprints"] = {}
-        _save_cfg(cfg)
+        def _clear(cfg):
+            cfg["fingerprints"] = {}
+        _mutate_cfg(_clear)
         self._refresh_fingerprint_panel()
         self._set_status("All fingerprints cleared")
 
@@ -571,20 +571,21 @@ class InspectViewMixin:
     @staticmethod
     def _save_fingerprint(path: Path, sha: str) -> None:
         """Append or update a fingerprint entry in config."""
-        cfg = _load_cfg()
-        fps = cfg.setdefault("fingerprints", {})
         key = str(path.resolve())
-        fps[key] = {
+        entry = {
             "filename": path.name,
             "sha256":   sha,
             "size":     path.stat().st_size,
             "recorded": datetime.now().isoformat(timespec="seconds"),
         }
-        if len(fps) > 50:
-            oldest = sorted(fps, key=lambda k: fps[k]["recorded"])
-            for k in oldest[:len(fps) - 50]:
-                del fps[k]
-        _save_cfg(cfg)
+        def _save(cfg):
+            fps = cfg.setdefault("fingerprints", {})
+            fps[key] = entry
+            if len(fps) > 50:
+                oldest = sorted(fps, key=lambda k: fps[k]["recorded"])
+                for k in oldest[:len(fps) - 50]:
+                    del fps[k]
+        _mutate_cfg(_save)
 
     @staticmethod
     def _load_fingerprints() -> Dict[str, Any]:
