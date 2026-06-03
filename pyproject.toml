@@ -1,28 +1,56 @@
 # Project metadata and tooling config for RPM Encrypter.
 #
-# RPM Encrypter is distributed as a PyInstaller executable, NOT as a pip-installable
-# wheel, so no build-system table or build backend is configured. Runtime dependencies are
-# declared with loose floors here for humans; the EXACT, reproducible versions used to
-# build a release live in requirements.lock.
+# RPM Encrypter is distributed as a desktop executable, NOT as a pip-installable
+# wheel, so no build-system table or build backend is configured.
+#
+# PRIMARY artifact: the modern Flet (Flutter) desktop app, built with
+#   `flet build windows`  (see build.ps1 and the [tool.flet] section below).
+# `flet build` bundles exactly the packages listed in [project.dependencies],
+# so that list is the Flet app's *real* runtime imports only. `flet` is pinned
+# because the UI targets the 0.85.2 API; the backend deps keep loose floors for
+# humans, while the EXACT versions used for the legacy CustomTkinter PyInstaller
+# build live in requirements.lock.
+#
+# The legacy CustomTkinter UI is kept as a fallback (`build.ps1 -Legacy`); its
+# extra GUI-only deps live under [project.optional-dependencies].legacy so they
+# are documented but never pulled into the Flet bundle.
 
 [project]
 name = "rpm-encrypter"
 version = "3.0.0"
-description = "Local-only desktop file encryption (AES-256-GCM + Argon2id) with a CustomTkinter GUI."
+description = "Local-only desktop file encryption (AES-256-GCM + Argon2id) with a modern Flet UI and a legacy CustomTkinter fallback."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "RPM Encrypter maintainers" }]
 dependencies = [
-    "customtkinter>=5.2.2",
-    "argon2-cffi>=23.1.0",
+    "flet==0.85.2",
     "cryptography>=41.0.3",
-    "tkinterdnd2>=0.3.0",
+    "argon2-cffi>=23.1.0",
     "zxcvbn>=4.4.28",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+# GUI-only deps for the legacy CustomTkinter fallback (build.ps1 -Legacy).
+legacy = ["customtkinter>=5.2.2", "tkinterdnd2>=0.3.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------
+# Flet (Flutter) desktop build configuration -- consumed by `flet build windows`.
+# Entry point:  app_flet.py  ->  ui_flet.app.run()  ->  ft.run(main).
+# Output:       build\windows\
+# A custom Windows icon is picked up from assets/icon.png when present; without
+# it the default Flet icon is used.
+# ---------------------------------------------------------------------------
+[tool.flet]
+org = "com.rpmencrypter"
+bundle_id = "com.rpmencrypter.app"
+product = "RPM Encrypter"
+company = "RPM Encrypter"
+copyright = "(c) 2026 RPM Encrypter maintainers - AGPL-3.0-or-later"
+
+[tool.flet.app]
+module = "app_flet"

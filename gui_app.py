@@ -83,9 +83,10 @@ import versioning
 # Phase 26 (ARCH-01) Stage 0: these were extracted into dedicated modules;
 # re-import them so existing call sites and tests keep working unchanged.
 from app_config import (
-    CONFIG_FILE, MAX_RECENT, _load_cfg, _save_cfg, get_recent, push_recent,
+    CONFIG_FILE, MAX_RECENT, _load_cfg, _save_cfg, _mutate_cfg, get_recent, push_recent,
     get_setting, save_setting, resource_path,
 )
+from log_hygiene import redact_path
 from app_state import (
     assert_main_thread, MAX_ATTEMPTS, LOCKOUT_SECS, AttemptLimiter, SessionStats,
 )
@@ -539,9 +540,9 @@ class RPMEncrypterApp(ctk.CTk, TkinterDnD.DnDWrapper, ActivityViewMixin, NotesVi
                     # failure (or a slow/hung wipe surfacing as OSError) can never
                     # stop the app from closing.
                     self.wiper.wipe_file(p)
-                    logger.info("Securely wiped temp file on exit: %s", p)
+                    logger.info("Securely wiped temp file on exit: %s", redact_path(p))
             except Exception as exc:
-                logger.warning("Failed to wipe temp file %s: %s", p, exc)
+                logger.warning("Failed to wipe temp file %s: %s", redact_path(p), exc)
 
         self.destroy()
 
@@ -656,12 +657,12 @@ class RPMEncrypterApp(ctk.CTk, TkinterDnD.DnDWrapper, ActivityViewMixin, NotesVi
 
         # 3 & 4. Fingerprints and recent-file lists stored in the config.
         try:
-            cfg = _load_cfg()
-            cfg["fingerprints"] = {}
-            cfg["enc_sources"] = []
-            cfg["dec_sources"] = []
-            cfg["rekey_vaults"] = []
-            _save_cfg(cfg)
+            def _clear(cfg):
+                cfg["fingerprints"] = {}
+                cfg["enc_sources"] = []
+                cfg["dec_sources"] = []
+                cfg["rekey_vaults"] = []
+            _mutate_cfg(_clear)
         except Exception as exc:
             errors.append(f"config: {exc}")
 

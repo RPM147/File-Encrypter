@@ -1212,134 +1212,18 @@ class StandardVaultMixin:
         return header
 
 # ------------------------------------------------------------------------------
-# CORE CRYPTOGRAPHIC ENGINE
+# HIDDEN VAULT (read + write)  (Phase 27 / ARCH-02: extracted from VaultCrypto)
+# Stage 5a/5b completes the hidden-compartment unit.
 # ------------------------------------------------------------------------------
 
-class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixin):
+class HiddenVaultMixin:
     """
-    High-level, thread-safe cryptographic engine for RPM Vault operations.
-
-    All public methods are stateless with respect to the vault payload, making
-    this class safe to share across multiple background worker threads in a GUI.
-
-    Usage:
-        crypto = VaultCrypto()
-
-        # Encrypt
-        with open('archive.zip', 'rb') as src, open('data.vault', 'wb') as dst:
-            crypto.encrypt_stream(src, dst, password="Secret123!", ...)
-
-        # Decrypt
-        with open('data.vault', 'rb') as src, open('restored.zip', 'wb') as dst:
-            crypto.decrypt_stream(src, dst, password="Secret123!", ...)
+    Hidden-compartment read/write logic, split out of VaultCrypto (Phase 27 ARCH-02):
+    password-derived offset, encrypted mini-header + metadata-block decryption,
+    and hidden-compartment creation. INSTANCE methods composed via the MRO;
+    they read the HIDDEN_* class constants and call other mixin helpers on
+    the VaultCrypto instance. No __init__.
     """
-
-    # --- Hidden Vault Constants ---
-    HIDDEN_SALT_SUFFIX = b"RPM_HIDDEN_SALT"
-    HIDDEN_OFFSET_MSG = b"RPM_OFFSET"
-    HIDDEN_MINI_HEADER_SIZE = 512
-    HIDDEN_MINI_HEADER_CIPHERTEXT_SIZE = 512 + 16  # 512 + 16 byte tag
-    HIDDEN_MINI_HEADER_NONCE_SIZE = 12
-    HIDDEN_TOTAL_HEADER_BYTES = 12 + 512 + 16
-    HIDDEN_INTERNAL_MAGIC = b"RPMH"
-    HIDDEN_INTERNAL_VERSION = 1
-    HIDDEN_MINI_FIXED_HEADER_SIZE = 4 + 1 + 3 + 4 + AES_KEY_SIZE + AES_NONCE_SIZE + AES_NONCE_SIZE
-    HIDDEN_METADATA_AAD = b"RPM_ENCRYPTER_HIDDEN_METADATA_V1"
-
-    def __init__(
-        self,
-        argon_memory: int = ARGON2_MEMORY_COST,
-        argon_iterations: int = ARGON2_TIME_COST,
-        argon_parallelism: int = ARGON2_PARALLELISM
-    ):
-        """
-        Initialize the crypto engine with configurable Argon2id parameters.
-
-        Args:
-            argon_memory: Memory cost in KiB (e.g., 65536 = 64 MiB).
-            argon_iterations: Time cost (number of passes over memory).
-            argon_parallelism: Number of parallel threads (lanes).
-        """
-        def _clamp(name, value, lo, hi, default):
-            if isinstance(value, bool) or not isinstance(value, int):
-                logger.warning("Argon2 %s is not an int (%r); using default %d", name, value, default)
-                return default
-            if value < lo:
-                logger.warning("Argon2 %s %d below policy min %d; clamping", name, value, lo)
-                return lo
-            if value > hi:
-                logger.warning("Argon2 %s %d above policy max %d; clamping", name, value, hi)
-                return hi
-            return value
-
-        self.argon_memory = _clamp(
-            "memory", argon_memory,
-            MIN_ARGON2_MEMORY, MAX_ARGON2_MEMORY, ARGON2_MEMORY_COST
-        )
-        self.argon_iterations = _clamp(
-            "iterations", argon_iterations,
-            MIN_ARGON2_TIME, MAX_ARGON2_TIME, ARGON2_TIME_COST
-        )
-        self.argon_parallelism = _clamp(
-            "parallelism", argon_parallelism,
-            MIN_ARGON2_PARALLELISM, MAX_ARGON2_PARALLELISM, ARGON2_PARALLELISM
-        )
-
-    # --------------------------------------------------------------------------
-    # Internal Helpers
-    # --------------------------------------------------------------------------
-
-    @staticmethod
-    def _secure_random(size: int) -> bytes:
-        """
-        Generate cryptographically secure random bytes.
-
-        Uses `os.urandom`, which draws from the operating system's CSPRNG
-        (/dev/urandom on Unix, CryptGenRandom on Windows, getentropy where
-        available). This is suitable for generating keys, salts, and nonces.
-        """
-        return os.urandom(size)
-
-    @staticmethod
-    def _calculate_container_size(total_size: int, min_container_mb: int = 0) -> int:
-        """
-        C2 FIX: Snap a vault's on-disk size to a coarse, shared "ladder" so the
-        file length leaks (almost) nothing about the true payload size and all
-        vaults of a similar magnitude look identical.
-
-        Args:
-            total_size: The FULL pre-padding on-disk size
-                (MAGIC + version + header-length field + header JSON +
-                meta-length prefix + encrypted-metadata block + payload + tag).
-            min_container_mb: Optional floor in MiB (the user's explicit
-                "Container Size" choice; 0 = "Auto" / no floor).
-
-        Returns:
-            The bucketed container size in bytes (>= total_size and >= the
-            floor). The result is idempotent: feeding a ladder value back in
-            returns that same value.
-        """
-        min_bytes = min_container_mb * 1024 * 1024
-        target = max(total_size, min_bytes)
-
-        # For very large files (> 10 GiB) use fixed 1 GiB steps to bound absolute waste.
-        if target > 10 * 1024 * 1024 * 1024:
-            gb = 1024 * 1024 * 1024
-            return ((target + gb - 1) // gb) * gb
-
-        # Multiplicative ladder (1.25x). Minimum bucket = 1 MiB.
-        bucket = 1 * 1024 * 1024
-        while bucket < target:
-            bucket = int(math.ceil(bucket * 1.25))
-        return bucket
-
-    # --------------------------------------------------------------------------
-    # Public API: Decryption
-    # --------------------------------------------------------------------------
-
-    # --------------------------------------------------------------------------
-    # Hidden Vault Internal Logic
-    # --------------------------------------------------------------------------
 
     def _derive_hidden_offset(self, password: str, total_file_size: int) -> int:
         offset_seed = hmac.new(password.encode('utf-8'), self.HIDDEN_OFFSET_MSG, hashlib.sha256).digest()
@@ -1426,11 +1310,6 @@ class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixi
         """Derive the hidden KEK once and open the hidden compartment."""
         hidden_kek = self._derive_hidden_kek(password, main_header_kdf)
         return self._open_hidden_vault(input_stream, password, total_file_size, hidden_kek)
-
-    # --------------------------------------------------------------------------
-    # Public API: Metadata & Password Verification (Vault Info Panel)
-    # --------------------------------------------------------------------------
-
 
     def encrypt_hidden_vault(
         self,
@@ -1670,6 +1549,19 @@ class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixi
 
         return decoy_header
 
+# ------------------------------------------------------------------------------
+# PASSWORD VERIFY / VAULT INFO  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+# ------------------------------------------------------------------------------
+
+class VerifyMixin:
+    """
+    Password verification + header/metadata retrieval WITHOUT decrypting the
+    payload (the Vault Info Panel path), split out of VaultCrypto (Phase 27
+    ARCH-02). M2-BEARING: it performs the same two-Argon2 derivation dance as
+    decrypt_stream (main KEK then hidden KEK, unconditional, fixed order).
+    INSTANCE method composed via the MRO; no __init__.
+    """
+
     def verify_password_and_get_header(
         self,
         input_stream: BinaryIO,
@@ -1779,9 +1671,18 @@ class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixi
 
         return header
 
-    # --------------------------------------------------------------------------
-    # Public API: Re-Keying (Change Password without Full Decryption)
-    # --------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# RE-KEY  (Phase 27 / ARCH-02: extracted verbatim from VaultCrypto)
+# ------------------------------------------------------------------------------
+
+class RekeyMixin:
+    """
+    Password change via envelope re-encryption (the payload is never decrypted),
+    split out of VaultCrypto (Phase 27 ARCH-02). INSTANCE method composed via the
+    MRO; it re-derives the old KEK, re-seals the DEK under a new KEK, and copies
+    the padded payload + hidden compartment byte-for-byte. No __init__.
+    """
 
     def rekey_vault(
         self,
@@ -1914,8 +1815,131 @@ class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixi
 
         logger.info(
             "Re-keying complete: %s -> %s (payload_size=%d bytes untouched)",
-            input_path, output_path, payload_size
+            Path(input_path).name, Path(output_path).name, payload_size
         )
+
+
+# ------------------------------------------------------------------------------
+# CORE CRYPTOGRAPHIC ENGINE
+# ------------------------------------------------------------------------------
+
+class VaultCrypto(HeaderMixin, EnvelopeMixin, DerivationMixin, StandardVaultMixin, HiddenVaultMixin, VerifyMixin, RekeyMixin):
+    """
+    High-level, thread-safe cryptographic engine for RPM Vault operations.
+
+    All public methods are stateless with respect to the vault payload, making
+    this class safe to share across multiple background worker threads in a GUI.
+
+    Usage:
+        crypto = VaultCrypto()
+
+        # Encrypt
+        with open('archive.zip', 'rb') as src, open('data.vault', 'wb') as dst:
+            crypto.encrypt_stream(src, dst, password="Secret123!", ...)
+
+        # Decrypt
+        with open('data.vault', 'rb') as src, open('restored.zip', 'wb') as dst:
+            crypto.decrypt_stream(src, dst, password="Secret123!", ...)
+    """
+
+    # --- Hidden Vault Constants ---
+    HIDDEN_SALT_SUFFIX = b"RPM_HIDDEN_SALT"
+    HIDDEN_OFFSET_MSG = b"RPM_OFFSET"
+    HIDDEN_MINI_HEADER_SIZE = 512
+    HIDDEN_MINI_HEADER_CIPHERTEXT_SIZE = 512 + 16  # 512 + 16 byte tag
+    HIDDEN_MINI_HEADER_NONCE_SIZE = 12
+    HIDDEN_TOTAL_HEADER_BYTES = 12 + 512 + 16
+    HIDDEN_INTERNAL_MAGIC = b"RPMH"
+    HIDDEN_INTERNAL_VERSION = 1
+    HIDDEN_MINI_FIXED_HEADER_SIZE = 4 + 1 + 3 + 4 + AES_KEY_SIZE + AES_NONCE_SIZE + AES_NONCE_SIZE
+    HIDDEN_METADATA_AAD = b"RPM_ENCRYPTER_HIDDEN_METADATA_V1"
+
+    def __init__(
+        self,
+        argon_memory: int = ARGON2_MEMORY_COST,
+        argon_iterations: int = ARGON2_TIME_COST,
+        argon_parallelism: int = ARGON2_PARALLELISM
+    ):
+        """
+        Initialize the crypto engine with configurable Argon2id parameters.
+
+        Args:
+            argon_memory: Memory cost in KiB (e.g., 65536 = 64 MiB).
+            argon_iterations: Time cost (number of passes over memory).
+            argon_parallelism: Number of parallel threads (lanes).
+        """
+        def _clamp(name, value, lo, hi, default):
+            if isinstance(value, bool) or not isinstance(value, int):
+                logger.warning("Argon2 %s is not an int (%r); using default %d", name, value, default)
+                return default
+            if value < lo:
+                logger.warning("Argon2 %s %d below policy min %d; clamping", name, value, lo)
+                return lo
+            if value > hi:
+                logger.warning("Argon2 %s %d above policy max %d; clamping", name, value, hi)
+                return hi
+            return value
+
+        self.argon_memory = _clamp(
+            "memory", argon_memory,
+            MIN_ARGON2_MEMORY, MAX_ARGON2_MEMORY, ARGON2_MEMORY_COST
+        )
+        self.argon_iterations = _clamp(
+            "iterations", argon_iterations,
+            MIN_ARGON2_TIME, MAX_ARGON2_TIME, ARGON2_TIME_COST
+        )
+        self.argon_parallelism = _clamp(
+            "parallelism", argon_parallelism,
+            MIN_ARGON2_PARALLELISM, MAX_ARGON2_PARALLELISM, ARGON2_PARALLELISM
+        )
+
+    # --------------------------------------------------------------------------
+    # Internal Helpers
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _secure_random(size: int) -> bytes:
+        """
+        Generate cryptographically secure random bytes.
+
+        Uses `os.urandom`, which draws from the operating system's CSPRNG
+        (/dev/urandom on Unix, CryptGenRandom on Windows, getentropy where
+        available). This is suitable for generating keys, salts, and nonces.
+        """
+        return os.urandom(size)
+
+    @staticmethod
+    def _calculate_container_size(total_size: int, min_container_mb: int = 0) -> int:
+        """
+        C2 FIX: Snap a vault's on-disk size to a coarse, shared "ladder" so the
+        file length leaks (almost) nothing about the true payload size and all
+        vaults of a similar magnitude look identical.
+
+        Args:
+            total_size: The FULL pre-padding on-disk size
+                (MAGIC + version + header-length field + header JSON +
+                meta-length prefix + encrypted-metadata block + payload + tag).
+            min_container_mb: Optional floor in MiB (the user's explicit
+                "Container Size" choice; 0 = "Auto" / no floor).
+
+        Returns:
+            The bucketed container size in bytes (>= total_size and >= the
+            floor). The result is idempotent: feeding a ladder value back in
+            returns that same value.
+        """
+        min_bytes = min_container_mb * 1024 * 1024
+        target = max(total_size, min_bytes)
+
+        # For very large files (> 10 GiB) use fixed 1 GiB steps to bound absolute waste.
+        if target > 10 * 1024 * 1024 * 1024:
+            gb = 1024 * 1024 * 1024
+            return ((target + gb - 1) // gb) * gb
+
+        # Multiplicative ladder (1.25x). Minimum bucket = 1 MiB.
+        bucket = 1 * 1024 * 1024
+        while bucket < target:
+            bucket = int(math.ceil(bucket * 1.25))
+        return bucket
 
     # --------------------------------------------------------------------------
     # Public API: High-Level File Wrappers

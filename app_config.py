@@ -9,6 +9,7 @@ import sys
 import json
 import tempfile
 import logging
+import threading
 from pathlib import Path
 from typing import List
 
@@ -16,6 +17,24 @@ logger = logging.getLogger("RPM_GUI")
 
 CONFIG_FILE = Path.home() / ".rpm_encrypter.json"
 MAX_RECENT  = 8
+
+# Phase 28 (Config Mutation Safety): one lock serialises every read-modify-write
+# so concurrent UI/worker updates can't silently overwrite each other.
+_CONFIG_LOCK = threading.Lock()
+
+
+def _mutate_cfg(mutator) -> None:
+    """
+    Serialise load -> modify -> save. `_save_cfg` is already atomic at the file
+    level, but the read-modify-write across threads is not; this single lock
+    makes the whole sequence atomic. `mutator(cfg)` mutates the freshly-loaded
+    config dict in place. NOTE: `_load_cfg`/`_save_cfg` must stay lock-free --
+    they are called here WHILE the lock is held.
+    """
+    with _CONFIG_LOCK:
+        cfg = _load_cfg()
+        mutator(cfg)
+        _save_cfg(cfg)
 
 
 def _load_cfg() -> dict:
@@ -52,13 +71,13 @@ def get_recent(key: str) -> List[str]:
 
 
 def push_recent(key: str, path: str) -> None:
-    cfg = _load_cfg()
-    lst = cfg.get(key, [])
-    if path in lst:
-        lst.remove(path)
-    lst.insert(0, path)
-    cfg[key] = lst[:MAX_RECENT]
-    _save_cfg(cfg)
+    def _apply(cfg: dict) -> None:
+        lst = cfg.get(key, [])
+        if path in lst:
+            lst.remove(path)
+        lst.insert(0, path)
+        cfg[key] = lst[:MAX_RECENT]
+    _mutate_cfg(_apply)
 
 
 def get_setting(key: str, default=None):
@@ -66,9 +85,9 @@ def get_setting(key: str, default=None):
 
 
 def save_setting(key: str, value) -> None:
-    cfg = _load_cfg()
-    cfg.setdefault("settings", {})[key] = value
-    _save_cfg(cfg)
+    def _apply(cfg: dict) -> None:
+        cfg.setdefault("settings", {})[key] = value
+    _mutate_cfg(_apply)
 
 
 def resource_path(relative_path):

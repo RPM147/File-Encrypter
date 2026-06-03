@@ -7,6 +7,7 @@ import struct
 from crypto_core import (
     VAULT_MAGIC, VaultFormatError, MAX_HEADER_SIZE, is_supported_vault_version
 )
+from log_hygiene import redact_path
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ class VaultScanner:
                         results.append(entry)
                         cache_updated = True
                 except Exception as e:
-                    logger.warning(f"Skipping unreadable vault {path_str}: {e}")
+                    logger.warning(f"Skipping unreadable vault {redact_path(path_str)}: {e}")
 
         # Cleanup cache for files that no longer exist
         keys_to_remove = [p for p in self.cache.keys() if p not in seen_paths and any(p.startswith(str(Path(d).resolve())) for d in directories)]

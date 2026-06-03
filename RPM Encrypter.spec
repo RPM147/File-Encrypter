@@ -1,4 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# LEGACY / FALLBACK builder -- packages the old CustomTkinter app (gui_app.py).
+# The PRIMARY artifact is now the Flet (Flutter) desktop app, built with
+# `flet build windows` (see build.ps1 default path and pyproject.toml [tool.flet]).
+# This spec is invoked only by `build.ps1 -Legacy` to keep the CustomTkinter UI
+# available as a fallback. Do NOT repoint it at the Flet app -- `flet build`
+# does not use PyInstaller spec files.
 from PyInstaller.utils.hooks import collect_data_files, collect_all
 
 # tkinterdnd2 ships a native tkdnd Tcl package (data + platform shared libraries)

@@ -29,6 +29,7 @@ from crypto_core import (
     VaultCrypto, VaultHeader, AuthenticationError, VaultFormatError,
     OperationCancelledError,
 )
+from log_hygiene import redact_path
 
 logger = logging.getLogger(__name__)
 
@@ -178,14 +179,14 @@ class SecureWiper:
         if path.is_symlink():
             try:
                 path.unlink()
-                logger.warning("Secure-wipe skipped symlink (removed link, target kept): %s", path)
+                logger.warning("Secure-wipe skipped symlink (removed link, target kept): %s", redact_path(path))
                 if on_skip:
-                    on_skip(f"Skipped symlink (removed link, target kept): {path}")
+                    on_skip(f"Skipped symlink (removed link, target kept): {redact_path(path)}")
             except OSError as exc:
-                logger.error("Failed to unlink symlink %s: %s", path, exc)
+                logger.error("Failed to unlink symlink %s: %s", redact_path(path), exc)
             return
         if not path.exists() or not path.is_file():
-            logger.warning("Wipe target does not exist or is not a file: %s", path)
+            logger.warning("Wipe target does not exist or is not a file: %s", redact_path(path))
             return
 
         success = False
@@ -206,9 +207,9 @@ class SecureWiper:
                         f.flush()
                         os.fsync(f.fileno())
             success = True
-            logger.info("Overwrite successful: %s", path)
+            logger.info("Overwrite successful: %s", redact_path(path))
         except OSError as exc:
-            logger.error("Failed to overwrite %s: %s", path, exc)
+            logger.error("Failed to overwrite %s: %s", redact_path(path), exc)
         finally:
             # H2 FIX: Only delete the file if the overwrite actually succeeded.
             # Unlinking after a failed overwrite would leave recoverable plaintext
@@ -217,16 +218,16 @@ class SecureWiper:
             if success:
                 try:
                     path.unlink()
-                    logger.info("Securely wiped file: %s", path)
+                    logger.info("Securely wiped file: %s", redact_path(path))
                 except Exception as del_exc:
-                    logger.critical("Wiped file could not be deleted: %s - %s", path, del_exc)
+                    logger.critical("Wiped file could not be deleted: %s - %s", redact_path(path), del_exc)
                     raise
             else:
                 logger.critical(
                     "Failed to overwrite %s. File was NOT deleted to prevent plaintext recovery.",
-                    path
+                    redact_path(path)
                 )
-                raise OSError(f"Secure wipe failed for {path}. File remains on disk.")
+                raise OSError(f"Secure wipe failed for {redact_path(path)}. File remains on disk.")
 
     def wipe_folder(self, path: Path, on_skip: Optional[Callable[[str], None]] = None) -> None:
         """
@@ -245,9 +246,9 @@ class SecureWiper:
                 path.unlink()
             except OSError:
                 pass
-            logger.warning("Secure-wipe skipped symlink folder (removed link, target kept): %s", path)
+            logger.warning("Secure-wipe skipped symlink folder (removed link, target kept): %s", redact_path(path))
             if on_skip:
-                on_skip(f"Skipped symlink folder (removed link, target kept): {path}")
+                on_skip(f"Skipped symlink folder (removed link, target kept): {redact_path(path)}")
             return
         if not path.exists():
             return
@@ -266,9 +267,9 @@ class SecureWiper:
                 if full.is_symlink():
                     try: full.unlink()
                     except OSError: pass
-                    logger.warning("Secure-wipe skipped symlink file (removed link, target kept): %s", full)
+                    logger.warning("Secure-wipe skipped symlink file (removed link, target kept): %s", redact_path(full))
                     if on_skip:
-                        on_skip(f"Skipped symlink file (removed link, target kept): {full}")
+                        on_skip(f"Skipped symlink file (removed link, target kept): {redact_path(full)}")
                 else:
                     self.wipe_file(full, on_skip=on_skip)
             for dname in dirs:
@@ -283,9 +284,9 @@ class SecureWiper:
                     except OSError:
                         try: os.rmdir(full)
                         except OSError: pass
-                    logger.warning("Secure-wipe skipped symlink dir (removed link, target kept): %s", full)
+                    logger.warning("Secure-wipe skipped symlink dir (removed link, target kept): %s", redact_path(full))
                     if on_skip:
-                        on_skip(f"Skipped symlink dir (removed link, target kept): {full}")
+                        on_skip(f"Skipped symlink dir (removed link, target kept): {redact_path(full)}")
                 else:
                     try: os.rmdir(full)
                     except OSError: pass
@@ -295,7 +296,7 @@ class SecureWiper:
         except OSError:
             pass
 
-        logger.info("Securely wiped folder: %s", path)
+        logger.info("Securely wiped folder: %s", redact_path(path))
 
 
 # ------------------------------------------------------------------------------
@@ -394,11 +395,11 @@ class FolderPackager:
         # Phase 5 (SEC-03): report any skipped symlinks — their targets were NOT
         # archived (they may point outside the selected folder).
         for s in skipped_symlinks:
-            logger.warning("Packaging skipped symlink (target NOT archived): %s", s)
+            logger.warning("Packaging skipped symlink (target NOT archived): %s", redact_path(s))
             if on_skip:
-                on_skip(f"Skipped symlink (not archived): {s}")
+                on_skip(f"Skipped symlink (not archived): {redact_path(s)}")
 
-        logger.info("Packaged folder '%s' -> '%s' (%d bytes)", source_path, temp_path, total_size)
+        logger.info("Packaged folder '%s' -> '%s' (%d bytes)", redact_path(source_path), redact_path(temp_path), total_size)
         return temp_path
 
     def package_files(
@@ -470,11 +471,11 @@ class FolderPackager:
 
         # Phase 5 (SEC-03): report any skipped symlinks — their targets were NOT archived.
         for s in skipped_symlinks:
-            logger.warning("Packaging skipped symlink (target NOT archived): %s", s)
+            logger.warning("Packaging skipped symlink (target NOT archived): %s", redact_path(s))
             if on_skip:
-                on_skip(f"Skipped symlink (not archived): {s}")
+                on_skip(f"Skipped symlink (not archived): {redact_path(s)}")
 
-        logger.info("Packaged %d files -> '%s' (%d bytes)", len(file_paths), temp_path, total_size)
+        logger.info("Packaged %d files -> '%s' (%d bytes)", len(file_paths), redact_path(temp_path), total_size)
         return temp_path
 
     def get_manifest(self, source_path: Path, exclude_paths: list = None) -> dict:
@@ -614,7 +615,7 @@ class FolderPackager:
                 if unix_mode and (unix_mode & 0o170000) == 0o120000:
                     logger.error(
                         "Symlink entry blocked: %r in archive %s",
-                        member, archive_path
+                        member, redact_path(archive_path)
                     )
                     raise VaultFormatError(
                         f"Archive contains a symlink entry: {member!r}. "
@@ -628,7 +629,7 @@ class FolderPackager:
                 except (ValueError, RuntimeError):
                     logger.error(
                         "Zip Slip attempt blocked: member %r would escape output dir %s",
-                        member, output_dir_resolved
+                        member, redact_path(output_dir_resolved)
                     )
                     raise VaultFormatError(
                         f"Archive contains a path-traversal entry: {member!r}. "
@@ -642,7 +643,7 @@ class FolderPackager:
                     except Exception as exc:
                         logger.warning("Progress callback failed: %s", exc)
 
-        logger.info("Extracted '%s' -> '%s'", archive_path, output_dir)
+        logger.info("Extracted '%s' -> '%s'", redact_path(archive_path), redact_path(output_dir))
 
 
 # ------------------------------------------------------------------------------

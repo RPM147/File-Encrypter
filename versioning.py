@@ -112,7 +112,7 @@ class VaultVersionManager:
 
         vault_path = Path(vault_path)
         if not vault_path.is_file():
-            logger.warning("save_version: vault not found: %s", vault_path)
+            logger.warning("save_version: vault not found: %s", vault_path.name)
             return None
 
         try:
