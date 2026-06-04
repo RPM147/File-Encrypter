@@ -66,7 +66,7 @@ python -m pip install --upgrade "flet-cli==0.85.2"
 flet build windows
 if ($LASTEXITCODE -ne 0) { throw "flet build windows failed (exit code $LASTEXITCODE)" }
 
-Write-Host "Flet build complete — compiling Unicode-path launcher..."
+Write-Host "Flet build complete - compiling Unicode-path launcher..."
 
 # ---- Compile the launcher wrapper (handles non-ASCII directory paths) ----
 # The embedded CPython in serious_python crashes when the exe sits inside a
@@ -81,8 +81,9 @@ $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.e
 if (-not (Test-Path $vswhere)) {
     throw "vswhere.exe not found - is Visual Studio installed?"
 }
-# Search both full VS and Build Tools
-$vsInstall = & $vswhere -latest -products "*" -property installationPath -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+# Search both full VS and Build Tools (-products *)
+$vsInstall = & $vswhere -latest -products * -property installationPath `
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
 if (-not $vsInstall) {
     throw "Visual Studio / Build Tools with C++ desktop tools not found (needed for launcher compilation)."
 }
