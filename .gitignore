@@ -10,3 +10,6 @@ dist/
 FIX.md
 HEADER_FIX.md
 GUIDE.md
+launcher/*.res
+launcher/*.obj
+.build-venv/
