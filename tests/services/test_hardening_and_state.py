@@ -3,10 +3,7 @@ import logging
 import threading
 from pathlib import Path
 
-import pytest
-
 from rpm_encrypter.services.controllers.inspect_controller import InspectController
-from rpm_encrypter.services.controllers.settings_controller import SettingsController
 from rpm_encrypter.services.recovery_copy import (
     DECRYPT_RECOVERY_LABEL,
     INSPECT_RECOVERY_LABEL,
@@ -117,7 +114,7 @@ def test_encrypt_screen_warns_hidden_has_no_recovery_and_shows_single_dialog():
 def test_decrypt_and_rekey_controllers_hardening():
     ctrl_dir = ROOT / "src" / "rpm_encrypter" / "services" / "controllers"
     dec_src = (ctrl_dir / "decrypt_controller.py").read_text(encoding="utf-8")
-    assert dec_src.count("self._wipe_extract_dir(extract_dir)") >= 2
+    assert dec_src.count("self._wipe_temp_dir(extract_dir)") >= 2
     assert "while extract_dir.exists()" in dec_src
 
     rk_src = (ctrl_dir / "rekey_controller.py").read_text(encoding="utf-8")

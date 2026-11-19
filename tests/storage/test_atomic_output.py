@@ -6,7 +6,7 @@ the final ``.vault`` only after the whole write succeeds, so the final name is
 never left as a partial stump. A failed write must leave NOTHING under the final
 name and no ``.rpm_vaulttmp_*`` leftover.
 
-These tests are GUI-free (they import only ``file_handler`` + ``crypto_core``).
+These tests are GUI-free (they import only ``storage.atomic`` + ``crypto_core``).
 The ``fast_crypto`` fixture (small/fast Argon2 params) comes from tests/conftest.py.
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from rpm_encrypter.storage.file_handler import atomic_output
+from rpm_encrypter.storage.atomic import atomic_output
 
 
 PASSWORD = "AtomicOutputTest123!"

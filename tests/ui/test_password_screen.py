@@ -260,28 +260,28 @@ def test_password_screen_copy_and_token_based_autoclear():
 
     fake = _FakeClipboard()
     screen.clipboard = fake
-    screen._ensure_services()
+    screen.build()
     assert any(s is fake for s in page.services)
 
     # Copy #1.
     screen.result_field.value = "first"
     _run(screen._copy_password())
     assert fake.values[-1] == "first"
-    token_a = screen._clipboard_token
+    token_a = screen.clipboard_guard.token
 
     # Copy #2 (newer) replaces the clipboard and advances the token.
     screen.result_field.value = "second"
     _run(screen._copy_password())
     assert fake.values[-1] == "second"
-    assert screen._clipboard_token != token_a
+    assert screen.clipboard_guard.token != token_a
 
     # A stale timer (token A) must NOT clear the newer password.
     before = list(fake.values)
-    _run(screen._clear_clipboard_if_current(token_a))
+    _run(screen.clipboard_guard.clear_if_current(token_a))
     assert fake.values == before
 
     # The current timer clears the clipboard with "".
-    _run(screen._clear_clipboard_if_current(screen._clipboard_token))
+    _run(screen.clipboard_guard.clear_if_current(screen.clipboard_guard.token))
     assert fake.values[-1] == ""
 
 
@@ -291,22 +291,22 @@ def test_password_screen_failed_copy_does_not_invalidate_existing_clear_timer():
 
     fake = _FakeClipboard()
     screen.clipboard = fake
-    screen._ensure_services()
+    screen.build()
 
     screen.result_field.value = "first"
     _run(screen._copy_password())
-    token_a = screen._clipboard_token
+    token_a = screen.clipboard_guard.token
     assert fake.values == ["first"]
 
     fake.fail_next = True
     screen.result_field.value = "second"
     _run(screen._copy_password())
 
-    assert screen._clipboard_token == token_a
+    assert screen.clipboard_guard.token == token_a
     assert fake.values == ["first"]
     assert shell.status_text.value == "Clipboard failed: simulated clipboard failure"
 
-    _run(screen._clear_clipboard_if_current(token_a))
+    _run(screen.clipboard_guard.clear_if_current(token_a))
     assert fake.values[-1] == ""
 
 
@@ -369,10 +369,14 @@ def test_shell_mounts_password_screen_without_duplicate_clipboard():
 
 def test_password_screen_uses_clipboard_service_not_page_level_method():
     root = Path(__file__).resolve().parents[2]
-    src = (root / "src" / "rpm_encrypter" / "ui" / "screens" / "password_screen.py").read_text(encoding="utf-8")
+    ui_dir = root / "src" / "rpm_encrypter" / "ui"
+    src = (ui_dir / "screens" / "password_screen.py").read_text(encoding="utf-8")
+    guard_src = (ui_dir / "components" / "clipboard.py").read_text(encoding="utf-8")
     assert "ft.Clipboard" in src
-    assert ".set(" in src
+    assert "AutoClearClipboard" in src
+    assert ".set(" in guard_src
     # The installed Flet has no page-level clipboard setter; build the forbidden
     # name by concatenation so the literal never appears in this test either.
     forbidden = "set_" + "clipboard"
     assert forbidden not in src
+    assert forbidden not in guard_src

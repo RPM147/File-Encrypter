@@ -127,3 +127,31 @@ def test_release_checklist_exists_and_covers_all_mandated_topics():
     assert not missing, f"RELEASE_CHECKLIST.md is missing mandated topics: {missing}"
     assert "gui_app.py" not in text
     assert "RPM Encrypter.spec" not in text
+
+
+def test_architecture_md_documents_clean_slate_policy():
+    arch = ROOT / "ARCHITECTURE.md"
+    assert arch.is_file()
+    low = arch.read_text(encoding="utf-8").lower()
+    assert "no backward compatibility" in low
+    assert "shim" in low
+    assert "vault format v4" in low
+    assert "ARCHITECTURE.md" in (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def test_ci_workflow_runs_lint_and_tests():
+    ci = ROOT / ".github" / "workflows" / "ci.yml"
+    assert ci.is_file()
+    text = ci.read_text(encoding="utf-8")
+    assert "ruff check src tests" in text
+    assert "python -m pytest" in text
+    assert "VAULT_VERSION == 4" in text
+
+
+def test_storage_split_has_no_legacy_file_handler_shim():
+    storage = ROOT / "src" / "rpm_encrypter" / "storage"
+    assert not (storage / "file_handler.py").exists()
+    for module in ("atomic.py", "wiper.py", "packager.py", "inspector.py"):
+        assert (storage / module).is_file(), module
+    for py in sorted((ROOT / "src").rglob("*.py")):
+        assert "file_handler" not in py.read_text(encoding="utf-8"), py.relative_to(ROOT)

@@ -1,17 +1,9 @@
-"""Activity feed controller for the Flet UI (Stage 9).
+"""Activity feed controller for the Flet UI (Flet-free)."""
 
-Reads the local activity log, manages the logging-enabled setting, and clears
-the feed. It intentionally imports no Flet symbols so it is unit-testable
-without a display, and it never writes new log entries: viewing, refreshing,
-toggling, and clearing must not create activity of their own.
-
-The persisted log itself is owned by the frozen backend service
-(services.activity_logger, an activity_log.ActivityLogger). This controller only
-talks to that service object and to app_config for the persisted setting.
-"""
 from dataclasses import dataclass
 
 from rpm_encrypter.storage import config as app_config
+from .base import BaseController
 
 
 @dataclass(frozen=True)
@@ -23,12 +15,8 @@ class ActivityRow:
     details: str = ""
 
 
-class ActivityController:
-    """Reads and manages the local activity feed.
-    FLET-FREE -> unit-testable without a display."""
-
-    def __init__(self, services):
-        self.services = services
+class ActivityController(BaseController):
+    """Reads and manages the local activity feed."""
 
     def is_logging_enabled(self) -> bool:
         logger = getattr(self.services, "activity_logger", None)
@@ -57,13 +45,15 @@ class ActivityController:
             return []
         rows: list[ActivityRow] = []
         for raw in raw_rows or []:
-            rows.append(ActivityRow(
-                timestamp=str(raw.get("timestamp", "") or ""),
-                action=str(raw.get("action", "") or ""),
-                filename=str(raw.get("filename", "") or ""),
-                status=str(raw.get("status", "") or ""),
-                details=str(raw.get("details", "") or ""),
-            ))
+            rows.append(
+                ActivityRow(
+                    timestamp=str(raw.get("timestamp", "") or ""),
+                    action=str(raw.get("action", "") or ""),
+                    filename=str(raw.get("filename", "") or ""),
+                    status=str(raw.get("status", "") or ""),
+                    details=str(raw.get("details", "") or ""),
+                )
+            )
         return rows
 
     def clear_logs(self) -> None:

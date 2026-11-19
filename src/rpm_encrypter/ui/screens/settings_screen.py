@@ -14,6 +14,7 @@ Flet 0.85.2 notes:
 All persistence and rebuild logic lives in the Flet-free SettingsController; this
 screen only wires controls to it and reflects status.
 """
+
 import flet as ft
 
 from rpm_encrypter.services.controllers.settings_controller import (
@@ -31,8 +32,14 @@ from rpm_encrypter.services.controllers.settings_controller import (
     SettingsController,
     ensure_modern_settings_defaults,
 )
-from rpm_encrypter.ui.tokens import COLORS, TYPE, SPACING
-
+from rpm_encrypter.ui.components import (
+    card_panel,
+    hint_text,
+    register_page_services,
+    set_screen_status,
+    show_confirm_dialog,
+)
+from rpm_encrypter.ui.tokens import COLORS, TYPE
 
 PRIVACY_HINT = (
     "Records each operation (action, status, and the file's NAME) to a local "
@@ -57,7 +64,6 @@ class SettingsScreen:
         ensure_modern_settings_defaults()
         snap = self.controller.get_snapshot()
 
-        # --- appearance ---
         self.theme_dropdown = ft.Dropdown(
             label="Theme",
             value=snap.theme if snap.theme in THEME_CHOICES else "Dark",
@@ -72,8 +78,6 @@ class SettingsScreen:
             on_select=self._on_scale_change,
             width=130,
         )
-
-        # --- updates ---
         self.updates_checkbox = ft.Checkbox(
             label="Check for updates on startup",
             value=snap.check_updates,
@@ -82,7 +86,6 @@ class SettingsScreen:
             label_style=ft.TextStyle(size=TYPE["body"]["size"], color=COLORS["text_primary"]),
         )
 
-        # --- profiles ---
         self.profile_name_field = ft.TextField(
             label="Profile name",
             value="",
@@ -101,7 +104,6 @@ class SettingsScreen:
         self.delete_profile_button = ft.Button("Delete Selected", on_click=self._delete_profile)
         self.apply_profile_button = ft.Button("Apply Selected", on_click=self._apply_profile)
 
-        # --- KDF ---
         self.kdf_memory_dropdown = ft.Dropdown(
             label="Memory (KiB)",
             value=str(snap.argon2_memory),
@@ -124,9 +126,9 @@ class SettingsScreen:
             width=140,
         )
         self.save_kdf_button = ft.Button(
-            "Save KDF Settings & Restart Crypto Engine", on_click=self._save_kdf)
+            "Save KDF Settings & Restart Crypto Engine", on_click=self._save_kdf
+        )
 
-        # --- secure wipe ---
         self.wipe_dropdown = ft.Dropdown(
             label="Overwrite passes",
             value=str(snap.wipe_passes),
@@ -135,7 +137,6 @@ class SettingsScreen:
             width=140,
         )
 
-        # --- versioning ---
         self.versioning_checkbox = ft.Checkbox(
             label="Enable Vault Versioning",
             value=snap.versioning_enabled,
@@ -170,9 +171,9 @@ class SettingsScreen:
         self.version_dir_picker = ft.FilePicker()
         self.browse_version_dir_button = ft.Button("Browse", on_click=self._browse_version_dir)
         self.save_versioning_button = ft.Button(
-            "Save Versioning Settings", on_click=self._save_versioning)
+            "Save Versioning Settings", on_click=self._save_versioning
+        )
 
-        # --- privacy ---
         self.logging_checkbox = ft.Checkbox(
             label="Enable Activity Logging",
             value=snap.logging_enabled,
@@ -181,45 +182,10 @@ class SettingsScreen:
             label_style=ft.TextStyle(size=TYPE["body"]["size"], color=COLORS["text_primary"]),
         )
         self.clear_traces_button = ft.Button(
-            "Clear All Local Traces", on_click=self._confirm_clear_traces)
-
-        # --- health check / about ---
+            "Clear All Local Traces", on_click=self._confirm_clear_traces
+        )
         self.health_button = ft.Button("Run Security Health Check", on_click=self._run_health_check)
 
-    # --- shared helpers -------------------------------------------------------
-    def _set_status(self, text: str) -> None:
-        self.shell.status_text.value = text
-        self.shell.safe_update()
-
-    def _ensure_picker_services(self) -> None:
-        services = self.page.services
-        for picker in (self.version_dir_picker,):
-            if not any(existing is picker for existing in services):
-                services.append(picker)
-
-    def _panel(self, title: str, controls: list) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
-    def _hint(self, text: str) -> ft.Control:
-        return ft.Text(text, size=TYPE["caption"]["size"], color=COLORS["text_secondary"])
-
-    # --- appearance / updates / logging ---------------------------------------
     def _on_theme_change(self, _event=None) -> None:
         choice = self.controller.set_theme(self.theme_dropdown.value)
         self.theme_dropdown.value = choice
@@ -227,28 +193,31 @@ class SettingsScreen:
             self.shell.apply_theme(choice)
         else:
             self.page.theme_mode = THEME_MODES.get(choice, ft.ThemeMode.DARK)
-        self._set_status(f"Theme: {choice}")
+        set_screen_status(self.shell, f"Theme: {choice}")
 
     def _on_scale_change(self, _event=None) -> None:
         choice = self.controller.set_ui_scale(self.scale_dropdown.value)
         self.scale_dropdown.value = choice
         if hasattr(self.shell, "apply_ui_scale"):
             self.shell.apply_ui_scale(choice)
-        self._set_status(f"UI scale: {choice}")
+        set_screen_status(self.shell, f"UI scale: {choice}")
 
     def _on_updates_change(self, _event=None) -> None:
         enabled = self.controller.set_check_updates(bool(self.updates_checkbox.value))
         self.updates_checkbox.value = enabled
-        self._set_status(
-            "Update check on startup enabled" if enabled else "Update check on startup disabled")
+        set_screen_status(
+            self.shell,
+            "Update check on startup enabled" if enabled else "Update check on startup disabled",
+        )
 
     def _on_logging_change(self, _event=None) -> None:
         enabled = self.controller.set_logging_enabled(bool(self.logging_checkbox.value))
         self.logging_checkbox.value = enabled
-        self._set_status(
-            "Activity logging enabled" if enabled else "Activity logging disabled")
+        set_screen_status(
+            self.shell,
+            "Activity logging enabled" if enabled else "Activity logging disabled",
+        )
 
-    # --- KDF ------------------------------------------------------------------
     def _save_kdf(self, _event=None) -> None:
         snap = self.controller.get_snapshot()
         memory = self._dropdown_int(self.kdf_memory_dropdown, snap.argon2_memory)
@@ -257,15 +226,14 @@ class SettingsScreen:
         try:
             self.controller.save_kdf_settings(memory, time, parallelism)
         except RuntimeError:
-            self._set_status(KDF_IN_PROGRESS_MSG)
+            set_screen_status(self.shell, KDF_IN_PROGRESS_MSG)
             return
         except ValueError as exc:
             self._sync_kdf_from_settings()
-            self._set_status(str(exc))
+            set_screen_status(self.shell, str(exc))
             return
-        self._set_status("Crypto engine reloaded with new KDF parameters")
+        set_screen_status(self.shell, "Crypto engine reloaded with new KDF parameters")
 
-    # --- secure wipe ----------------------------------------------------------
     def _on_wipe_change(self, _event=None) -> None:
         snap = self.controller.get_snapshot()
         try:
@@ -274,38 +242,38 @@ class SettingsScreen:
             )
         except ValueError as exc:
             self._sync_kdf_from_settings()
-            self._set_status(str(exc))
+            set_screen_status(self.shell, str(exc))
             return
-        self._set_status(f"Wipe passes set to {passes}")
+        set_screen_status(self.shell, f"Wipe passes set to {passes}")
 
-    # --- versioning -----------------------------------------------------------
     def _save_versioning(self, _event=None) -> None:
         snap = self.controller.get_snapshot()
         try:
             self.controller.save_versioning_settings(
                 enabled=bool(self.versioning_checkbox.value),
                 max_per_vault=self._dropdown_int(
-                    self.version_count_dropdown, snap.versioning_max_per_vault),
+                    self.version_count_dropdown, snap.versioning_max_per_vault
+                ),
                 max_total_mb=self._dropdown_int(
-                    self.version_size_dropdown, snap.versioning_max_total_mb),
+                    self.version_size_dropdown, snap.versioning_max_total_mb
+                ),
                 versions_dir=self.version_dir_field.value or "",
             )
         except ValueError as exc:
             self._sync_versioning_from_settings()
-            self._set_status(str(exc))
+            set_screen_status(self.shell, str(exc))
             return
         state = "enabled" if self.versioning_checkbox.value else "disabled"
         self._sync_versioning_from_settings()
-        self._set_status(f"Versioning {state}")
+        set_screen_status(self.shell, f"Versioning {state}")
 
     async def _browse_version_dir(self, _event=None) -> None:
-        self._ensure_picker_services()
+        register_page_services(self.page, self.version_dir_picker)
         folder = await self.version_dir_picker.get_directory_path()
         if folder:
             self.version_dir_field.value = folder
             self._save_versioning()
 
-    # --- profiles -------------------------------------------------------------
     def _refresh_profiles(self) -> None:
         names = self.controller.list_profiles()
         if names:
@@ -319,35 +287,35 @@ class SettingsScreen:
         try:
             name = self.controller.save_profile(self.profile_name_field.value)
         except ValueError as exc:
-            self._set_status(str(exc))
+            set_screen_status(self.shell, str(exc))
             return
         self.profile_name_field.value = ""
         self._refresh_profiles()
-        self._set_status(f"Profile '{name}' saved")
+        set_screen_status(self.shell, f"Profile '{name}' saved")
 
     def _delete_profile(self, _event=None) -> None:
         name = self.profile_dropdown.value
         if not name or name == NO_PROFILES:
-            self._set_status("No profile selected")
+            set_screen_status(self.shell, "No profile selected")
             return
         if self.controller.delete_profile(name):
             self._refresh_profiles()
-            self._set_status(f"Profile '{name}' deleted")
+            set_screen_status(self.shell, f"Profile '{name}' deleted")
 
     def _apply_profile(self, _event=None) -> None:
         name = self.profile_dropdown.value
         if not name or name == NO_PROFILES:
-            self._set_status("No profile selected")
+            set_screen_status(self.shell, "No profile selected")
             return
         try:
             applied = self.controller.apply_profile(name)
         except ValueError as exc:
             self._sync_kdf_from_settings()
-            self._set_status(str(exc))
+            set_screen_status(self.shell, str(exc))
             return
         if applied:
             self._sync_kdf_from_settings()
-            self._set_status(f"Profile '{name}' applied")
+            set_screen_status(self.shell, f"Profile '{name}' applied")
 
     def _sync_kdf_from_settings(self) -> None:
         snap = self.controller.get_snapshot()
@@ -370,7 +338,6 @@ class SettingsScreen:
             dropdown.value = str(fallback)
             return int(fallback)
 
-    # --- health check ---------------------------------------------------------
     def _run_health_check(self, _event=None) -> None:
         result = self.controller.run_health_check()
         dialog = ft.AlertDialog(
@@ -386,33 +353,34 @@ class SettingsScreen:
         self.page.pop_dialog()
         self.shell.safe_update()
 
-    # --- clear local traces (confirmation-gated) ------------------------------
     def _confirm_clear_traces(self, _event=None) -> None:
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Clear All Local Traces"),
-            content=ft.Text(
+        show_confirm_dialog(
+            self.page,
+            self.shell,
+            title="Clear All Local Traces",
+            body=(
                 "Erase the activity log, Library cache, saved fingerprints, and "
                 "recent-file lists from this device? Vault files are not affected."
             ),
-            actions=[
-                ft.Button("Cancel", on_click=self._close_dialog),
-                ft.Button("Clear", on_click=self._clear_traces_confirmed),
-            ],
+            action_label="Clear",
+            on_confirm=self._clear_traces_confirmed,
+            on_cancel=self._close_dialog,
+            pop_on_confirm=False,
         )
-        self.page.show_dialog(dialog)
-        self.shell.safe_update()
 
     def _clear_traces_confirmed(self, _event=None) -> None:
         result = self.controller.clear_local_traces()
         self.page.pop_dialog()
         if result.errors:
-            self._set_status("Local traces cleared with errors: " + "; ".join(result.errors))
+            set_screen_status(
+                self.shell,
+                "Local traces cleared with errors: " + "; ".join(result.errors),
+            )
         else:
-            self._set_status("All local traces cleared")
+            set_screen_status(self.shell, "All local traces cleared")
 
-    # --- build ----------------------------------------------------------------
     def build(self) -> ft.Control:
+        register_page_services(self.page, self.version_dir_picker)
         self._refresh_profiles()
         return ft.Container(
             content=ft.Column(
@@ -423,12 +391,13 @@ class SettingsScreen:
                         weight=ft.FontWeight.W_600,
                         color=COLORS["text_primary"],
                     ),
-                    self._panel(
+                    card_panel(
                         "Appearance",
                         [ft.Row([self.theme_dropdown, self.scale_dropdown], spacing=16)],
+                        stretch=False,
                     ),
-                    self._panel("Updates", [self.updates_checkbox]),
-                    self._panel(
+                    card_panel("Updates", [self.updates_checkbox], stretch=False),
+                    card_panel(
                         "Smart Encryption Profiles",
                         [
                             ft.Row(
@@ -444,8 +413,9 @@ class SettingsScreen:
                                 spacing=10,
                             ),
                         ],
+                        stretch=False,
                     ),
-                    self._panel(
+                    card_panel(
                         "Argon2id Key Derivation (applied to new vaults)",
                         [
                             ft.Row(
@@ -458,22 +428,24 @@ class SettingsScreen:
                             ),
                             self.save_kdf_button,
                         ],
+                        stretch=False,
                     ),
-                    self._panel(
+                    card_panel(
                         "Secure Wipe",
                         [
                             ft.Row(
                                 [
                                     self.wipe_dropdown,
-                                    self._hint("1 pass is sufficient for SSDs; 3+ for HDDs."),
+                                    hint_text("1 pass is sufficient for SSDs; 3+ for HDDs."),
                                 ],
                                 spacing=16,
                                 wrap=True,
                                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
                         ],
+                        stretch=False,
                     ),
-                    self._panel(
+                    card_panel(
                         "Vault Versioning",
                         [
                             self.versioning_checkbox,
@@ -486,22 +458,25 @@ class SettingsScreen:
                                 spacing=10,
                             ),
                             self.save_versioning_button,
-                            self._hint(
+                            hint_text(
                                 "Versioning is opt-in. Large vaults are fully copied before "
-                                "each Re-Key."),
+                                "each Re-Key."
+                            ),
                         ],
+                        stretch=False,
                     ),
-                    self._panel(
+                    card_panel(
                         "Privacy & Local Traces",
                         [
                             self.logging_checkbox,
-                            self._hint(PRIVACY_HINT),
+                            hint_text(PRIVACY_HINT),
                             self.clear_traces_button,
-                            self._hint(CLEAR_TRACES_HINT),
+                            hint_text(CLEAR_TRACES_HINT),
                         ],
+                        stretch=False,
                     ),
-                    self._panel("Security Health Check", [self.health_button]),
-                    self._panel("About", [self._hint(ABOUT_TEXT)]),
+                    card_panel("Security Health Check", [self.health_button], stretch=False),
+                    card_panel("About", [hint_text(ABOUT_TEXT)], stretch=False),
                 ],
                 spacing=18,
                 scroll=ft.ScrollMode.AUTO,

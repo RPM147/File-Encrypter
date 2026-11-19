@@ -58,12 +58,19 @@ def test_app_services_builds_all_backend_services(hermetic_home):
     from rpm_encrypter.services.app_services import AppServices
     from rpm_encrypter import core as crypto_core
     from rpm_encrypter.services import state as app_state
-    from rpm_encrypter.storage import activity_log, file_handler, scanner as vault_scanner, versioning
+    from rpm_encrypter.storage import (
+        activity_log,
+        inspector,
+        packager,
+        scanner as vault_scanner,
+        versioning,
+        wiper,
+    )
     s = AppServices()
     assert isinstance(s.crypto, crypto_core.VaultCrypto)
-    assert isinstance(s.packager, file_handler.FolderPackager)
-    assert isinstance(s.wiper, file_handler.SecureWiper)
-    assert isinstance(s.inspector, file_handler.VaultInspector)
+    assert isinstance(s.packager, packager.FolderPackager)
+    assert isinstance(s.wiper, wiper.SecureWiper)
+    assert isinstance(s.inspector, inspector.VaultInspector)
     assert isinstance(s.limiter, app_state.AttemptLimiter)
     assert isinstance(s.stats, app_state.SessionStats)
     assert isinstance(s.activity_logger, activity_log.ActivityLogger)

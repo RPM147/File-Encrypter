@@ -1,23 +1,15 @@
-"""Vault Info / Inspect controller for the Flet UI.
+"""Vault Info / Inspect controller for the Flet UI (Flet-free)."""
 
-This module intentionally imports no Flet symbols. It mirrors the legacy
-views/inspect_view.py logic on worker threads and reports results through the
-Stage-1 message queue protocol, so it is unit-testable with real vaults in a
-headless environment.
-"""
 import hashlib
 import logging
 import os
-import queue
 import shutil
 import struct
 import tempfile
-import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from rpm_encrypter.storage.config import _load_cfg, _mutate_cfg
 from rpm_encrypter.core import (
     AES_TAG_SIZE,
     AuthenticationError,
@@ -25,37 +17,24 @@ from rpm_encrypter.core import (
     VAULT_MAGIC,
     is_supported_vault_version,
 )
+from rpm_encrypter.storage.config import _load_cfg, _mutate_cfg
 from rpm_encrypter.storage.log_hygiene import redact_path
+from .base import BaseController
 
 logger = logging.getLogger("RPM_GUI")
 
 
-class InspectController:
+class InspectController(BaseController):
     """Drive Vault Info inspect/hash/fingerprint/extract/diff operations."""
 
-    def __init__(self, services):
-        self.services = services
-
     def start_inspect(self, path, password=None, recovery_key=None):
-        threading.Thread(
-            target=self._inspect_worker,
-            args=(Path(path), password, recovery_key),
-            daemon=True,
-        ).start()
+        self._spawn(self._inspect_worker, Path(path), password, recovery_key)
 
     def start_integrity_check(self, path):
-        threading.Thread(
-            target=self._integrity_worker,
-            args=(Path(path),),
-            daemon=True,
-        ).start()
+        self._spawn(self._integrity_worker, Path(path))
 
     def start_verify_saved(self, path):
-        threading.Thread(
-            target=self._verify_worker,
-            args=(Path(path),),
-            daemon=True,
-        ).start()
+        self._spawn(self._verify_worker, Path(path))
 
     def start_selective_extract(
         self,
@@ -65,32 +44,23 @@ class InspectController:
         selected_files,
         output_dir,
     ):
-        threading.Thread(
-            target=self._selective_extract_worker,
-            args=(Path(vault_path), password, recovery_key, list(selected_files), Path(output_dir)),
-            daemon=True,
-        ).start()
+        self._spawn(
+            self._selective_extract_worker,
+            Path(vault_path),
+            password,
+            recovery_key,
+            list(selected_files),
+            Path(output_dir),
+        )
 
     def start_vault_diff(self, path_a, password_a, path_b, password_b):
-        threading.Thread(
-            target=self._vault_diff_worker,
-            args=(Path(path_a), password_a, Path(path_b), password_b),
-            daemon=True,
-        ).start()
-
-    def _put(self, msg, timeout=0.1):
-        try:
-            self.services.msg_queue.put(msg, timeout=timeout)
-        except queue.Full:
-            pass
-
-    def _log(self, text):
-        self._put({"type": "log", "text": text})
-
-    def _log_activity(self, action, target, result, details=""):
-        logger_obj = getattr(self.services, "activity_logger", None)
-        if logger_obj:
-            logger_obj.log_event(action, target, result, details)
+        self._spawn(
+            self._vault_diff_worker,
+            Path(path_a),
+            password_a,
+            Path(path_b),
+            password_b,
+        )
 
     # ------------------------------------------------------------------ inspect
     def _inspect_worker(self, path, password=None, recovery_key=None):
@@ -256,14 +226,12 @@ class InspectController:
         temp_extract_dir: Optional[Path] = None
         extracted_count = 0
         success = False
-        cancel_check = lambda: self.services.cancel_requested
         self._put({"type": "progress_start"})
         try:
             temp_fd, temp_name = tempfile.mkstemp(suffix=".zip", prefix=".rpm_extract_")
             os.close(temp_fd)
             temp_zip = Path(temp_name)
-            with self.services._temp_files_lock:
-                self.services._active_temp_files.append(temp_zip)
+            self._track_temp(temp_zip)
 
             self._log("Decrypting vault to secure temporary archive...")
             self.services.crypto.decrypt_file(
@@ -271,12 +239,14 @@ class InspectController:
                 temp_zip,
                 password=password,
                 recovery_key=recovery_key,
-                cancel_check=cancel_check,
+                cancel_check=self._cancel_check,
             )
 
             temp_extract_dir = Path(tempfile.mkdtemp(prefix=".rpm_extract_dir_"))
             self._log("Extracting temporary archive...")
-            self.services.packager.extract_archive(temp_zip, temp_extract_dir, cancel_check=cancel_check)
+            self.services.packager.extract_archive(
+                temp_zip, temp_extract_dir, cancel_check=self._cancel_check
+            )
 
             for selected in selected_files:
                 src_path = temp_extract_dir / selected
@@ -329,7 +299,9 @@ class InspectController:
             self._put({"type": "batch_done", "text": msg, "success": success}, timeout=1.0)
 
     # ---------------------------------------------------------------- vault diff
-    def _vault_diff_worker(self, path_a: Path, password_a: str, path_b: Path, password_b: str) -> None:
+    def _vault_diff_worker(
+        self, path_a: Path, password_a: str, path_b: Path, password_b: str
+    ) -> None:
         self._put({"type": "progress_start"})
         success = False
         try:
@@ -503,28 +475,3 @@ class InspectController:
             return True, msg, sha
         except Exception as exc:
             return False, str(exc), ""
-
-    def _wipe_temp_file(self, temp_path: Optional[Path]) -> None:
-        if temp_path is None:
-            return
-        with self.services._temp_files_lock:
-            try:
-                self.services._active_temp_files.remove(temp_path)
-            except ValueError:
-                pass
-        try:
-            if temp_path.exists():
-                self.services.wiper.wipe_file(temp_path)
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _wipe_temp_dir(self, temp_dir: Optional[Path]) -> None:
-        if temp_dir is None or not temp_dir.exists():
-            return
-        try:
-            self.services.wiper.wipe_folder(temp_dir)
-        except Exception:
-            shutil.rmtree(temp_dir, ignore_errors=True)

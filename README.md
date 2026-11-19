@@ -70,6 +70,10 @@ Then build (Windows / PowerShell):
 ```
 `flet build` reads the app metadata, entry point (`src/main.py`), and bundled dependency list from `pyproject.toml` (`[project]` + `[tool.flet]`). Custom icons live at `src\assets\icon.png` and `launcher\icon.ico`.
 
+## Architecture & Compatibility Policy
+
+The codebase follows a strict layered architecture (`core` → `storage` → `services` → `ui`) under `src/rpm_encrypter/`. Because the project is being reorganized cleanly from scratch, **backward compatibility with legacy code, deprecated module paths, or compatibility shims is intentionally not maintained** — see [ARCHITECTURE.md](ARCHITECTURE.md) for layout rules and format policy.
+
 ## Security & Limitations
 
 RPM Encrypter is a local-only tool with real limitations: secure wipe is best-effort, deniability is heuristic, secrets may remain in RAM, and the lockout does not protect the vault file itself. **Please read [SECURITY.md](SECURITY.md)** to understand exactly what this tool does and does not protect before using it for sensitive data.

@@ -21,11 +21,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.4.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff.lint]
+select = ["E722", "F401", "F821", "F841"]
 
 # ---------------------------------------------------------------------------
 # Flet (Flutter) desktop build configuration -- consumed by `flet build windows`.

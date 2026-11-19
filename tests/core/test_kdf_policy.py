@@ -2,8 +2,6 @@ from pathlib import Path
 
 import pytest
 
-import argon2.low_level
-from rpm_encrypter import core as crypto_core
 from rpm_encrypter.core import KDFParams, VaultFormatError, _validate_kdf_params
 
 ROOT = Path(__file__).resolve().parents[2]

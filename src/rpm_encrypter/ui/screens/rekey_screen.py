@@ -13,6 +13,13 @@ from pathlib import Path
 import flet as ft
 
 from rpm_encrypter.services.controllers.rekey_controller import RekeyController
+from rpm_encrypter.ui.components import (
+    card_panel,
+    empty_text,
+    register_page_services,
+    set_screen_status,
+    show_confirm_dialog,
+)
 from rpm_encrypter.ui.tokens import COLORS, TYPE, SPACING
 
 
@@ -91,52 +98,18 @@ class RekeyScreen:
             border_color=COLORS["border"],
         )
 
-    # --- Flet 0.85.2: FilePicker is a SERVICE, registered via page.services ---
-    def _ensure_picker_services(self) -> None:
-        services = self.page.services
-        for picker in (self.vault_picker,):
-            if not any(existing is picker for existing in services):
-                services.append(picker)
-
-    def _panel(self, title: str, controls: list) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
-    def _empty_text(self, text: str) -> ft.Control:
-        return ft.Text(text, size=TYPE["body"]["size"], color=COLORS["text_secondary"])
-
-    def _set_status(self, text: str) -> None:
-        self.shell.status_text.value = text
-        self.shell.safe_update()
-
     # --- inputs (passwords are never stripped) ---
     def _selected_vault_path(self):
         raw = (self.vault_field.value or "").strip().strip('"')
         if not raw:
-            self._set_status("Select a vault file")
+            set_screen_status(self.shell, "Select a vault file")
             return None
         if not raw.lower().endswith(".vault"):
-            self._set_status("Re-Key requires a .vault file")
+            set_screen_status(self.shell, "Re-Key requires a .vault file")
             return None
         p = Path(raw)
         if not p.is_file():
-            self._set_status("Vault file does not exist")
+            set_screen_status(self.shell, "Vault file does not exist")
             return None
         return p
 
@@ -169,12 +142,12 @@ class RekeyScreen:
                     return
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"File picker failed: {exc}")
+            set_screen_status(self.shell, f"File picker failed: {exc}")
 
     # --- re-key ---
     def _do_rekey(self, _event=None):
         if self.services.is_processing:
-            self._set_status("Busy")
+            set_screen_status(self.shell, "Busy")
             return
         vault = self._selected_vault_path()
         if vault is None:
@@ -183,16 +156,16 @@ class RekeyScreen:
         new_pw = self._new_password()
         confirm = self._confirm_password()
         if not old_pw:
-            self._set_status("Enter the current password")
+            set_screen_status(self.shell, "Enter the current password")
             return
         if not new_pw:
-            self._set_status("Enter the new password")
+            set_screen_status(self.shell, "Enter the new password")
             return
         if new_pw != confirm:
-            self._set_status("New password and confirmation do not match")
+            set_screen_status(self.shell, "New password and confirmation do not match")
             return
         if new_pw == old_pw:
-            self._set_status("New password is the same as the current one")
+            set_screen_status(self.shell, "New password is the same as the current one")
             return
 
         self.services.is_processing = True
@@ -236,7 +209,7 @@ class RekeyScreen:
         vault = self._selected_vault_path()
         if vault is None:
             return
-        self.version_list.controls = [self._empty_text("Loading versions...")]
+        self.version_list.controls = [empty_text("Loading versions...")]
         self.shell.safe_update()
         RekeyController(self.services).start_refresh_versions(vault)
 
@@ -245,7 +218,7 @@ class RekeyScreen:
         if error:
             self._version_entries = []
             self._selected_version_index = None
-            self.version_list.controls = [self._empty_text(error)]
+            self.version_list.controls = [empty_text(error)]
             return
         self._version_entries = list(msg.get("entries", []))
         self._selected_version_index = None
@@ -256,10 +229,10 @@ class RekeyScreen:
             versioner = getattr(self.services, "versioner", None)
             if not getattr(versioner, "enabled", False):
                 self.version_list.controls = [
-                    self._empty_text("Versioning is disabled. Enable it in Settings -> Vault Versioning.")
+                    empty_text("Versioning is disabled. Enable it in Settings -> Vault Versioning.")
                 ]
             else:
-                self.version_list.controls = [self._empty_text("No versions found for this vault.")]
+                self.version_list.controls = [empty_text("No versions found for this vault.")]
             return
 
         rows = []
@@ -298,10 +271,10 @@ class RekeyScreen:
 
     def _selected_entry_payload(self):
         if not self._version_entries or self._selected_version_index is None:
-            self._set_status("Select a version entry")
+            set_screen_status(self.shell, "Select a version entry")
             return None
         if self._selected_version_index >= len(self._version_entries):
-            self._set_status("Select a version entry")
+            set_screen_status(self.shell, "Select a version entry")
             return None
         return self._version_entries[self._selected_version_index]
 
@@ -324,12 +297,12 @@ class RekeyScreen:
         if entry is None:
             return
         if self.services.is_processing:
-            self._set_status("Busy")
+            set_screen_status(self.shell, "Busy")
             return
         self.services.is_processing = True
         self.services.cancel_requested = False
         self.shell.set_busy(self.restore_copy_button)
-        self._set_status("Restoring version as copy...")
+        set_screen_status(self.shell, "Restoring version as copy...")
         RekeyController(self.services).start_restore_copy(entry, vault)
 
     def _confirm_replace_current(self, _event=None):
@@ -339,7 +312,7 @@ class RekeyScreen:
         entry = self._selected_entry_payload()
         if entry is None:
             return
-        self._show_confirm_dialog(
+        show_confirm_dialog(self.page, self.shell, 
             title="Replace Current Vault?",
             body=(
                 "This REPLACES the current vault file with the selected version:\n"
@@ -353,12 +326,12 @@ class RekeyScreen:
 
     def _replace_current_confirmed(self, vault, entry):
         if self.services.is_processing:
-            self._set_status("Busy")
+            set_screen_status(self.shell, "Busy")
             return
         self.services.is_processing = True
         self.services.cancel_requested = False
         self.shell.set_busy(self.replace_current_button)
-        self._set_status("Replacing current vault...")
+        set_screen_status(self.shell, "Replacing current vault...")
         RekeyController(self.services).start_replace_current(entry, vault)
 
     def _confirm_delete_version(self, _event=None):
@@ -368,7 +341,7 @@ class RekeyScreen:
         entry = self._selected_entry_payload()
         if entry is None:
             return
-        self._show_confirm_dialog(
+        show_confirm_dialog(self.page, self.shell, 
             title="Delete Version?",
             body=(
                 "This permanently deletes the selected version file:\n"
@@ -382,37 +355,16 @@ class RekeyScreen:
 
     def _delete_version_confirmed(self, vault, entry):
         if self.services.is_processing:
-            self._set_status("Busy")
+            set_screen_status(self.shell, "Busy")
             return
         self.services.is_processing = True
         self.services.cancel_requested = False
         self.shell.set_busy(self.delete_version_button)
-        self._set_status("Deleting version...")
+        set_screen_status(self.shell, "Deleting version...")
         RekeyController(self.services).start_delete_version(entry, vault)
 
-    def _show_confirm_dialog(self, title, body, action_label, on_confirm):
-        def _cancel(_e=None):
-            self.page.pop_dialog()
-            self.shell.safe_update()
-
-        def _confirm(_e=None):
-            self.page.pop_dialog()
-            on_confirm()
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(title),
-            content=ft.Text(body),
-            actions=[
-                ft.Button("Cancel", on_click=_cancel),
-                ft.Button(action_label, on_click=_confirm),
-            ],
-        )
-        self.page.show_dialog(dialog)
-        self.shell.safe_update()
-
     def build(self) -> ft.Control:
-        self._ensure_picker_services()
+        register_page_services(self.page, self.vault_picker)
         self._render_versions()
         return ft.Container(
             content=ft.Column(
@@ -424,11 +376,11 @@ class RekeyScreen:
                         color=COLORS["text_primary"],
                     ),
                     ft.Text(_EXPLANATION, size=TYPE["caption"]["size"], color=COLORS["text_secondary"]),
-                    self._panel(
+                    card_panel(
                         "Vault",
                         [ft.Row([self.vault_field, self.browse_button], spacing=10)],
                     ),
-                    self._panel(
+                    card_panel(
                         "Passwords",
                         [
                             self.current_password_field,
@@ -437,14 +389,14 @@ class RekeyScreen:
                             self.strength_text,
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Action",
                         [
                             ft.Row([self.rekey_button], spacing=10),
                             self.log_box,
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Version History",
                         [
                             ft.Row(

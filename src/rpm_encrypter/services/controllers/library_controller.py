@@ -1,48 +1,22 @@
-"""Vault Library controller for the Flet UI.
+"""Vault Library controller for the Flet UI (Flet-free)."""
 
-This module intentionally imports no Flet symbols. It manages the monitored-
-directory config and drives unauthenticated VaultScanner library scans on a
-worker thread, reporting results through the Stage-1 message queue protocol.
-
-The Library is deliberately NON-sensitive: it never asks for a password, never
-decrypts, and never unlocks authenticated metadata. It only runs directory scans
-via services.scanner.scan_directories, which returns the limited, spoofable
-header fields (filename on disk, bucketed container_size, locked placeholders).
-"""
 import logging
-import queue
-import threading
 from pathlib import Path
 from typing import List
 
 from rpm_encrypter.storage.config import _load_cfg, _mutate_cfg
+from .base import BaseController
 
 logger = logging.getLogger("RPM_GUI")
 
 
-class LibraryController:
-    """Drives monitored-directory config and VaultScanner library scans.
-    FLET-FREE -> unit-testable without a display."""
-
-    def __init__(self, services):
-        self.services = services
+class LibraryController(BaseController):
+    """Drives monitored-directory config and VaultScanner library scans."""
 
     def start_scan(self, directories=None):
         dirs = list(directories) if directories is not None else self.load_dirs()
-        threading.Thread(target=self._scan_worker, args=(dirs,), daemon=True).start()
+        self._spawn(self._scan_worker, dirs)
 
-    def _put(self, msg, timeout=0.1):
-        try:
-            self.services.msg_queue.put(msg, timeout=timeout)
-        except queue.Full:
-            pass
-
-    def _log_activity(self, action, target, result, details=""):
-        logger_obj = getattr(self.services, "activity_logger", None)
-        if logger_obj:
-            logger_obj.log_event(action, target, result, details)
-
-    # ----------------------------------------------------- monitored-dir config
     @staticmethod
     def _clean_path(path) -> str:
         return str(path or "").strip().strip('"')
@@ -104,7 +78,6 @@ class LibraryController:
         _mutate_cfg(_remove)
         return removed
 
-    # ----------------------------------------------------------------- scanning
     def _scan_worker(self, dirs):
         dirs = [str(Path(d).resolve()) for d in dirs if str(d).strip()]
         try:

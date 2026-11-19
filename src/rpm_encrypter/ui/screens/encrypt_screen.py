@@ -14,6 +14,13 @@ from rpm_encrypter.core import entropy_to_mnemonic, generate_recovery_entropy
 from rpm_encrypter.services.recovery_copy import get_recovery_dialog_copy
 from rpm_encrypter.services.controllers.encrypt_controller import EncryptController
 from rpm_encrypter.services.controllers.settings_controller import SettingsController
+from rpm_encrypter.ui.components import (
+    card_panel,
+    empty_text,
+    register_page_services,
+    set_screen_status,
+    source_row,
+)
 from rpm_encrypter.ui.tokens import COLORS, SPACING, TYPE
 
 
@@ -166,45 +173,6 @@ class EncryptScreen:
         self.hidden_panel = ft.Column(visible=False, spacing=12)
         self.encrypt_button = ft.Button("Encrypt", on_click=self._start_encrypt)
 
-    def _ensure_picker_services(self) -> None:
-        services = self.page.services
-        for picker in (
-            self.file_picker,
-            self.folder_picker,
-            self.output_picker,
-            self.hidden_file_picker,
-            self.hidden_folder_picker,
-        ):
-            if not any(existing is picker for existing in services):
-                services.append(picker)
-
-    def _panel(self, title: str, controls: list[ft.Control]) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
-    def _set_status(self, text: str, is_error=False) -> None:
-        if hasattr(self.shell, "show_snackbar"):
-            self.shell.show_snackbar(text, is_error=is_error)
-            return
-        self.shell.status_text.value = text
-        self.shell.safe_update()
-
     def _refresh_profiles(self) -> None:
         try:
             names = SettingsController(self.services).list_profiles()
@@ -220,19 +188,19 @@ class EncryptScreen:
     def _apply_profile(self, _event=None) -> None:
         name = self.profile_dropdown.value or "Custom"
         if name == "Custom":
-            self._set_status("Profile: Custom")
+            set_screen_status(self.shell, "Profile: Custom")
             return
         try:
             applied = SettingsController(self.services).apply_profile(name)
         except ValueError as exc:
             self.profile_dropdown.value = "Custom"
-            self._set_status(str(exc), is_error=True)
+            set_screen_status(self.shell, str(exc), is_error=True)
             return
         if applied:
-            self._set_status(f"Profile '{name}' applied")
+            set_screen_status(self.shell, f"Profile '{name}' applied")
         else:
             self.profile_dropdown.value = "Custom"
-            self._set_status("Profile unavailable", is_error=True)
+            set_screen_status(self.shell, "Profile unavailable", is_error=True)
 
     def reset_form(self) -> None:
         self.sources = []
@@ -300,42 +268,18 @@ class EncryptScreen:
             self._remove_hidden_source,
         )
 
-    def _source_rows(self, paths, empty_text, remove_handler):
+    def _source_rows(self, paths, empty_label, remove_handler):
         if not paths:
-            return [
-                ft.Text(
-                    empty_text,
-                    size=TYPE["body"]["size"],
-                    color=COLORS["text_secondary"],
-                )
-            ]
+            return [empty_text(empty_label)]
 
         rows = []
         for path in paths:
             p = Path(path)
             rows.append(
-                ft.Container(
-                    content=ft.Row(
-                        [
-                            ft.Text(
-                                p.name or path,
-                                size=TYPE["body"]["size"],
-                                color=COLORS["text_primary"],
-                                expand=True,
-                            ),
-                            ft.Text(
-                                str(p.parent),
-                                size=TYPE["caption"]["size"],
-                                color=COLORS["text_secondary"],
-                                expand=True,
-                            ),
-                            ft.Button("Remove", on_click=lambda _e, value=path: remove_handler(value)),
-                        ],
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                    bgcolor=COLORS["bg"],
-                    border_radius=SPACING["radius"],
+                source_row(
+                    p.name or path,
+                    lambda _e, value=path: remove_handler(value),
+                    subtitle=str(p.parent),
                 )
             )
         return rows
@@ -352,7 +296,7 @@ class EncryptScreen:
                 self._append_source(getattr(item, "path", "") or getattr(item, "name", ""))
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"File picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"File picker failed: {exc}", is_error=True)
 
     async def _pick_folder(self):
         try:
@@ -361,7 +305,7 @@ class EncryptScreen:
                 self._append_source(folder)
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Folder picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Folder picker failed: {exc}", is_error=True)
 
     async def _pick_output_dir(self):
         try:
@@ -371,7 +315,7 @@ class EncryptScreen:
                 self.output_field.value = folder
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Output picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Output picker failed: {exc}", is_error=True)
 
     async def _pick_hidden_files(self):
         try:
@@ -380,7 +324,7 @@ class EncryptScreen:
                 self._append_hidden_source(getattr(item, "path", "") or getattr(item, "name", ""))
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Hidden file picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Hidden file picker failed: {exc}", is_error=True)
 
     async def _pick_hidden_folder(self):
         try:
@@ -389,7 +333,7 @@ class EncryptScreen:
                 self._append_hidden_source(folder)
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Hidden folder picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Hidden folder picker failed: {exc}", is_error=True)
 
     def _update_strength(self, _event=None) -> None:
         password = self.password_field.value or ""
@@ -489,7 +433,7 @@ class EncryptScreen:
 
         args, error = self._validate_start()
         if error:
-            self._set_status(error, is_error=True)
+            set_screen_status(self.shell, error, is_error=True)
             return
 
         self.services.is_processing = True
@@ -518,11 +462,11 @@ class EncryptScreen:
                 self.page.pop_dialog()
             self.services.is_processing = False
             self._pending_encrypt_args = None
-            self._set_status("Encryption cancelled")
+            set_screen_status(self.shell, "Encryption cancelled")
 
         def _continue(_e=None):
             if not confirmed.value:
-                self._set_status("Confirm that you saved the recovery phrase", is_error=True)
+                set_screen_status(self.shell, "Confirm that you saved the recovery phrase", is_error=True)
                 return
             if hasattr(self.page, "pop_dialog"):
                 self.page.pop_dialog()
@@ -571,7 +515,7 @@ class EncryptScreen:
         if not hasattr(self.page, "show_dialog"):
             self.services.is_processing = False
             self._pending_encrypt_args = None
-            self._set_status("Recovery dialog unavailable", is_error=True)
+            set_screen_status(self.shell, "Recovery dialog unavailable", is_error=True)
             return
 
         self.page.show_dialog(dialog)
@@ -603,7 +547,14 @@ class EncryptScreen:
         self._pending_encrypt_args = None
 
     def build(self) -> ft.Control:
-        self._ensure_picker_services()
+        register_page_services(
+            self.page,
+            self.file_picker,
+            self.folder_picker,
+            self.output_picker,
+            self.hidden_file_picker,
+            self.hidden_folder_picker,
+        )
         self._refresh_profiles()
         self._render_sources()
         self._render_hidden_sources()
@@ -642,7 +593,7 @@ class EncryptScreen:
                         weight=ft.FontWeight.W_600,
                         color=COLORS["text_primary"],
                     ),
-                    self._panel(
+                    card_panel(
                         "Sources",
                         [
                             ft.Row(
@@ -668,7 +619,7 @@ class EncryptScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Options",
                         [
                             self.password_field,

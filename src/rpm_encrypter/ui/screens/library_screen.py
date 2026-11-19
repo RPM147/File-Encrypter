@@ -13,6 +13,14 @@ from pathlib import Path
 import flet as ft
 
 from rpm_encrypter.services.controllers.library_controller import LibraryController
+from rpm_encrypter.ui.components import (
+    card_panel,
+    empty_text,
+    finish_screen_operation,
+    register_page_services,
+    set_screen_status,
+    source_row,
+)
 from rpm_encrypter.ui.tokens import COLORS, TYPE, SPACING
 
 
@@ -48,83 +56,17 @@ class LibraryScreen:
         self.scan_button = ft.Button("Scan Now", on_click=self._scan_library)
         self.clear_search_button = ft.Button("Clear", on_click=self._clear_search)
 
-    # --- Flet 0.85.2: FilePicker is a SERVICE, registered via page.services ---
-    def _ensure_picker_services(self) -> None:
-        services = self.page.services
-        for picker in (self.directory_picker,):
-            if not any(existing is picker for existing in services):
-                services.append(picker)
-
-    def _panel(self, title: str, controls: list) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
-    def _empty_text(self, text: str) -> ft.Control:
-        return ft.Text(text, size=TYPE["body"]["size"], color=COLORS["text_secondary"])
-
-    # --- status / cleanup helpers ---
-    def _set_status(self, text: str) -> None:
-        self.shell.status_text.value = text
-        self.shell.safe_update()
-
-    def _finish_operation(self, status_text: str) -> None:
-        self.services.is_processing = False
-        self.shell.status_text.value = status_text
-        self.shell.progress_bar.value = 0
-        self.shell.progress_pct.value = "0%"
-        if hasattr(self.shell, "clear_busy"):
-            self.shell.clear_busy()
-        elif self.shell.busy_control is not None:
-            self.shell.busy_control.disabled = False
-            self.shell.busy_control = None
-        self.shell.safe_update()
-
     # --- monitored directories ---
     def _refresh_dirs(self) -> None:
         dirs = LibraryController.load_dirs()
         if not dirs:
             self.dir_list.controls = [
-                self._empty_text("No directories monitored. Add a directory to start.")
+                empty_text("No directories monitored. Add a directory to start.")
             ]
             return
-        rows = []
-        for d in dirs:
-            rows.append(
-                ft.Container(
-                    content=ft.Row(
-                        [
-                            ft.Text(
-                                d,
-                                size=TYPE["body"]["size"],
-                                color=COLORS["text_primary"],
-                                expand=True,
-                            ),
-                            ft.Button("Remove", on_click=lambda _e, value=d: self._remove_dir(value)),
-                        ],
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                    bgcolor=COLORS["bg"],
-                    border_radius=SPACING["radius"],
-                )
-            )
-        self.dir_list.controls = rows
+        self.dir_list.controls = [
+            source_row(d, lambda _e, value=d: self._remove_dir(value)) for d in dirs
+        ]
 
     def _remove_dir(self, path: str) -> None:
         # Removes the directory from config ONLY. Never deletes folders, vault
@@ -149,7 +91,7 @@ class LibraryScreen:
             if not folder:
                 return
             if not Path(folder).is_dir():
-                self._set_status("Selected path is not a directory")
+                set_screen_status(self.shell, "Selected path is not a directory")
                 return
             added = LibraryController.add_dir(folder)
             self._refresh_dirs()
@@ -158,9 +100,9 @@ class LibraryScreen:
                 self.shell.safe_update()
                 self._scan_library()
             else:
-                self._set_status("Directory already monitored")
+                set_screen_status(self.shell, "Directory already monitored")
         except Exception as exc:
-            self._set_status(f"Directory picker failed: {exc}")
+            set_screen_status(self.shell, f"Directory picker failed: {exc}")
 
     # --- scanning ---
     def _scan_library(self, _event=None):
@@ -176,7 +118,7 @@ class LibraryScreen:
         self.services.is_processing = True
         self.services.cancel_requested = False
         self.shell.set_busy(self.scan_button)
-        self.results_list.controls = [self._empty_text("Scanning directories...")]
+        self.results_list.controls = [empty_text("Scanning directories...")]
         self.shell.safe_update()
         LibraryController(self.services).start_scan(dirs)
 
@@ -203,11 +145,11 @@ class LibraryScreen:
         if error:
             self.last_results = []
             self._render_results()
-            self._finish_operation(error)
+            finish_screen_operation(self.services, self.shell, error)
             return
         self.last_results = self._filter_current_dir_results(msg.get("data", []))
         self._render_results()
-        self._finish_operation(
+        finish_screen_operation(self.services, self.shell, 
             f"Library scan complete. Found {len(self.last_results)} vaults."
         )
 
@@ -252,17 +194,17 @@ class LibraryScreen:
     def _render_results(self) -> None:
         if not LibraryController.load_dirs():
             self.results_list.controls = [
-                self._empty_text("No directories monitored. Add a directory to start.")
+                empty_text("No directories monitored. Add a directory to start.")
             ]
             return
         query = (self.search_field.value or "").strip()
         if not self.last_results and not query:
-            self.results_list.controls = [self._empty_text("No .vault files found.")]
+            self.results_list.controls = [empty_text("No .vault files found.")]
             return
         filtered = self._filtered_results()
         if not filtered:
             self.results_list.controls = [
-                self._empty_text("No .vault files found matching the search.")
+                empty_text("No .vault files found matching the search.")
             ]
             return
 
@@ -317,7 +259,7 @@ class LibraryScreen:
         return f"{size} B"
 
     def build(self) -> ft.Control:
-        self._ensure_picker_services()
+        register_page_services(self.page, self.directory_picker)
         self._refresh_dirs()
         self._render_results()
         self._maybe_auto_scan()
@@ -331,7 +273,7 @@ class LibraryScreen:
                         color=COLORS["text_primary"],
                     ),
                     ft.Text(_WARNING, size=TYPE["caption"]["size"], color=COLORS["text_secondary"]),
-                    self._panel(
+                    card_panel(
                         "Monitored Directories",
                         [
                             ft.Row([self.add_button, self.scan_button], spacing=10),
@@ -344,13 +286,13 @@ class LibraryScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Search",
                         [
                             ft.Row([self.search_field, self.clear_search_button], spacing=10),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Vaults",
                         [
                             ft.Container(

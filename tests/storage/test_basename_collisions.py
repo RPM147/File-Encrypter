@@ -1,7 +1,7 @@
 import zipfile
 from pathlib import Path
 
-from rpm_encrypter.storage.file_handler import FolderPackager, assign_unique_arcnames
+from rpm_encrypter.storage.packager import FolderPackager, assign_unique_arcnames
 
 
 def _write(path: Path, data: bytes) -> Path:

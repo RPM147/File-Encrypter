@@ -11,7 +11,8 @@ from rpm_encrypter.core import (
     OperationCancelledError,
     VaultCrypto,
 )
-from rpm_encrypter.storage.file_handler import FolderPackager, atomic_output
+from rpm_encrypter.storage.atomic import atomic_output
+from rpm_encrypter.storage.packager import FolderPackager
 
 ROOT = Path(__file__).resolve().parents[2]
 PASSWORD = "CorrectHorseBatteryStaple!123"

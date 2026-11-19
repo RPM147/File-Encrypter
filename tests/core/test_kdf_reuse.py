@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 import argon2.low_level
-from rpm_encrypter import core as crypto_core
 from rpm_encrypter.core import (
     AuthenticationError,
     VaultCrypto,

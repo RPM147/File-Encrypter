@@ -23,7 +23,8 @@ from rpm_encrypter.storage import scanner as vault_scanner
 from rpm_encrypter.storage import versioning
 from rpm_encrypter.services.constants import APP_NAME, APP_VERSION
 from rpm_encrypter.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM
-from rpm_encrypter.storage.file_handler import SecureWiper
+from rpm_encrypter.storage.wiper import SecureWiper
+from .base import BaseController
 
 
 # --- selector choices ---------------------------------------------------------
@@ -248,12 +249,9 @@ def _validated_profile_values(profile: dict) -> dict:
     }
 
 
-class SettingsController:
+class SettingsController(BaseController):
     """Reads and manages persisted settings + profiles.
     FLET-FREE -> unit-testable without a display."""
-
-    def __init__(self, services):
-        self.services = services
 
     # --- snapshot -------------------------------------------------------------
     def get_snapshot(self) -> SettingsSnapshot:

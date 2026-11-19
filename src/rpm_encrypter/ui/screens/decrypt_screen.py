@@ -17,6 +17,13 @@ from rpm_encrypter.storage.config import get_recent
 from rpm_encrypter.core import mnemonic_to_entropy
 from rpm_encrypter.services.recovery_copy import DECRYPT_RECOVERY_LABEL
 from rpm_encrypter.services.controllers.decrypt_controller import DecryptController
+from rpm_encrypter.ui.components import (
+    card_panel,
+    empty_text,
+    register_page_services,
+    set_screen_status,
+    source_row,
+)
 from rpm_encrypter.ui.tokens import COLORS, TYPE, SPACING
 
 
@@ -84,37 +91,7 @@ class DecryptScreen:
         )
         self.decrypt_button = ft.Button("Decrypt", on_click=self._start_decrypt)
 
-    # --- Flet 0.85.2: FilePicker is a SERVICE, registered via page.services ---
-    def _ensure_picker_services(self) -> None:
-        services = self.page.services
-        for picker in (self.vault_picker, self.output_picker):
-            if not any(existing is picker for existing in services):
-                services.append(picker)
-
-    def _panel(self, title: str, controls: list) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
     # --- status helpers ---
-    def _set_status(self, text: str) -> None:
-        self.shell.status_text.value = text
-        self.shell.safe_update()
 
     def _set_attempt_status(self, remaining, lockout) -> None:
         if lockout:
@@ -171,41 +148,17 @@ class DecryptScreen:
 
     def _render_sources(self) -> None:
         if not self.paths:
-            self.source_list.controls = [
-                ft.Text(
-                    "No vault files selected",
-                    size=TYPE["body"]["size"],
-                    color=COLORS["text_secondary"],
-                )
-            ]
+            self.source_list.controls = [empty_text("No vault files selected")]
             return
 
         rows = []
         for path in self.paths:
             p = Path(path)
             rows.append(
-                ft.Container(
-                    content=ft.Row(
-                        [
-                            ft.Text(
-                                p.name or path,
-                                size=TYPE["body"]["size"],
-                                color=COLORS["text_primary"],
-                                expand=True,
-                            ),
-                            ft.Text(
-                                str(p.parent),
-                                size=TYPE["caption"]["size"],
-                                color=COLORS["text_secondary"],
-                                expand=True,
-                            ),
-                            ft.Button("Remove", on_click=lambda _e, value=path: self._remove_source(value)),
-                        ],
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                    bgcolor=COLORS["bg"],
-                    border_radius=SPACING["radius"],
+                source_row(
+                    p.name or path,
+                    lambda _e, value=path: self._remove_source(value),
+                    subtitle=str(p.parent),
                 )
             )
         self.source_list.controls = rows
@@ -215,7 +168,7 @@ class DecryptScreen:
         self.path_field.value = ""
         self._apply_default_output()
         if result == "invalid":
-            self._set_status("Only .vault files can be decrypted")
+            set_screen_status(self.shell, "Only .vault files can be decrypted")
         else:
             self.shell.safe_update()
 
@@ -223,7 +176,7 @@ class DecryptScreen:
         result = self._append_source(raw)
         self._apply_default_output()
         if result == "invalid":
-            self._set_status("Only .vault files can be decrypted")
+            set_screen_status(self.shell, "Only .vault files can be decrypted")
         else:
             self.shell.safe_update()
 
@@ -265,11 +218,11 @@ class DecryptScreen:
                     invalid += 1
             self._apply_default_output()
             if invalid and not added:
-                self._set_status("Only .vault files can be decrypted")
+                set_screen_status(self.shell, "Only .vault files can be decrypted")
             else:
                 self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"File picker failed: {exc}")
+            set_screen_status(self.shell, f"File picker failed: {exc}")
 
     async def _pick_output_dir(self):
         try:
@@ -278,7 +231,7 @@ class DecryptScreen:
                 self.output_field.value = folder
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Output picker failed: {exc}")
+            set_screen_status(self.shell, f"Output picker failed: {exc}")
 
     def _toggle_recovery(self, _event=None) -> None:
         use_recovery = bool(self.use_recovery_checkbox.value)
@@ -292,7 +245,7 @@ class DecryptScreen:
 
         paths = list(self.paths)
         if not paths:
-            self._set_status("Select one or more .vault files")
+            set_screen_status(self.shell, "Select one or more .vault files")
             return
 
         password = None
@@ -300,27 +253,27 @@ class DecryptScreen:
         if self.use_recovery_checkbox.value:
             phrase = (self.recovery_field.value or "").strip()
             if not phrase:
-                self._set_status("Enter your 24-word recovery phrase")
+                set_screen_status(self.shell, "Enter your 24-word recovery phrase")
                 return
             try:
                 recovery_key = mnemonic_to_entropy(phrase)
             except ValueError as exc:
-                self._set_status(f"Invalid recovery phrase: {exc}")
+                set_screen_status(self.shell, f"Invalid recovery phrase: {exc}")
                 return
         else:
             locked, secs = self.services.limiter.is_locked()
             if locked:
                 self._set_attempt_status(self.services.limiter.attempts_remaining(), secs)
-                self._set_status(f"Locked out - {secs}s")
+                set_screen_status(self.shell, f"Locked out - {secs}s")
                 return
             password = self.password_field.value or ""
             if not password:
-                self._set_status("Enter the vault password")
+                set_screen_status(self.shell, "Enter the vault password")
                 return
 
         output_dir = Path((self.output_field.value or "").strip() or Path(paths[0]).parent)
         if not output_dir.is_dir():
-            self._set_status("Output directory does not exist")
+            set_screen_status(self.shell, "Output directory does not exist")
             return
 
         # Write permission probe, mirroring the old view.
@@ -329,10 +282,10 @@ class DecryptScreen:
             test_file.touch()
             test_file.unlink()
         except PermissionError:
-            self._set_status(f"Cannot write to directory: {output_dir}")
+            set_screen_status(self.shell, f"Cannot write to directory: {output_dir}")
             return
         except Exception as exc:
-            self._set_status(f"Directory access failed: {exc}")
+            set_screen_status(self.shell, f"Directory access failed: {exc}")
             return
 
         # Low-space guard. Stage 11 may add a confirmation dialog; for Stage 3,
@@ -341,10 +294,10 @@ class DecryptScreen:
             total_vault_size = sum(Path(p).stat().st_size for p in paths)
             free_space = shutil.disk_usage(output_dir).free
             if free_space < total_vault_size * 1.5:
-                self._set_status("Low disk space for decrypt output")
+                set_screen_status(self.shell, "Low disk space for decrypt output")
                 return
         except Exception as exc:
-            self._set_status(f"Disk space check failed: {exc}")
+            set_screen_status(self.shell, f"Disk space check failed: {exc}")
             return
 
         self.services.is_processing = True
@@ -355,7 +308,7 @@ class DecryptScreen:
         DecryptController(self.services).start(paths, password, output_dir, recovery_key)
 
     def build(self) -> ft.Control:
-        self._ensure_picker_services()
+        register_page_services(self.page, self.vault_picker, self.output_picker)
         self._render_sources()
         return ft.Container(
             content=ft.Column(
@@ -366,7 +319,7 @@ class DecryptScreen:
                         weight=ft.FontWeight.W_600,
                         color=COLORS["text_primary"],
                     ),
-                    self._panel(
+                    card_panel(
                         "Sources",
                         [
                             ft.Row(
@@ -392,7 +345,7 @@ class DecryptScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Authentication",
                         [
                             self.password_field,
@@ -401,7 +354,7 @@ class DecryptScreen:
                             self.attempts_text,
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Output",
                         [
                             ft.Row(

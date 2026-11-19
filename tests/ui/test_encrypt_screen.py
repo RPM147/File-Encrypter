@@ -189,7 +189,7 @@ def test_encrypt_screen_no_longer_uses_page_overlay_for_file_picker():
     assert "_ensure_overlay" not in src
     assert "page.overlay" not in src
     assert ".overlay" not in src
-    assert "page.services" in src or ".services" in src
+    assert "register_page_services" in src
 
 
 def test_app_shell_safe_update_stops_on_destroyed_session():

@@ -1,5 +1,4 @@
 """Vault Info / Inspect screen for the Flet UI."""
-import asyncio
 import shutil
 import tempfile
 from pathlib import Path
@@ -9,6 +8,13 @@ import flet as ft
 from rpm_encrypter.core import mnemonic_to_entropy
 from rpm_encrypter.services.recovery_copy import INSPECT_RECOVERY_LABEL
 from rpm_encrypter.services.controllers.inspect_controller import InspectController
+from rpm_encrypter.ui.components import (
+    AutoClearClipboard,
+    card_panel,
+    finish_screen_operation,
+    register_page_services,
+    set_screen_status,
+)
 from rpm_encrypter.ui.tokens import COLORS, SPACING, TYPE
 
 
@@ -34,8 +40,6 @@ class InspectScreen:
         self._pending_auth_recovery_key = None
         self._pending_auth_path = None
         self.last_sha = ""
-        self._clipboard_token = 0
-        self._clipboard_clear_seconds = 30
         self._selective_output_field = None
         self._diff_path_a_field = None
         self._diff_path_b_field = None
@@ -45,6 +49,10 @@ class InspectScreen:
         self.diff_vault_a_picker = ft.FilePicker()
         self.diff_vault_b_picker = ft.FilePicker()
         self.clipboard = ft.Clipboard()
+        # Getter (not the instance) so a swapped `self.clipboard` is honoured.
+        self.clipboard_guard = AutoClearClipboard(
+            page, shell, services, lambda: self.clipboard, clear_seconds=30
+        )
 
         self.path_field = ft.TextField(
             label="Vault path",
@@ -108,46 +116,7 @@ class InspectScreen:
         self.diff_button = ft.Button("Vault Diff", on_click=self._open_vault_diff)
         self.clear_button = ft.Button("Clear All", on_click=self._clear_fingerprints)
 
-    def _ensure_services(self) -> None:
-        services = self.page.services
-        for service in (
-            self.vault_picker,
-            self.selective_output_picker,
-            self.diff_vault_a_picker,
-            self.diff_vault_b_picker,
-            self.clipboard,
-        ):
-            if not any(existing is service for existing in services):
-                services.append(service)
-
-    def _panel(self, title: str, controls: list) -> ft.Control:
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text(
-                        title,
-                        size=TYPE["section"]["size"],
-                        weight=ft.FontWeight.W_600,
-                        color=COLORS["text_primary"],
-                    ),
-                    *controls,
-                ],
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            ),
-            padding=SPACING["card_pad"],
-            bgcolor=COLORS["surface_card"],
-            border_radius=SPACING["radius"],
-        )
-
     # --- status / results helpers ---
-    def _set_status(self, text: str, is_error=False) -> None:
-        if hasattr(self.shell, "show_snackbar"):
-            self.shell.show_snackbar(text, is_error=is_error)
-            return
-        self.shell.status_text.value = text
-        self.shell.safe_update()
-
     def _set_results(self, text: str) -> None:
         self.results_text.value = text or "No results."
 
@@ -167,30 +136,18 @@ class InspectScreen:
     def on_auth_error(self, remaining, lockout) -> None:
         self._set_attempt_status(remaining, lockout)
 
-    def _finish_operation(self, status_text: str) -> None:
-        self.services.is_processing = False
-        self.shell.status_text.value = status_text
-        self.shell.progress_bar.value = 0
-        self.shell.progress_pct.value = "0%"
-        if hasattr(self.shell, "clear_busy"):
-            self.shell.clear_busy()
-        elif self.shell.busy_control is not None:
-            self.shell.busy_control.disabled = False
-            self.shell.busy_control = None
-        self.shell.safe_update()
-
     # --- validation ---
     def _selected_path(self):
         raw = (self.path_field.value or "").strip().strip('"')
         if not raw:
-            self._set_status("Select a .vault file", is_error=True)
+            set_screen_status(self.shell, "Select a .vault file", is_error=True)
             return None
         if not raw.lower().endswith(".vault"):
-            self._set_status("Only .vault files can be inspected", is_error=True)
+            set_screen_status(self.shell, "Only .vault files can be inspected", is_error=True)
             return None
         path = Path(raw)
         if not path.is_file():
-            self._set_status("Vault file does not exist", is_error=True)
+            set_screen_status(self.shell, "Vault file does not exist", is_error=True)
             return None
         return path
 
@@ -211,13 +168,13 @@ class InspectScreen:
         if path is None:
             return False
         if self.current_path is None or not self.current_metadata:
-            self._set_status("Inspect Vault first", is_error=True)
+            set_screen_status(self.shell, "Inspect Vault first", is_error=True)
             return False
         if path.resolve() != self.current_path.resolve():
-            self._set_status("Path changed. Inspect Vault again.", is_error=True)
+            set_screen_status(self.shell, "Path changed. Inspect Vault again.", is_error=True)
             return False
         if self.current_auth_password is None and self.current_auth_recovery_key is None:
-            self._set_status("Inspect Vault again before extracting", is_error=True)
+            set_screen_status(self.shell, "Inspect Vault again before extracting", is_error=True)
             return False
         return True
 
@@ -234,22 +191,22 @@ class InspectScreen:
         if self.use_recovery_checkbox.value:
             phrase = (self.recovery_field.value or "").strip()
             if not phrase:
-                self._set_status("Enter your 24-word recovery phrase", is_error=True)
+                set_screen_status(self.shell, "Enter your 24-word recovery phrase", is_error=True)
                 return
             try:
                 recovery_key = mnemonic_to_entropy(phrase)
             except ValueError as exc:
-                self._set_status(f"Invalid recovery phrase: {exc}", is_error=True)
+                set_screen_status(self.shell, f"Invalid recovery phrase: {exc}", is_error=True)
                 return
         else:
             locked, secs = self.services.limiter.is_locked()
             if locked:
                 self._set_attempt_status(self.services.limiter.attempts_remaining(), secs)
-                self._set_status(f"Locked out - {secs}s", is_error=True)
+                set_screen_status(self.shell, f"Locked out - {secs}s", is_error=True)
                 return
             password = self.password_field.value or ""
             if not password:
-                self._set_status("Enter the vault password", is_error=True)
+                set_screen_status(self.shell, "Enter the vault password", is_error=True)
                 return
 
         self.services.is_processing = True
@@ -294,33 +251,15 @@ class InspectScreen:
             return
         rec = InspectController.load_fingerprints().get(str(path.resolve()))
         if not rec or not rec.get("sha256"):
-            self._set_status("Run Integrity Check first", is_error=True)
+            set_screen_status(self.shell, "Run Integrity Check first", is_error=True)
             return
-        try:
-            await self.clipboard.set(rec["sha256"])
-        except Exception as exc:
-            self._set_status(f"Clipboard failed: {exc}", is_error=True)
-            return
-        self._clipboard_token += 1
-        token = self._clipboard_token
-        self._set_status(f"SHA-256 copied: {rec['sha256'][:16]}...")
-        self.page.run_task(self._clear_clipboard_after_delay, token)
-
-    async def _clear_clipboard_after_delay(self, token: int):
-        await asyncio.sleep(self._clipboard_clear_seconds)
-        await self._clear_clipboard_if_current(token)
-
-    async def _clear_clipboard_if_current(self, token: int):
-        if token != self._clipboard_token:
-            return
-        if getattr(self.services, "shutdown_requested", False):
-            return
-        try:
-            await self.clipboard.set("")
-        except Exception:
-            return
-        self.shell.status_text.value = "Clipboard cleared"
-        self.shell.safe_update()
+        await self.clipboard_guard.copy(
+            rec["sha256"],
+            copied_status=f"SHA-256 copied: {rec['sha256'][:16]}...",
+            on_error=lambda exc: set_screen_status(
+                self.shell, f"Clipboard failed: {exc}", is_error=True
+            ),
+        )
 
     def _clear_fingerprints(self, _event=None):
         InspectController.clear_fingerprints()
@@ -353,7 +292,7 @@ class InspectScreen:
                     self._on_path_changed()
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"File picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"File picker failed: {exc}", is_error=True)
 
     async def _pick_selective_output(self):
         try:
@@ -362,7 +301,7 @@ class InspectScreen:
                 self._selective_output_field.value = folder
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Output picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Output picker failed: {exc}", is_error=True)
 
     async def _pick_diff_vault(self, target: str):
         picker = self.diff_vault_a_picker if target == "a" else self.diff_vault_b_picker
@@ -374,7 +313,7 @@ class InspectScreen:
                 field.value = getattr(item, "path", "") or getattr(item, "name", "")
             self.shell.safe_update()
         except Exception as exc:
-            self._set_status(f"Vault picker failed: {exc}", is_error=True)
+            set_screen_status(self.shell, f"Vault picker failed: {exc}", is_error=True)
 
     # --- dialogs ---
     def _open_selective_extract(self, _event=None):
@@ -384,7 +323,7 @@ class InspectScreen:
             return
         files = self.current_metadata.get("files", [])
         if not files:
-            self._set_status("No files available for Selective Extract", is_error=True)
+            set_screen_status(self.shell, "No files available for Selective Extract", is_error=True)
             return
 
         checks = []
@@ -417,23 +356,23 @@ class InspectScreen:
         def _extract(_e=None):
             selected = [c.data for c in checks if c.value]
             if not selected:
-                self._set_status("Select at least one file", is_error=True)
+                set_screen_status(self.shell, "Select at least one file", is_error=True)
                 return
             out_raw = (self._selective_output_field.value or "").strip()
             out_dir = Path(out_raw)
             if not out_raw or not out_dir.is_dir():
-                self._set_status("Select a valid output directory", is_error=True)
+                set_screen_status(self.shell, "Select a valid output directory", is_error=True)
                 return
             try:
                 if InspectController.temp_space_warning_needed(
                     self.current_metadata,
                     shutil.disk_usage(tempfile.gettempdir()).free,
                 ):
-                    self._set_status("Temp drive may not have enough free space", is_error=True)
+                    set_screen_status(self.shell, "Temp drive may not have enough free space", is_error=True)
                     return
                 selected_size = InspectController.estimate_selected_size(self.current_metadata, selected)
                 if shutil.disk_usage(out_dir).free < selected_size:
-                    self._set_status("Output drive does not have enough free space", is_error=True)
+                    set_screen_status(self.shell, "Output drive does not have enough free space", is_error=True)
                     return
             except Exception:
                 pass
@@ -493,7 +432,7 @@ class InspectScreen:
             self.page.show_dialog(dialog)
             self.shell.safe_update()
         else:
-            self._set_status("Dialog unavailable", is_error=True)
+            set_screen_status(self.shell, "Dialog unavailable", is_error=True)
 
     def _open_vault_diff(self, _event=None):
         if self.services.is_processing:
@@ -515,7 +454,7 @@ class InspectScreen:
             pw_a = pw_a_field.value or ""
             pw_b = pw_b_field.value or ""
             if not path_a.is_file() or not path_b.is_file() or not pw_a or not pw_b:
-                self._set_status("Vault paths and passwords are required", is_error=True)
+                set_screen_status(self.shell, "Vault paths and passwords are required", is_error=True)
                 return
             if hasattr(self.page, "pop_dialog"):
                 self.page.pop_dialog()
@@ -562,7 +501,7 @@ class InspectScreen:
             self.page.show_dialog(dialog)
             self.shell.safe_update()
         else:
-            self._set_status("Dialog unavailable", is_error=True)
+            set_screen_status(self.shell, "Dialog unavailable", is_error=True)
 
     # --- result handlers (called by AppShell on the poll loop) ---
     def on_inspect_result(self, msg):
@@ -573,7 +512,7 @@ class InspectScreen:
             self.current_auth_password = None
             self.current_auth_recovery_key = None
             self._set_results(error)
-            self._finish_operation(error)
+            finish_screen_operation(self.services, self.shell, error)
             return
         self.current_metadata = msg.get("metadata", {})
         path_str = msg.get("path", "")
@@ -585,7 +524,7 @@ class InspectScreen:
         self._pending_auth_recovery_key = None
         self.attempts_text.value = ""
         self._set_results(self._format_metadata(self.current_metadata))
-        self._finish_operation("Vault inspection complete")
+        finish_screen_operation(self.services, self.shell, "Vault inspection complete")
 
     def on_integrity_result(self, msg):
         ok = bool(msg.get("ok", False))
@@ -594,7 +533,7 @@ class InspectScreen:
         self._set_results(msg.get("msg", ""))
         if ok:
             self._refresh_fingerprint_panel()
-        self._finish_operation("Integrity check complete" if ok else "Integrity check failed")
+        finish_screen_operation(self.services, self.shell, "Integrity check complete" if ok else "Integrity check failed")
 
     def on_verify_result(self, msg):
         status = msg.get("status", "")
@@ -624,7 +563,7 @@ class InspectScreen:
             text = msg.get("error", "Verification error")
             status_line = "Verification error"
         self._set_results(text)
-        self._finish_operation(status_line)
+        finish_screen_operation(self.services, self.shell, status_line)
 
     def on_selective_extract_result(self, msg):
         if msg.get("error"):
@@ -722,7 +661,14 @@ class InspectScreen:
         self.shell.safe_update()
 
     def build(self) -> ft.Control:
-        self._ensure_services()
+        register_page_services(
+            self.page,
+            self.vault_picker,
+            self.selective_output_picker,
+            self.diff_vault_a_picker,
+            self.diff_vault_b_picker,
+            self.clipboard,
+        )
         self._refresh_fingerprint_panel()
         return ft.Container(
             content=ft.Column(
@@ -733,7 +679,7 @@ class InspectScreen:
                         weight=ft.FontWeight.W_600,
                         color=COLORS["text_primary"],
                     ),
-                    self._panel(
+                    card_panel(
                         "Vault",
                         [
                             ft.Row(
@@ -745,7 +691,7 @@ class InspectScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Authentication",
                         [
                             self.password_field,
@@ -754,7 +700,7 @@ class InspectScreen:
                             self.attempts_text,
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Actions",
                         [
                             ft.Row(
@@ -769,7 +715,7 @@ class InspectScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Results",
                         [
                             ft.Container(
@@ -781,7 +727,7 @@ class InspectScreen:
                             ),
                         ],
                     ),
-                    self._panel(
+                    card_panel(
                         "Saved Fingerprints",
                         [
                             ft.Container(

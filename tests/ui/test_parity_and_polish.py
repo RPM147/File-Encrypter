@@ -1,7 +1,6 @@
 """Stage 11 cross-cutting parity tests for the Flet UI."""
 import asyncio
 import json
-import queue
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -331,11 +330,11 @@ def test_copy_sha_uses_saved_fingerprint_and_token_clear(fast_services, tmp_path
 
     _run(screen._copy_sha())
     assert fake.values == ["a" * 64]
-    old_token = screen._clipboard_token
+    old_token = screen.clipboard_guard.token
 
-    _run(screen._clear_clipboard_if_current(old_token - 1))
+    _run(screen.clipboard_guard.clear_if_current(old_token - 1))
     assert fake.values == ["a" * 64]
-    _run(screen._clear_clipboard_if_current(old_token))
+    _run(screen.clipboard_guard.clear_if_current(old_token))
     assert fake.values[-1] == ""
     assert shell.status_text.value == "Clipboard cleared"
 

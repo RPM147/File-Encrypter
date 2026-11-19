@@ -1,75 +1,37 @@
-"""Vault decryption controller for the Flet UI.
+"""Vault decryption controller for the Flet UI (Flet-free)."""
 
-This module intentionally imports no Flet symbols. It mirrors the legacy
-views/decrypt_view.py worker call sequence on a worker thread and reports
-progress through the Stage-1 message queue protocol, so it is unit-testable with
-real crypto round-trips in a headless environment.
-"""
 import logging
 import os
-import queue
-import shutil
 import tempfile
-import threading
 from pathlib import Path
 from typing import Optional
 
-from rpm_encrypter.storage.config import push_recent
 from rpm_encrypter.core import AuthenticationError, OperationCancelledError
+from rpm_encrypter.storage.config import push_recent
 from rpm_encrypter.storage.log_hygiene import redact_path
+from .base import BaseController
 
 logger = logging.getLogger("RPM_GUI")
 
 
-class DecryptController:
-    """Drives vault decrypt on a worker thread, posting bridge messages.
-    FLET-FREE -> unit-testable with real crypto round-trips."""
-
-    def __init__(self, services):
-        self.services = services
+class DecryptController(BaseController):
+    """Drives vault decrypt on a worker thread, posting bridge messages."""
 
     def start(self, paths, password, output_dir, recovery_key=None):
         """Spawn the decryption worker."""
-        threading.Thread(
-            target=self._worker,
-            args=(list(paths), password, Path(output_dir), recovery_key),
-            daemon=True,
-        ).start()
-
-    def _put(self, msg, timeout=0.1):
-        try:
-            self.services.msg_queue.put(msg, timeout=timeout)
-        except queue.Full:
-            pass
-
-    def _log(self, text):
-        self._put({"type": "log", "text": text})
-
-    def _log_activity(self, action, target, result, details=""):
-        logger_obj = getattr(self.services, "activity_logger", None)
-        if logger_obj:
-            logger_obj.log_event(action, target, result, details)
-
-    def _wipe_extract_dir(self, extract_dir):
-        if extract_dir is None or not extract_dir.exists():
-            return
-        try:
-            self.services.wiper.wipe_folder(extract_dir)
-        except Exception:
-            shutil.rmtree(extract_dir, ignore_errors=True)
+        self._spawn(self._worker, list(paths), password, Path(output_dir), recovery_key)
 
     def _worker(self, paths, password, output_dir, recovery_key=None):
         s = self.services
-        crypto, packager, wiper = s.crypto, s.packager, s.wiper
+        crypto, packager = s.crypto, s.packager
         output_dir = Path(output_dir)
         total = len(paths)
         success = 0
         auth_error = False
         cancelled = False
-        cancel_check = lambda: s.cancel_requested
 
         for idx, raw_path in enumerate(paths, 1):
-            if s.cancel_requested:
+            if self._cancel_check():
                 cancelled = True
                 self._log("Operation cancelled by user")
                 break
@@ -86,9 +48,7 @@ class DecryptController:
                 )
                 os.close(temp_fd)
                 temp_zip = Path(temp_name)
-
-                with s._temp_files_lock:
-                    s._active_temp_files.append(temp_zip)
+                self._track_temp(temp_zip)
 
                 self._log(f"[{idx}/{total}] Decrypting -> {path.name}")
                 self._put({"type": "progress_start"})
@@ -99,18 +59,14 @@ class DecryptController:
                         timeout=0.01,
                     )
 
-                # CRITICAL (Phase 12 PERF-01): single KDF path. Do not pre-verify
-                # metadata. decrypt_file performs the unchanged backend M2
-                # constant-work pass and returns the populated header. Calling the
-                # metadata verifier first would repeat the same two Argon2
-                # derivations, turning decrypt into four KDF calls.
+                # Single KDF path: decrypt_file performs the M2 pass and returns header.
                 header = crypto.decrypt_file(
                     path,
                     temp_zip,
                     password,
                     progress_callback=prog,
                     recovery_key=recovery_key,
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
 
                 filename = header.payload.filename
@@ -125,7 +81,7 @@ class DecryptController:
                 packager.extract_archive(
                     temp_zip,
                     extract_dir,
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
 
                 s.stats.add_decrypted(byte_count=header.payload.original_size)
@@ -143,7 +99,7 @@ class DecryptController:
             except OperationCancelledError:
                 cancelled = True
                 self._log("Cancelling and cleaning up...")
-                self._wipe_extract_dir(extract_dir)
+                self._wipe_temp_dir(extract_dir)
                 break
 
             except AuthenticationError:
@@ -161,31 +117,12 @@ class DecryptController:
 
             except Exception as exc:
                 logger.exception("Decryption failed for %s", redact_path(path))
-                # Partial plaintext may have been written before the failure.
-                self._wipe_extract_dir(extract_dir)
+                self._wipe_temp_dir(extract_dir)
                 self._log(f"[{idx}/{total}] FAILED: {exc}")
                 self._log_activity("Decrypt", path.name, "Failed", str(exc))
 
             finally:
-                if temp_zip is not None:
-                    with s._temp_files_lock:
-                        try:
-                            s._active_temp_files.remove(temp_zip)
-                        except ValueError:
-                            pass
-
-                    # temp_zip is the fully decrypted PLAINTEXT archive. Route
-                    # removal through the secure wiper (H4 FIX); a bare unlink
-                    # leaves a recoverable copy in the output folder's free space.
-                    try:
-                        if temp_zip.exists():
-                            wiper.wipe_file(temp_zip)
-                    except Exception as wipe_exc:
-                        logger.warning(
-                            "Failed to securely wipe temp file %s: %s",
-                            redact_path(temp_zip),
-                            wipe_exc,
-                        )
+                self._wipe_temp_file(temp_zip)
 
         s.is_processing = False
         text = (

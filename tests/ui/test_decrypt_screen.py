@@ -173,7 +173,7 @@ def test_decrypt_controller_keeps_collision_loop_and_partial_wipe():
     root = Path(__file__).resolve().parents[2]
     src = (root / "src" / "rpm_encrypter" / "services" / "controllers" / "decrypt_controller.py").read_text(encoding="utf-8")
     assert "while extract_dir.exists()" in src
-    assert "wipe_folder(extract_dir)" in src or "_wipe_extract_dir(extract_dir)" in src
+    assert "self._wipe_temp_dir(extract_dir)" in src
 
 
 # --- Screen runtime guards: the Stage-2 "Unknown control: FilePicker" bug was
@@ -246,7 +246,7 @@ def test_decrypt_screen_no_longer_uses_page_overlay_for_file_picker():
     src = (root / "src" / "rpm_encrypter" / "ui" / "screens" / "decrypt_screen.py").read_text(encoding="utf-8")
     assert "page.overlay" not in src
     assert ".overlay" not in src
-    assert "page.services" in src or ".services" in src
+    assert "register_page_services" in src
 
 
 def test_decrypt_screen_recovery_toggle_swaps_password_and_phrase_fields():

@@ -6,7 +6,7 @@ LINK itself, never the target. Following a symlink would let a folder that
 contains a link (a) overwrite a file OUTSIDE the selected folder during a secure
 wipe, or (b) archive content from outside the selected root into the vault.
 
-These tests are GUI-free (they import only `file_handler`).
+These tests are GUI-free (they import only `storage.packager` / `storage.wiper`).
 
 NOTE: creating a symlink on Windows raises OSError [WinError 1314] unless
 Developer Mode / admin is enabled. Every test detects this and skips cleanly
@@ -19,7 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from rpm_encrypter.storage.file_handler import SecureWiper, FolderPackager
+from rpm_encrypter.storage.packager import FolderPackager
+from rpm_encrypter.storage.wiper import SecureWiper
 
 
 SKIP_REASON = (

@@ -1,28 +1,20 @@
-"""Normal and hidden-vault encryption controller for the Flet UI.
+"""Normal and hidden-vault encryption controller for the Flet UI (Flet-free)."""
 
-This module intentionally imports no Flet symbols. It runs the existing backend
-pipeline on a worker thread and reports progress through the Stage-1 message
-queue protocol.
-"""
-import queue
-import threading
 from pathlib import Path
 
-from rpm_encrypter.storage.config import push_recent
-from rpm_encrypter.services.constants import container_label_to_mb
 from rpm_encrypter.core import (
     MAX_PAYLOAD_SIZE,
     OperationCancelledError,
     PayloadTooLargeError,
 )
-from rpm_encrypter.storage.file_handler import atomic_output
+from rpm_encrypter.services.constants import container_label_to_mb
+from rpm_encrypter.storage.atomic import atomic_output
+from rpm_encrypter.storage.config import push_recent
+from .base import BaseController
 
 
-class EncryptController:
+class EncryptController(BaseController):
     """Drive normal and hidden-vault encryption while posting bridge messages."""
-
-    def __init__(self, services):
-        self.services = services
 
     def start(
         self,
@@ -39,38 +31,21 @@ class EncryptController:
         hidden_size_label="100 MB",
         hidden_sources=None,
     ):
-        """Spawn the encryption worker.
-
-        The positional signature remains compatible with Stage-2 callers. Stage
-        11 additions are keyword-only so older tests and integrations keep
-        working.
-        """
-        threading.Thread(
-            target=self._worker,
-            args=(
-                list(sources),
-                password,
-                int(container_mb or 0),
-                bool(compress),
-                bool(secure_wipe),
-                out_dir,
-                recovery_key,
-                bool(hidden_mode),
-                hidden_password,
-                hidden_size_label,
-                list(hidden_sources or []),
-            ),
-            daemon=True,
-        ).start()
-
-    def _put(self, msg, timeout=0.1):
-        try:
-            self.services.msg_queue.put(msg, timeout=timeout)
-        except queue.Full:
-            pass
-
-    def _log(self, text):
-        self._put({"type": "log", "text": text})
+        """Spawn the encryption worker."""
+        self._spawn(
+            self._worker,
+            list(sources),
+            password,
+            int(container_mb or 0),
+            bool(compress),
+            bool(secure_wipe),
+            out_dir,
+            recovery_key,
+            bool(hidden_mode),
+            hidden_password,
+            hidden_size_label,
+            list(hidden_sources or []),
+        )
 
     def _worker(
         self,
@@ -130,7 +105,7 @@ class EncryptController:
         self._put({"type": "progress_start"})
 
         for idx, src in enumerate(sources, 1):
-            if s.cancel_requested:
+            if self._cancel_check():
                 cancelled = True
                 self._log("Operation cancelled by user")
                 break
@@ -145,29 +120,26 @@ class EncryptController:
                 if manifest_size > MAX_PAYLOAD_SIZE:
                     detail = f"Payload too large (> 32 GiB): {manifest_size:,} bytes."
                     self._log(f"[{idx}/{total}] FAILED: {detail}")
-                    if s.activity_logger:
-                        s.activity_logger.log_event("Encrypt", path.name, "Failed", detail)
+                    self._log_activity("Encrypt", path.name, "Failed", detail)
                     had_error = True
                     continue
 
-                cancel_check = lambda: s.cancel_requested
                 temp_zip = (
                     packager.package_folder(
                         path,
                         compress=compress,
                         on_skip=lambda m: self._log(f"Skipped: {m}"),
-                        cancel_check=cancel_check,
+                        cancel_check=self._cancel_check,
                     )
                     if path.is_dir()
                     else packager.package_files(
                         [path],
                         compress=compress,
                         on_skip=lambda m: self._log(f"Skipped: {m}"),
-                        cancel_check=cancel_check,
+                        cancel_check=self._cancel_check,
                     )
                 )
-                with s._temp_files_lock:
-                    s._active_temp_files.append(temp_zip)
+                self._track_temp(temp_zip)
 
                 base_dir = Path(out_dir) if out_dir else path.parent
                 out_path = base_dir / f"{path.name}.vault"
@@ -191,7 +163,7 @@ class EncryptController:
                         progress_callback=prog,
                         recovery_key=recovery_key,
                         target_container_mb=container_mb,
-                        cancel_check=cancel_check,
+                        cancel_check=self._cancel_check,
                     ),
                 )
 
@@ -207,10 +179,7 @@ class EncryptController:
                     byte_count=manifest.get("total_size", 0),
                 )
                 push_recent("enc_sources", str(path))
-                if s.activity_logger:
-                    s.activity_logger.log_event(
-                        "Encrypt", path.name, "Success", f"Output: {out_path.name}"
-                    )
+                self._log_activity("Encrypt", path.name, "Success", f"Output: {out_path.name}")
                 self._log(f"[{idx}/{total}] Done       ->  {out_path.name}")
                 success += 1
 
@@ -221,11 +190,10 @@ class EncryptController:
             except Exception as exc:
                 had_error = True
                 self._log(f"[{idx}/{total}] FAILED: {exc}")
-                if s.activity_logger:
-                    s.activity_logger.log_event("Encrypt", path.name, "Failed", str(exc))
+                self._log_activity("Encrypt", path.name, "Failed", str(exc))
                 self._put({"type": "error", "text": f"{path.name}: {exc}"})
             finally:
-                self._wipe_temp(temp_zip)
+                self._wipe_temp_file(temp_zip)
 
         s.is_processing = False
         text = (
@@ -266,7 +234,6 @@ class EncryptController:
         hidden_tmp = None
         self._put({"type": "progress_start"})
         self._log("--- Creating hidden vault ---")
-        cancel_check = lambda: s.cancel_requested
 
         try:
             if not paths:
@@ -310,7 +277,7 @@ class EncryptController:
                     exclude_paths=h_paths,
                     compress=compress,
                     on_skip=lambda m: self._log(f"Skipped: {m}"),
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
             else:
                 decoy_tmp = packager.package_files(
@@ -318,7 +285,7 @@ class EncryptController:
                     exclude_paths=h_paths,
                     compress=compress,
                     on_skip=lambda m: self._log(f"Skipped: {m}"),
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
             self._track_temp(decoy_tmp)
 
@@ -328,14 +295,14 @@ class EncryptController:
                     h_paths[0],
                     compress=compress,
                     on_skip=lambda m: self._log(f"Skipped: {m}"),
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
             else:
                 hidden_tmp = packager.package_files(
                     h_paths,
                     compress=compress,
                     on_skip=lambda m: self._log(f"Skipped: {m}"),
-                    cancel_check=cancel_check,
+                    cancel_check=self._cancel_check,
                 )
             self._track_temp(hidden_tmp)
 
@@ -356,7 +323,11 @@ class EncryptController:
             self._log(f"Encrypting hidden vault -> {final_vault.name}")
 
             def _write_hidden_vault(p):
-                with open(decoy_tmp, "rb") as dec_in, open(hidden_tmp, "rb") as hid_in, open(p, "wb") as v_out:
+                with (
+                    open(decoy_tmp, "rb") as dec_in,
+                    open(hidden_tmp, "rb") as hid_in,
+                    open(p, "wb") as v_out,
+                ):
                     crypto.encrypt_hidden_vault(
                         dec_in,
                         hid_in,
@@ -371,7 +342,7 @@ class EncryptController:
                         progress_callback=prog,
                         recovery_key=recovery_key,
                         target_container_mb=hidden_container_mb,
-                        cancel_check=cancel_check,
+                        cancel_check=self._cancel_check,
                     )
 
             atomic_output(final_vault, _write_hidden_vault)
@@ -384,13 +355,16 @@ class EncryptController:
                     else:
                         wiper.wipe_file(source, on_skip=lambda m: self._log(f"Skipped: {m}"))
 
-            file_count = int(dec_meta.get("file_count", 0) or 0) + int(hid_meta.get("file_count", 0) or 0)
-            byte_count = int(dec_meta.get("total_size", 0) or 0) + int(hid_meta.get("total_size", 0) or 0)
+            file_count = int(dec_meta.get("file_count", 0) or 0) + int(
+                hid_meta.get("file_count", 0) or 0
+            )
+            byte_count = int(dec_meta.get("total_size", 0) or 0) + int(
+                hid_meta.get("total_size", 0) or 0
+            )
             s.stats.add_encrypted(file_count=file_count, byte_count=byte_count)
             for path in paths:
                 push_recent("enc_sources", str(path))
-            if s.activity_logger:
-                s.activity_logger.log_event("Encrypt", "HiddenArchive", "Success", f"Output: {final_vault.name}")
+            self._log_activity("Encrypt", "HiddenArchive", "Success", f"Output: {final_vault.name}")
             self._log(f"Hidden vault complete -> {final_vault.name}")
             success = 1
 
@@ -400,12 +374,11 @@ class EncryptController:
         except Exception as exc:
             had_error = True
             self._log(f"FAILED: {exc}")
-            if s.activity_logger:
-                s.activity_logger.log_event("Encrypt", "HiddenArchive", "Failed", str(exc))
+            self._log_activity("Encrypt", "HiddenArchive", "Failed", str(exc))
             self._put({"type": "error", "text": f"Hidden vault: {exc}"})
         finally:
-            self._wipe_temp(decoy_tmp)
-            self._wipe_temp(hidden_tmp)
+            self._wipe_temp_file(decoy_tmp)
+            self._wipe_temp_file(hidden_tmp)
 
         s.is_processing = False
         text = (
@@ -421,27 +394,3 @@ class EncryptController:
             },
             timeout=1.0,
         )
-
-    def _track_temp(self, temp_path):
-        if temp_path is None:
-            return
-        with self.services._temp_files_lock:
-            if temp_path not in self.services._active_temp_files:
-                self.services._active_temp_files.append(temp_path)
-
-    def _wipe_temp(self, temp_path):
-        if temp_path is None:
-            return
-        with self.services._temp_files_lock:
-            try:
-                self.services._active_temp_files.remove(temp_path)
-            except ValueError:
-                pass
-        try:
-            if temp_path.exists():
-                self.services.wiper.wipe_file(temp_path)
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
