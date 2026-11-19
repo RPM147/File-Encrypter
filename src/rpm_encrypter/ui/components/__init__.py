@@ -2,6 +2,11 @@
 
 from .clipboard import AutoClearClipboard
 from .dialogs import show_confirm_dialog
+from .hidden_vault_panel import (
+    HIDDEN_RECOVERY_WARNING,
+    HIDDEN_SIZE_CHOICES,
+    HiddenVaultPanel,
+)
 from .layout import (
     card_panel,
     empty_text,
@@ -14,6 +19,9 @@ from .layout import (
 
 __all__ = [
     "AutoClearClipboard",
+    "HIDDEN_RECOVERY_WARNING",
+    "HIDDEN_SIZE_CHOICES",
+    "HiddenVaultPanel",
     "show_confirm_dialog",
     "card_panel",
     "empty_text",

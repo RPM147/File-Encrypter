@@ -1,6 +1,4 @@
 """Vault Info / Inspect screen for the Flet UI."""
-import shutil
-import tempfile
 from pathlib import Path
 
 import flet as ft
@@ -22,7 +20,9 @@ from rpm_encrypter.ui.components import (
     register_page_services,
     set_screen_status,
 )
+from rpm_encrypter.ui.dialogs import show_selective_extract_dialog, show_vault_diff_dialog
 from rpm_encrypter.ui.tokens import COLORS, SPACING, TYPE
+from .inspect_formatters import build_fingerprint_rows, format_vault_metadata
 
 
 _RESULTS_HELP = (
@@ -47,9 +47,6 @@ class InspectScreen:
         self._pending_auth_recovery_key = None
         self._pending_auth_path = None
         self.last_sha = ""
-        self._selective_output_field = None
-        self._diff_path_a_field = None
-        self._diff_path_b_field = None
 
         self.vault_picker = ft.FilePicker()
         self.selective_output_picker = ft.FilePicker()
@@ -301,214 +298,35 @@ class InspectScreen:
         except Exception as exc:
             set_screen_status(self.shell, f"File picker failed: {exc}", is_error=True)
 
-    async def _pick_selective_output(self):
-        try:
-            folder = await self.selective_output_picker.get_directory_path()
-            if folder and self._selective_output_field is not None:
-                self._selective_output_field.value = folder
-            self.shell.safe_update()
-        except Exception as exc:
-            set_screen_status(self.shell, f"Output picker failed: {exc}", is_error=True)
-
-    async def _pick_diff_vault(self, target: str):
-        picker = self.diff_vault_a_picker if target == "a" else self.diff_vault_b_picker
-        field = self._diff_path_a_field if target == "a" else self._diff_path_b_field
-        try:
-            files = await picker.pick_files(allow_multiple=False)
-            if files and field is not None:
-                item = files[0]
-                field.value = getattr(item, "path", "") or getattr(item, "name", "")
-            self.shell.safe_update()
-        except Exception as exc:
-            set_screen_status(self.shell, f"Vault picker failed: {exc}", is_error=True)
-
     # --- dialogs ---
     def _open_selective_extract(self, _event=None):
         if self.services.is_processing:
             return
         if not self._has_current_context():
             return
-        files = self.current_metadata.get("files", [])
-        if not files:
-            set_screen_status(self.shell, "No files available for Selective Extract", is_error=True)
-            return
-
-        checks = []
-        for item in files:
-            path = item.get("path", "")
-            size = int(item.get("size", 0) or 0)
-            checks.append(
-                ft.Checkbox(
-                    label=f"{path} ({size:,} bytes)",
-                    value=False,
-                    data=path,
-                    active_color=COLORS["accent"],
-                    label_style=ft.TextStyle(size=TYPE["body"]["size"], color=COLORS["text_primary"]),
-                )
-            )
-
-        self._selective_output_field = ft.TextField(
-            label="Output directory",
-            expand=True,
-            color=COLORS["text_primary"],
-            border_color=COLORS["border"],
-            focused_border_color=COLORS["accent"],
+        show_selective_extract_dialog(
+            self.page,
+            self.shell,
+            self.services,
+            metadata=self.current_metadata,
+            vault_path=self.current_path,
+            password=self.current_auth_password,
+            recovery_key=self.current_auth_recovery_key,
+            output_picker=self.selective_output_picker,
+            busy_control=self.selective_button,
         )
-
-        def _cancel(_e=None):
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
-            self.shell.safe_update()
-
-        def _extract(_e=None):
-            selected = [c.data for c in checks if c.value]
-            if not selected:
-                set_screen_status(self.shell, "Select at least one file", is_error=True)
-                return
-            out_raw = (self._selective_output_field.value or "").strip()
-            out_dir = Path(out_raw)
-            if not out_raw or not out_dir.is_dir():
-                set_screen_status(self.shell, "Select a valid output directory", is_error=True)
-                return
-            try:
-                if InspectController.temp_space_warning_needed(
-                    self.current_metadata,
-                    shutil.disk_usage(tempfile.gettempdir()).free,
-                ):
-                    set_screen_status(self.shell, "Temp drive may not have enough free space", is_error=True)
-                    return
-                selected_size = InspectController.estimate_selected_size(self.current_metadata, selected)
-                if shutil.disk_usage(out_dir).free < selected_size:
-                    set_screen_status(self.shell, "Output drive does not have enough free space", is_error=True)
-                    return
-            except Exception:
-                pass
-
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
-            self.services.is_processing = True
-            self.services.cancel_requested = False
-            self.shell.set_busy(self.selective_button)
-            self.shell.status_text.value = "Extracting selected files..."
-            self.shell.safe_update()
-            InspectController(self.services).start_selective_extract(
-                self.current_path,
-                self.current_auth_password,
-                self.current_auth_recovery_key,
-                selected,
-                out_dir,
-            )
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Selective Extract"),
-            content=ft.Container(
-                width=620,
-                height=430,
-                content=ft.Column(
-                    [
-                        ft.Text(
-                            "Full decrypt to a secure temporary archive is required first.",
-                            size=TYPE["caption"]["size"],
-                            color=COLORS["text_secondary"],
-                        ),
-                        ft.Container(
-                            content=ft.Column(checks, scroll=ft.ScrollMode.AUTO),
-                            height=260,
-                            padding=10,
-                            bgcolor=COLORS["bg"],
-                            border_radius=SPACING["radius"],
-                        ),
-                        ft.Row(
-                            [
-                                self._selective_output_field,
-                                ft.Button("Browse", on_click=lambda _e: self.page.run_task(self._pick_selective_output)),
-                            ],
-                            spacing=10,
-                        ),
-                    ],
-                    spacing=12,
-                ),
-            ),
-            actions=[
-                ft.Button("Cancel", on_click=_cancel),
-                ft.Button("Extract", on_click=_extract),
-            ],
-        )
-        if hasattr(self.page, "show_dialog"):
-            self.page.show_dialog(dialog)
-            self.shell.safe_update()
-        else:
-            set_screen_status(self.shell, "Dialog unavailable", is_error=True)
 
     def _open_vault_diff(self, _event=None):
         if self.services.is_processing:
             return
-
-        self._diff_path_a_field = ft.TextField(label="Vault A path", expand=True)
-        self._diff_path_b_field = ft.TextField(label="Vault B path", expand=True)
-        pw_a_field = ft.TextField(label="Vault A password", password=True, can_reveal_password=True)
-        pw_b_field = ft.TextField(label="Vault B password", password=True, can_reveal_password=True)
-
-        def _cancel(_e=None):
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
-            self.shell.safe_update()
-
-        def _compare(_e=None):
-            path_a = Path((self._diff_path_a_field.value or "").strip().strip('"'))
-            path_b = Path((self._diff_path_b_field.value or "").strip().strip('"'))
-            pw_a = pw_a_field.value or ""
-            pw_b = pw_b_field.value or ""
-            if not path_a.is_file() or not path_b.is_file() or not pw_a or not pw_b:
-                set_screen_status(self.shell, "Vault paths and passwords are required", is_error=True)
-                return
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
-            self.services.is_processing = True
-            self.services.cancel_requested = False
-            self.shell.set_busy(self.diff_button)
-            self.shell.status_text.value = "Computing Vault Diff..."
-            self.shell.safe_update()
-            InspectController(self.services).start_vault_diff(path_a, pw_a, path_b, pw_b)
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Vault Diff"),
-            content=ft.Container(
-                width=620,
-                content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                self._diff_path_a_field,
-                                ft.Button("Browse", on_click=lambda _e: self.page.run_task(self._pick_diff_vault, "a")),
-                            ],
-                            spacing=10,
-                        ),
-                        pw_a_field,
-                        ft.Row(
-                            [
-                                self._diff_path_b_field,
-                                ft.Button("Browse", on_click=lambda _e: self.page.run_task(self._pick_diff_vault, "b")),
-                            ],
-                            spacing=10,
-                        ),
-                        pw_b_field,
-                    ],
-                    spacing=12,
-                ),
-            ),
-            actions=[
-                ft.Button("Cancel", on_click=_cancel),
-                ft.Button("Compare", on_click=_compare),
-            ],
+        show_vault_diff_dialog(
+            self.page,
+            self.shell,
+            self.services,
+            picker_a=self.diff_vault_a_picker,
+            picker_b=self.diff_vault_b_picker,
+            busy_control=self.diff_button,
         )
-        if hasattr(self.page, "show_dialog"):
-            self.page.show_dialog(dialog)
-            self.shell.safe_update()
-        else:
-            set_screen_status(self.shell, "Dialog unavailable", is_error=True)
 
     # --- result handlers (called by AppShell on the poll loop) ---
     def on_inspect_result(self, event: InspectResultEvent):
@@ -530,7 +348,7 @@ class InspectScreen:
         self._pending_auth_password = None
         self._pending_auth_recovery_key = None
         self.attempts_text.value = ""
-        self._set_results(self._format_metadata(self.current_metadata))
+        self._set_results(format_vault_metadata(self.current_metadata))
         finish_screen_operation(self.services, self.shell, "Vault inspection complete")
 
     def on_integrity_result(self, event: IntegrityResultEvent):
@@ -584,84 +402,10 @@ class InspectScreen:
         self._set_results(event.text or "No diff results.")
 
     # --- rendering ---
-    def _format_metadata(self, metadata):
-        mb = metadata.get("total_size", metadata.get("original_size", 0)) / (1024 * 1024)
-        lines = [
-            "=" * 55,
-            "VAULT METADATA",
-            "=" * 55,
-            "",
-            f"Original Name   : {metadata.get('filename', 'N/A')}",
-            f"Original Size   : {metadata.get('original_size', 0):,} bytes ({mb:.2f} MiB)",
-            f"File Count      : {metadata.get('file_count', 'N/A')}",
-            f"Created         : {metadata.get('created_at', 'N/A')}",
-            f"Source Type     : {metadata.get('source_type', 'N/A')}",
-            "",
-            "-" * 55,
-            "CRYPTOGRAPHIC PARAMETERS",
-            "-" * 55,
-            "",
-            f"KDF Algorithm   : {metadata.get('kdf_algorithm', 'N/A')}",
-            f"Envelope Cipher : {metadata.get('encryption', 'N/A')}",
-            f"Payload Cipher  : {metadata.get('payload_encryption', 'N/A')}",
-            "",
-            f"Argon2 Memory   : {metadata.get('argon_memory', 'N/A')} KiB",
-            f"Argon2 Iters    : {metadata.get('argon_iterations', 'N/A')}",
-            f"Argon2 Parallel : {metadata.get('argon_parallelism', 'N/A')}",
-            "",
-            "=" * 55,
-        ]
-        files = metadata.get("files", [])
-        if files:
-            lines += ["", "FILE MANIFEST", "-" * 55, ""]
-            for fi in files[:100]:
-                lines.append(f"- {fi.get('path', '')} ({fi.get('size', 0):,} bytes)")
-            if len(files) > 100:
-                lines.append(f"... and {len(files) - 100} more files")
-            lines += ["", "=" * 55]
-        return "\n".join(lines)
-
     def _refresh_fingerprint_panel(self) -> None:
-        fps = InspectController.load_fingerprints()
-        if not fps:
-            self.fingerprint_list.controls = [
-                ft.Text(
-                    "No fingerprints saved yet.",
-                    size=TYPE["body"]["size"],
-                    color=COLORS["text_secondary"],
-                )
-            ]
-            return
-
-        rows = []
-        for key, rec in sorted(
-            fps.items(), key=lambda kv: kv[1].get("recorded", ""), reverse=True
-        ):
-            sz_mb = rec.get("size", 0) / (1024 * 1024)
-            sha16 = rec.get("sha256", "")[:16]
-            rows.append(
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text(
-                                f"{rec.get('filename', '?')}  ({sz_mb:.1f} MiB)  recorded {rec.get('recorded', '')}",
-                                size=TYPE["body"]["size"],
-                                color=COLORS["text_primary"],
-                            ),
-                            ft.Text(
-                                f"SHA-256: {sha16}...  |  {key}",
-                                size=TYPE["caption"]["size"],
-                                color=COLORS["text_secondary"],
-                            ),
-                        ],
-                        spacing=2,
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                    bgcolor=COLORS["bg"],
-                    border_radius=SPACING["radius"],
-                )
-            )
-        self.fingerprint_list.controls = rows
+        self.fingerprint_list.controls = build_fingerprint_rows(
+            InspectController.load_fingerprints()
+        )
 
     def _refresh_and_update(self, _event=None):
         self._refresh_fingerprint_panel()

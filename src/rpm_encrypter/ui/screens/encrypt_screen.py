@@ -11,20 +11,18 @@ from rpm_encrypter.services.constants import (
     zxcvbn,
 )
 from rpm_encrypter.core import entropy_to_mnemonic, generate_recovery_entropy
-from rpm_encrypter.services.recovery_copy import get_recovery_dialog_copy
 from rpm_encrypter.services.controllers.encrypt_controller import EncryptController
 from rpm_encrypter.services.controllers.settings_controller import SettingsController
 from rpm_encrypter.ui.components import (
+    HiddenVaultPanel,
     card_panel,
     empty_text,
     register_page_services,
     set_screen_status,
     source_row,
 )
+from rpm_encrypter.ui.dialogs import show_recovery_dialog
 from rpm_encrypter.ui.tokens import COLORS, SPACING, TYPE
-
-
-HIDDEN_SIZE_CHOICES = ["10 MB", "100 MB", "500 MB", "1 GB", "5 GB", "10 GB"]
 
 
 class EncryptScreen:
@@ -35,18 +33,18 @@ class EncryptScreen:
         self.services = services
         self.shell = shell
         self.sources = []
-        self.hidden_sources = []
         self.out_dir = ""
         self._pending_encrypt_args = None
 
+        self.hidden_section = HiddenVaultPanel(page, shell)
         self.file_picker = ft.FilePicker()
         self.folder_picker = ft.FilePicker()
         self.output_picker = ft.FilePicker()
-        self.hidden_file_picker = ft.FilePicker()
-        self.hidden_folder_picker = ft.FilePicker()
+        self.hidden_file_picker = self.hidden_section.file_picker
+        self.hidden_folder_picker = self.hidden_section.folder_picker
 
         self.source_list = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
-        self.hidden_source_list = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+        self.hidden_source_list = self.hidden_section.source_list
         self.path_field = ft.TextField(
             label="Path",
             expand=True,
@@ -135,43 +133,20 @@ class EncryptScreen:
             on_click=lambda _e: self.page.run_task(self._pick_output_dir),
         )
 
-        self.hidden_toggle = ft.Checkbox(
-            label="Enable Hidden Vault",
-            value=False,
-            on_change=self._toggle_hidden_mode,
-            active_color=COLORS["accent"],
-            label_style=ft.TextStyle(size=TYPE["body"]["size"], color=COLORS["text_primary"]),
-        )
-        self.hidden_password_field = ft.TextField(
-            label="Hidden Password",
-            password=True,
-            can_reveal_password=True,
-            text_size=TYPE["body"]["size"],
-            color=COLORS["text_primary"],
-            border_color=COLORS["border"],
-            focused_border_color=COLORS["accent"],
-        )
-        self.hidden_confirm_password_field = ft.TextField(
-            label="Confirm Hidden Password",
-            password=True,
-            can_reveal_password=True,
-            text_size=TYPE["body"]["size"],
-            color=COLORS["text_primary"],
-            border_color=COLORS["border"],
-            focused_border_color=COLORS["accent"],
-        )
-        self.hidden_size_dropdown = ft.Dropdown(
-            label="Hidden Container Size",
-            value="100 MB",
-            options=[ft.DropdownOption(key=label, text=label) for label in HIDDEN_SIZE_CHOICES],
-            width=210,
-            text_size=TYPE["body"]["size"],
-            color=COLORS["text_primary"],
-            border_color=COLORS["border"],
-            focused_border_color=COLORS["accent"],
-        )
-        self.hidden_panel = ft.Column(visible=False, spacing=12)
+        self.hidden_toggle = self.hidden_section.toggle
+        self.hidden_password_field = self.hidden_section.password_field
+        self.hidden_confirm_password_field = self.hidden_section.confirm_password_field
+        self.hidden_size_dropdown = self.hidden_section.size_dropdown
+        self.hidden_panel = self.hidden_section.panel
         self.encrypt_button = ft.Button("Encrypt", on_click=self._start_encrypt)
+
+    @property
+    def hidden_sources(self):
+        return self.hidden_section.sources
+
+    @hidden_sources.setter
+    def hidden_sources(self, value) -> None:
+        self.hidden_section.sources = list(value)
 
     def _refresh_profiles(self) -> None:
         try:
@@ -204,7 +179,6 @@ class EncryptScreen:
 
     def reset_form(self) -> None:
         self.sources = []
-        self.hidden_sources = []
         self.out_dir = ""
         self.path_field.value = ""
         self.password_field.value = ""
@@ -216,15 +190,10 @@ class EncryptScreen:
         self.secure_wipe_checkbox.value = False
         self.save_next_checkbox.value = True
         self.output_field.value = ""
-        self.hidden_toggle.value = False
-        self.hidden_password_field.value = ""
-        self.hidden_confirm_password_field.value = ""
-        self.hidden_size_dropdown.value = "100 MB"
         self.profile_dropdown.value = "Custom"
         self._toggle_output_override()
-        self._toggle_hidden_mode()
+        self.hidden_section.reset()
         self._render_sources()
-        self._render_hidden_sources()
 
     def _append_source(self, path_text: str) -> None:
         value = (path_text or "").strip().strip('"')
@@ -235,54 +204,26 @@ class EncryptScreen:
             self.sources.append(path)
             self._render_sources()
 
-    def _append_hidden_source(self, path_text: str) -> None:
-        value = (path_text or "").strip().strip('"')
-        if not value:
-            return
-        path = str(Path(value))
-        if path not in self.hidden_sources:
-            self.hidden_sources.append(path)
-            self._render_hidden_sources()
-
     def _remove_source(self, path: str) -> None:
         self.sources = [p for p in self.sources if p != path]
         self._render_sources()
         self.shell.safe_update()
 
-    def _remove_hidden_source(self, path: str) -> None:
-        self.hidden_sources = [p for p in self.hidden_sources if p != path]
-        self._render_hidden_sources()
-        self.shell.safe_update()
-
     def _render_sources(self) -> None:
-        self.source_list.controls = self._source_rows(
-            self.sources,
-            "No sources selected",
-            self._remove_source,
-        )
-
-    def _render_hidden_sources(self) -> None:
-        self.hidden_source_list.controls = self._source_rows(
-            self.hidden_sources,
-            "No hidden sources selected",
-            self._remove_hidden_source,
-        )
-
-    def _source_rows(self, paths, empty_label, remove_handler):
-        if not paths:
-            return [empty_text(empty_label)]
-
+        if not self.sources:
+            self.source_list.controls = [empty_text("No sources selected")]
+            return
         rows = []
-        for path in paths:
+        for path in self.sources:
             p = Path(path)
             rows.append(
                 source_row(
                     p.name or path,
-                    lambda _e, value=path: remove_handler(value),
+                    lambda _e, value=path: self._remove_source(value),
                     subtitle=str(p.parent),
                 )
             )
-        return rows
+        self.source_list.controls = rows
 
     def _add_path_from_field(self, _event=None) -> None:
         self._append_source(self.path_field.value)
@@ -316,24 +257,6 @@ class EncryptScreen:
             self.shell.safe_update()
         except Exception as exc:
             set_screen_status(self.shell, f"Output picker failed: {exc}", is_error=True)
-
-    async def _pick_hidden_files(self):
-        try:
-            files = await self.hidden_file_picker.pick_files(allow_multiple=True)
-            for item in files or []:
-                self._append_hidden_source(getattr(item, "path", "") or getattr(item, "name", ""))
-            self.shell.safe_update()
-        except Exception as exc:
-            set_screen_status(self.shell, f"Hidden file picker failed: {exc}", is_error=True)
-
-    async def _pick_hidden_folder(self):
-        try:
-            folder = await self.hidden_folder_picker.get_directory_path()
-            if folder:
-                self._append_hidden_source(folder)
-            self.shell.safe_update()
-        except Exception as exc:
-            set_screen_status(self.shell, f"Hidden folder picker failed: {exc}", is_error=True)
 
     def _update_strength(self, _event=None) -> None:
         password = self.password_field.value or ""
@@ -370,10 +293,6 @@ class EncryptScreen:
         if _event is not None:
             self.shell.safe_update()
 
-    def _toggle_hidden_mode(self, _event=None) -> None:
-        self.hidden_panel.visible = bool(self.hidden_toggle.value)
-        self.shell.safe_update()
-
     def _validate_start(self):
         sources = list(self.sources)
         if not sources:
@@ -394,24 +313,9 @@ class EncryptScreen:
                 return None, "Select a valid output directory"
             out_dir = raw_out
 
-        hidden_mode = bool(self.hidden_toggle.value)
-        hidden_password = None
-        hidden_size_label = self.hidden_size_dropdown.value or "100 MB"
-        hidden_sources = []
-        if hidden_mode:
-            hidden_password = self.hidden_password_field.value or ""
-            hidden_confirm = self.hidden_confirm_password_field.value or ""
-            if not hidden_password:
-                return None, "Enter a hidden password"
-            if hidden_password != hidden_confirm:
-                return None, "Hidden passwords do not match"
-            if password == hidden_password:
-                return None, "Decoy and hidden passwords must be different"
-            hidden_sources = list(self.hidden_sources)
-            if not hidden_sources:
-                return None, "Add at least one hidden source"
-            if hidden_size_label not in HIDDEN_SIZE_CHOICES:
-                return None, "Select an explicit hidden container size"
+        hidden_args, hidden_error = self.hidden_section.validate(password)
+        if hidden_error:
+            return None, hidden_error
 
         label = self.container_dropdown.value or CONTAINER_SIZE_CHOICES[0]
         return {
@@ -421,10 +325,7 @@ class EncryptScreen:
             "compress": bool(self.compress_checkbox.value),
             "secure_wipe": bool(self.secure_wipe_checkbox.value),
             "out_dir": out_dir,
-            "hidden_mode": hidden_mode,
-            "hidden_password": hidden_password,
-            "hidden_size_label": hidden_size_label,
-            "hidden_sources": hidden_sources,
+            **hidden_args,
         }, ""
 
     def _start_encrypt(self, _event=None) -> None:
@@ -449,77 +350,24 @@ class EncryptScreen:
         )
 
     def _show_recovery_dialog(self, phrase: str, hidden_mode: bool, recovery_key: bytes) -> None:
-        recovery_copy = get_recovery_dialog_copy(hidden_mode)
-        confirmed = ft.Checkbox(
-            label=recovery_copy.checkbox_text,
-            value=False,
-            active_color=COLORS["accent"],
-            label_style=ft.TextStyle(size=TYPE["body"]["size"], color=COLORS["text_primary"]),
-        )
-
-        def _cancel(_e=None):
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
+        def _cancel():
             self.services.is_processing = False
             self._pending_encrypt_args = None
             set_screen_status(self.shell, "Encryption cancelled")
 
-        def _continue(_e=None):
-            if not confirmed.value:
-                set_screen_status(self.shell, "Confirm that you saved the recovery phrase", is_error=True)
-                return
-            if hasattr(self.page, "pop_dialog"):
-                self.page.pop_dialog()
-            self._continue_after_recovery(recovery_key)
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(recovery_copy.title),
-            content=ft.Container(
-                width=560,
-                content=ft.Column(
-                    [
-                        ft.Text(
-                            recovery_copy.heading,
-                            size=TYPE["section"]["size"],
-                            weight=ft.FontWeight.W_600,
-                            color=COLORS["text_primary"],
-                        ),
-                        ft.Text(
-                            recovery_copy.description,
-                            size=TYPE["body"]["size"],
-                            color=COLORS["text_secondary"],
-                        ),
-                        ft.TextField(
-                            value=phrase,
-                            read_only=True,
-                            multiline=True,
-                            min_lines=3,
-                            max_lines=5,
-                            text_style=ft.TextStyle(font_family="Courier New"),
-                            color=COLORS["text_primary"],
-                            border_color=COLORS["border"],
-                        ),
-                        confirmed,
-                    ],
-                    tight=True,
-                    spacing=12,
-                ),
-            ),
-            actions=[
-                ft.Button("Cancel", on_click=_cancel),
-                ft.Button("Continue", on_click=_continue),
-            ],
-        )
-
-        if not hasattr(self.page, "show_dialog"):
+        def _unavailable():
             self.services.is_processing = False
             self._pending_encrypt_args = None
-            set_screen_status(self.shell, "Recovery dialog unavailable", is_error=True)
-            return
 
-        self.page.show_dialog(dialog)
-        self.shell.safe_update()
+        show_recovery_dialog(
+            self.page,
+            self.shell,
+            phrase=phrase,
+            hidden_mode=hidden_mode,
+            on_confirm=lambda: self._continue_after_recovery(recovery_key),
+            on_cancel=_cancel,
+            on_unavailable=_unavailable,
+        )
 
     def _continue_after_recovery(self, recovery_key: bytes) -> None:
         args = self._pending_encrypt_args
@@ -557,33 +405,8 @@ class EncryptScreen:
         )
         self._refresh_profiles()
         self._render_sources()
-        self._render_hidden_sources()
         self._toggle_output_override()
-        self.hidden_panel.controls = [
-            ft.Text(
-                "Hidden data has no recovery phrase and requires the hidden password.",
-                size=TYPE["caption"]["size"],
-                color=COLORS["text_secondary"],
-            ),
-            ft.Row(
-                [
-                    ft.Button("Add Hidden File", on_click=lambda _e: self.page.run_task(self._pick_hidden_files)),
-                    ft.Button("Add Hidden Folder", on_click=lambda _e: self.page.run_task(self._pick_hidden_folder)),
-                ],
-                spacing=10,
-            ),
-            ft.Container(
-                content=self.hidden_source_list,
-                height=150,
-                padding=10,
-                bgcolor=COLORS["bg"],
-                border_radius=SPACING["radius"],
-            ),
-            self.hidden_password_field,
-            self.hidden_confirm_password_field,
-            self.hidden_size_dropdown,
-        ]
-        self.hidden_panel.visible = bool(self.hidden_toggle.value)
+        self.hidden_section.build_controls()
         return ft.Container(
             content=ft.Column(
                 [

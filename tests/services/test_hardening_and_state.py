@@ -103,12 +103,14 @@ def test_recovery_labels_clarify_standard_or_decoy_only_scope():
 
 
 def test_encrypt_screen_warns_hidden_has_no_recovery_and_shows_single_dialog():
-    src = (ROOT / "src" / "rpm_encrypter" / "ui" / "screens" / "encrypt_screen.py").read_text(
-        encoding="utf-8"
-    )
-    assert '"type": "recovery_phrase"' not in src
-    assert "Hidden data has no recovery phrase" in src
-    assert "requires the hidden password" in src
+    ui_dir = ROOT / "src" / "rpm_encrypter" / "ui"
+    enc_src = (ui_dir / "screens" / "encrypt_screen.py").read_text(encoding="utf-8")
+    hidden_src = (ui_dir / "components" / "hidden_vault_panel.py").read_text(encoding="utf-8")
+    assert '"type": "recovery_phrase"' not in enc_src
+    assert "HiddenVaultPanel" in enc_src
+    assert "show_recovery_dialog" in enc_src
+    assert "Hidden data has no recovery phrase" in hidden_src
+    assert "requires the hidden password" in hidden_src
 
 
 def test_decrypt_and_rekey_controllers_hardening():
