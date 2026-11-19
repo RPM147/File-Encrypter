@@ -1,6 +1,4 @@
-customtkinter>=5.2.2
-argon2-cffi>=23.1.0
+flet==0.85.2  # pinned: the Flet UI targets the 0.85.2 API
 cryptography>=41.0.3
-tkinterdnd2>=0.3.0
+argon2-cffi>=23.1.0
 zxcvbn>=4.4.28
-flet==0.85.2  # pinned: the Flet UI targets the 0.85.2 API (a loose floor could pull a breaking 1.x)

@@ -50,7 +50,7 @@ Anyone with a copy of your `.vault` file can brute-force it **offline** with oth
 ### Other limitations
 
 - **Lost credentials = lost data.** If you lose both your password and your recovery phrase, the data is unrecoverable by design.
-- **Large-item plaintext is released before final verification.** For very large items the current format writes decrypted output to an app-owned temporary file before the authentication tag is checked ("release of unverified plaintext"). The output is app-owned, is not used until verification succeeds, and is securely wiped on failure. A future v4 chunked-AEAD format will verify each chunk before release.
+- **Large-item plaintext is released before final verification.** For very large items the current v4 format writes decrypted output to an app-owned temporary file before the authentication tag is checked ("release of unverified plaintext"). The output is app-owned, is not used until verification succeeds, and is securely wiped on failure. A future chunked-AEAD format will verify each chunk before release.
 - **Host trust.** RPM Encrypter cannot protect against a compromised operating system, malware, a keylogger, or a hardware implant on the machine where you type your password.
 
 ## Reporting a vulnerability

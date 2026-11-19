@@ -2,12 +2,10 @@
 
 Run this entire checklist before tagging/publishing any release. RPM Encrypter is a
 **local-only desktop app** — every step is performed on your own machine; no server
-or network is involved (except the optional, off-by-default update check in the legacy
-interface). All steps are **manual** unless marked *(automated)*.
+or network is involved (except the optional, off-by-default update check). All steps
+are **manual** unless marked *(automated)*.
 
-The shipped UI is the modern **Flet** app (`app_flet.py`); the legacy **CustomTkinter**
-app (`gui_app.py`) is kept as a fallback. Run the GUI smoke tests below against the Flet
-app. If you also ship the legacy app, repeat at least sections 3–7 against it.
+The application entry point is `src\main.py` (`rpm_encrypter.ui.app`).
 
 Local state files this app may create in your home directory (referenced throughout):
 
@@ -21,26 +19,25 @@ Local state files this app may create in your home directory (referenced through
 
 ## 0. Pre-flight (automated gates)
 - [ ] *(automated)* `python -m pytest -q` → **all green** (symlink tests skip on Windows without Developer Mode)
-- [ ] *(automated)* `python crypto_core.py` → all core self-tests pass
-- [ ] App version bumped where applicable: `APP_VERSION` (About panel) and `[project].version` in `pyproject.toml` (the Flet build artifact version)
+- [ ] *(automated)* `ruff check --select E722,F401,F821,F841 src` → **0 issues**
+- [ ] App version bumped where applicable: `APP_VERSION` (`src\rpm_encrypter\services\constants.py`) and `[project].version` in `pyproject.toml`
 - [ ] `requirements.txt` installs cleanly in a fresh virtual environment (includes `flet==0.85.2`)
 - [ ] *(Flet build only)* Windows **Developer Mode** is ON (`start ms-settings:developers`) — Flutter plugin builds need symlink support
 - [ ] *(Flet build only)* `flutter doctor` shows Visual Studio with the **"Desktop development with C++"** workload **and the Windows 10/11 SDK** component (the SDK is installed separately from the compiler)
 
-## 1. Build the release artifact(s)
-- [ ] **Primary (Flet):** `.\build.ps1` → produces `build\windows\` ; the app launches from there
+## 1. Build the release artifact
+- [ ] `.\build.ps1` → produces `build\windows\` (`RPM Encrypter.exe` launcher + `rpm-encrypter.exe`); the app launches from there
 - [ ] Confirm the Flet build is **fully offline** — first launch makes **no** download of a Flet client from GitHub (the Flutter client is compiled into the build)
-- [ ] *(optional, if shipping the fallback)* **Legacy (CustomTkinter):** `.\build.ps1 -Legacy` → produces `dist\RPM Encrypter.exe` ; it launches
-- [ ] *(optional)* Custom Windows icon is present (`assets\icon.png` for the Flet build / `icon.ico` for the legacy build)
+- [ ] Custom Windows icons are present (`src\assets\icon.png` and `launcher\icon.ico`)
 
 ## 2. Clean install
 - [ ] Use a fresh user profile / VM with **no** prior `~/.rpm_encrypter*` files or `~/.rpm_encrypter/` folder
-- [ ] Install one of: the packaged Flet build (`build\windows\`), the packaged legacy build (`dist\`), or `pip install -r requirements.txt`
+- [ ] Install either the packaged Flet build (`build\windows\`) or `pip install -r requirements.txt`
 - [ ] Confirm none of the local-state files in the table above exist yet
 
 ## 3. Launch + first-run privacy
-- [ ] Launch the Flet app (`python app_flet.py`, or the packaged executable) → main window opens, no crash
-- [ ] First-run privacy notice is shown and states that update checks & activity logging are **OFF**
+- [ ] Launch the app (`python src\main.py`, or the packaged executable) → main window opens, no crash
+- [ ] First-run privacy/update dialog states that update checks & activity logging are **OFF** by default
 - [ ] Verify defaults are opt-in: update checks **OFF** and activity logging **OFF** by default
 
 ## 4. Encrypt / Decrypt — single file
@@ -72,24 +69,24 @@ Local state files this app may create in your home directory (referenced through
 
 ## 9. Versioning (opt-in)
 - [ ] Enable versioning in Settings (set max-per-vault, max-total-MB, and versions directory)
-- [ ] Trigger a version save (re-encrypt/replace a vault) → a version appears under `~/.rpm_encrypter/versions/` (or the chosen directory)
+- [ ] Trigger a version save (re-key a vault) → a version appears under `~/.rpm_encrypter/versions/` (or the chosen directory)
 - [ ] Restore a version (as a copy and via replace); confirm pruning honors the count and total-size limits
 
 ## 10. Inspect / integrity / fingerprints
 - [ ] Inspect a vault → metadata is shown without fully decrypting the payload
 - [ ] Compute the integrity SHA-256 and save a fingerprint
 - [ ] Verify-vs-saved correctly reports "unchanged" for an untouched file and "mismatch" for a modified one
-- [ ] *(if used)* Vault-diff compares two vaults by header only (no payload decryption)
+- [ ] Vault-diff compares two vaults accurately
 
-## 11. Notes & password generator
+## 11. Notes, password generator & shortcuts
 - [ ] Encrypt a text note, then decrypt it → identical text
 - [ ] Generate a password and copy it → the clipboard auto-clears (≈30s); a stale timer never clears a newer value
+- [ ] `Ctrl+1` through `Ctrl+9` switches between tabs; status-bar `Cancel` button interrupts an active operation
 
 ## 12. Update check (off by default)
 - [ ] Fresh launch with default settings makes **no** network call of any kind
 - [ ] In Settings, the "Check for updates on startup" toggle is **OFF** by default
-- [ ] Toggle it ON → the `check_updates` setting persists across a restart
-- [ ] Note: the Flet app persists this preference but performs **no** update network call (the actual background update check is wired only in the legacy CustomTkinter app). *(If shipping the legacy app: with the toggle ON and offline, the check fails silently/gracefully.)*
+- [ ] Toggle it ON → `check_updates` persists across a restart; when enabled and offline, startup check fails gracefully without error dialogs; when a newer release exists on GitHub, the sidebar update banner appears
 
 ## 13. Activity logging toggle
 - [ ] Enable activity logging → events are recorded to `~/.rpm_encrypter_activity.db`
@@ -97,8 +94,8 @@ Local state files this app may create in your home directory (referenced through
 - [ ] Disable logging → no new events are recorded
 
 ## 14. Local-trace cleanup
-- [ ] Use **Clear All Local Traces** → it clears the activity log, the library cache (`~/.rpm_encrypter_library.json`), and the recent-file lists + saved fingerprints inside `~/.rpm_encrypter.json`
-- [ ] Confirm console logs print **basenames only** (e.g. `secret.txt`), never full home-directory paths (Phase 29 hygiene)
+- [ ] Use **Clear All Local Traces** → clears the activity log, the library cache (`~/.rpm_encrypter_library.json`), and the recent-file lists + saved fingerprints inside `~/.rpm_encrypter.json`
+- [ ] Confirm console logs print **basenames only** (e.g. `secret.txt`), never full home-directory paths
 
 ## 15. Uninstall / residual files
 - [ ] Close the app, then remove these for a fully clean uninstall (delete only those that exist):
@@ -109,14 +106,14 @@ Local state files this app may create in your home directory (referenced through
   - [ ] any leftover operation temp files or temp zips in the system temp directory
 - [ ] After removing the above plus the application files, no RPM Encrypter data remains on disk
 
-## 16. Non-negotiable regression gate (from FIX.md)
-These are covered by `pytest` + `python crypto_core.py`; confirm green before shipping:
+## 16. Non-negotiable regression gate
+These are covered by `pytest` and must be green before shipping:
 - [ ] Normal encrypt/decrypt round-trip
 - [ ] Wrong-password rejection
 - [ ] Tampered header / encrypted metadata / payload / tag rejection
 - [ ] Recovery-phrase checksum and decrypt
 - [ ] Hidden vault: decoy password opens decoy data; hidden password opens hidden data
-- [ ] Hidden vault header does not reveal existence (post format fix)
+- [ ] Hidden vault header does not reveal existence
 - [ ] M2 invariant: a password unlock performs exactly 2 Argon2 derivations (normal/hidden/wrong are timing-indistinguishable)
 - [ ] Re-key preserves decryptability
 - [ ] KDF bounds reject hostile values

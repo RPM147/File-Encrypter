@@ -5,4 +5,4 @@
 // Note: paths in .rc files are resolved relative to the CWD of rc.exe
 // (the project root), NOT relative to this file's directory.
 
-1 ICON "icon.ico"
+1 ICON "launcher\\icon.ico"

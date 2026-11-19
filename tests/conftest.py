@@ -1,6 +1,6 @@
 import pytest
 
-from crypto_core import VaultCrypto
+from rpm_encrypter.core import VaultCrypto
 
 
 @pytest.fixture
