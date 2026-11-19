@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from rpm_encrypter.services.events import AppEvent, LogEvent
 from rpm_encrypter.storage.log_hygiene import redact_path
 
 logger = logging.getLogger("RPM_GUI")
@@ -18,14 +19,14 @@ class BaseController:
     def __init__(self, services):
         self.services = services
 
-    def _put(self, msg: dict, timeout: float = 0.1) -> None:
+    def _put(self, event: AppEvent, timeout: float = 0.1) -> None:
         try:
-            self.services.msg_queue.put(msg, timeout=timeout)
+            self.services.msg_queue.put(event, timeout=timeout)
         except queue.Full:
             pass
 
     def _log(self, text: str) -> None:
-        self._put({"type": "log", "text": text})
+        self._put(LogEvent(text=text))
 
     def _log_activity(self, action: str, target: str, result: str, details: str = "") -> None:
         logger_obj = getattr(self.services, "activity_logger", None)

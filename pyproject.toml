@@ -10,7 +10,7 @@ name = "rpm-encrypter"
 version = "3.0.0"
 description = "Local-only desktop file encryption (AES-256-GCM + Argon2id) with a modern Flet UI."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "RPM Encrypter maintainers" }]
 dependencies = [
@@ -28,7 +28,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff.lint]
-select = ["E722", "F401", "F821", "F841"]
+select = ["E722", "F401", "F821", "F841", "B"]
 
 # ---------------------------------------------------------------------------
 # Flet (Flutter) desktop build configuration -- consumed by `flet build windows`.

@@ -282,7 +282,7 @@ class HeaderMixin:
             raise AuthenticationError(
                 "Encrypted metadata integrity check failed. The vault has been "
                 "corrupted or tampered with."
-            )
+            ) from None
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise VaultFormatError(f"Invalid encrypted metadata block: {exc}") from exc
         return meta_dict, offset + 4 + meta_len

@@ -73,14 +73,15 @@ def _make_vault(services, tmp_path, password="PwStage4!", name="secret.txt", rec
 
 def test_inspect_controller_reads_metadata_by_password(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.inspect_controller import InspectController
+    from rpm_encrypter.services.events import InspectResultEvent
 
     vault, filename = _make_vault(fast_services, tmp_path)
     InspectController(fast_services)._inspect_worker(vault, "PwStage4!", None)
 
     msgs = _drain(fast_services.msg_queue)
-    results = [m for m in msgs if m["type"] == "inspect_result"]
-    assert results and results[0]["error"] == ""
-    md = results[0]["metadata"]
+    results = [m for m in msgs if isinstance(m, InspectResultEvent)]
+    assert results and results[0].error == ""
+    md = results[0].metadata
     assert md["filename"] == filename
     assert md["original_size"] > 0
     assert md.get("kdf_algorithm") and md.get("encryption")
@@ -92,6 +93,7 @@ def test_inspect_controller_reads_metadata_by_password(fast_services, tmp_path):
 def test_inspect_controller_reads_metadata_by_recovery_phrase(fast_services, tmp_path):
     from rpm_encrypter.core import generate_recovery_entropy, entropy_to_mnemonic, mnemonic_to_entropy
     from rpm_encrypter.services.controllers.inspect_controller import InspectController
+    from rpm_encrypter.services.events import InspectResultEvent
 
     recovery_entropy = generate_recovery_entropy()
     phrase = entropy_to_mnemonic(recovery_entropy)
@@ -103,14 +105,15 @@ def test_inspect_controller_reads_metadata_by_recovery_phrase(fast_services, tmp
     InspectController(fast_services)._inspect_worker(vault, None, recovery_key)
 
     msgs = _drain(fast_services.msg_queue)
-    results = [m for m in msgs if m["type"] == "inspect_result"]
-    assert results and results[0]["error"] == ""
-    assert results[0]["metadata"]["filename"] == filename
+    results = [m for m in msgs if isinstance(m, InspectResultEvent)]
+    assert results and results[0].error == ""
+    assert results[0].metadata["filename"] == filename
 
 
 def test_inspect_wrong_password_posts_auth_error(fast_services, tmp_path):
     from rpm_encrypter.services.state import MAX_ATTEMPTS
     from rpm_encrypter.services.controllers.inspect_controller import InspectController
+    from rpm_encrypter.services.events import AuthErrorEvent, InspectResultEvent
 
     vault, _filename = _make_vault(fast_services, tmp_path, password="RightPw1!")
     InspectController(fast_services)._inspect_worker(vault, "WrongPw1!", None)
@@ -118,15 +121,16 @@ def test_inspect_wrong_password_posts_auth_error(fast_services, tmp_path):
     expected_remaining = MAX_ATTEMPTS - 1
     msgs = _drain(fast_services.msg_queue)
     assert any(
-        m["type"] == "auth_error" and m["remaining"] == expected_remaining for m in msgs
+        isinstance(m, AuthErrorEvent) and m.remaining == expected_remaining for m in msgs
     )
-    results = [m for m in msgs if m["type"] == "inspect_result"]
-    assert results and results[0]["error"]
+    results = [m for m in msgs if isinstance(m, InspectResultEvent)]
+    assert results and results[0].error
     assert fast_services.limiter.attempts_remaining() == expected_remaining
 
 
 def test_integrity_check_hashes_and_saves_fingerprint(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.inspect_controller import InspectController
+    from rpm_encrypter.services.events import IntegrityResultEvent
 
     vault, _filename = _make_vault(fast_services, tmp_path)
     expected = hashlib.sha256(vault.read_bytes()).hexdigest()
@@ -134,9 +138,9 @@ def test_integrity_check_hashes_and_saves_fingerprint(fast_services, tmp_path):
     InspectController(fast_services)._integrity_worker(vault)
 
     msgs = _drain(fast_services.msg_queue)
-    results = [m for m in msgs if m["type"] == "integrity_result"]
-    assert results and results[0]["ok"] is True
-    assert results[0]["sha"] == expected
+    results = [m for m in msgs if isinstance(m, IntegrityResultEvent)]
+    assert results and results[0].ok is True
+    assert results[0].sha == expected
 
     fps = InspectController.load_fingerprints()
     assert fps[str(vault.resolve())]["sha256"] == expected
@@ -144,6 +148,7 @@ def test_integrity_check_hashes_and_saves_fingerprint(fast_services, tmp_path):
 
 def test_verify_saved_reports_unchanged_then_mismatch(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.inspect_controller import InspectController
+    from rpm_encrypter.services.events import VerifyResultEvent
 
     vault, _filename = _make_vault(fast_services, tmp_path)
     ctrl = InspectController(fast_services)
@@ -153,17 +158,17 @@ def test_verify_saved_reports_unchanged_then_mismatch(fast_services, tmp_path):
 
     ctrl._verify_worker(vault)
     msgs = _drain(fast_services.msg_queue)
-    verify = [m for m in msgs if m["type"] == "verify_result"]
-    assert verify and verify[0]["status"] == "unchanged"
+    verify = [m for m in msgs if isinstance(m, VerifyResultEvent)]
+    assert verify and verify[0].status == "unchanged"
 
     with open(vault, "ab") as f:
         f.write(b"\x00")
 
     ctrl._verify_worker(vault)
     msgs = _drain(fast_services.msg_queue)
-    verify = [m for m in msgs if m["type"] == "verify_result"]
-    assert verify and verify[0]["status"] == "mismatch"
-    assert verify[0]["current_sha"] != verify[0]["saved_sha"]
+    verify = [m for m in msgs if isinstance(m, VerifyResultEvent)]
+    assert verify and verify[0].status == "mismatch"
+    assert verify[0].current_sha != verify[0].saved_sha
 
 
 def test_integrity_rejects_non_vault_magic(tmp_path):
@@ -188,6 +193,11 @@ def test_inspect_controller_is_flet_free_and_keeps_inspect_header_only():
 
 
 def test_event_dispatcher_routes_stage4_results():
+    from rpm_encrypter.services.events import (
+        InspectResultEvent,
+        IntegrityResultEvent,
+        VerifyResultEvent,
+    )
     from rpm_encrypter.ui.events import EventDispatcher
 
     calls = []
@@ -203,12 +213,12 @@ def test_event_dispatcher_routes_stage4_results():
             calls.append(("verify", msg))
 
     dispatcher = EventDispatcher(FakeSink())
-    dispatcher.dispatch({"type": "inspect_result", "path": "a"})
-    dispatcher.dispatch({"type": "integrity_result", "path": "b"})
-    dispatcher.dispatch({"type": "verify_result", "path": "c"})
+    dispatcher.dispatch(InspectResultEvent(path="a"))
+    dispatcher.dispatch(IntegrityResultEvent(path="b"))
+    dispatcher.dispatch(VerifyResultEvent(path="c"))
 
     assert [c[0] for c in calls] == ["inspect", "integrity", "verify"]
-    assert calls[0][1]["path"] == "a"
+    assert calls[0][1].path == "a"
 
 
 # --- screen runtime guards (mirror the Stage-2/3 FilePicker-as-service rule) ---

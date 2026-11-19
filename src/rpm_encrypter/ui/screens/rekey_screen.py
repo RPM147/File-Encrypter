@@ -13,6 +13,11 @@ from pathlib import Path
 import flet as ft
 
 from rpm_encrypter.services.controllers.rekey_controller import RekeyController
+from rpm_encrypter.services.events import (
+    RekeyPasswordStrengthEvent,
+    RekeyVersionActionEvent,
+    RekeyVersionsEvent,
+)
 from rpm_encrypter.ui.components import (
     card_panel,
     empty_text,
@@ -187,9 +192,9 @@ class RekeyScreen:
             return
         RekeyController(self.services).start_strength_check(pw)
 
-    def on_rekey_password_strength(self, msg):
-        score = int(msg.get("score", 0) or 0)
-        crack_time = msg.get("crack_time", "")
+    def on_rekey_password_strength(self, event: RekeyPasswordStrengthEvent):
+        score = int(event.score or 0)
+        crack_time = event.crack_time
         label = _STRENGTH_LABELS.get(score, "Very weak")
         if crack_time:
             self.strength_text.value = f"New password strength: {label} - Est. crack time: {crack_time}"
@@ -213,14 +218,14 @@ class RekeyScreen:
         self.shell.safe_update()
         RekeyController(self.services).start_refresh_versions(vault)
 
-    def on_rekey_versions(self, msg):
-        error = msg.get("error", "")
+    def on_rekey_versions(self, event: RekeyVersionsEvent):
+        error = event.error
         if error:
             self._version_entries = []
             self._selected_version_index = None
             self.version_list.controls = [empty_text(error)]
             return
-        self._version_entries = list(msg.get("entries", []))
+        self._version_entries = list(event.entries)
         self._selected_version_index = None
         self._render_versions()
 
@@ -278,9 +283,9 @@ class RekeyScreen:
             return None
         return self._version_entries[self._selected_version_index]
 
-    def on_rekey_version_action(self, msg):
-        text = msg.get("text", "")
-        error = msg.get("error", "")
+    def on_rekey_version_action(self, event: RekeyVersionActionEvent):
+        text = event.text
+        error = event.error
         # is_processing / busy_control are cleared by the shared on_batch_done,
         # which the controller also posts for every version action.
         if error:

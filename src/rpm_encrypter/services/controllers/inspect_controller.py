@@ -17,6 +17,16 @@ from rpm_encrypter.core import (
     VAULT_MAGIC,
     is_supported_vault_version,
 )
+from rpm_encrypter.services.events import (
+    AuthErrorEvent,
+    BatchDoneEvent,
+    InspectResultEvent,
+    IntegrityResultEvent,
+    ProgressStartEvent,
+    SelectiveExtractResultEvent,
+    VaultDiffResultEvent,
+    VerifyResultEvent,
+)
 from rpm_encrypter.storage.config import _load_cfg, _mutate_cfg
 from rpm_encrypter.storage.log_hygiene import redact_path
 from .base import BaseController
@@ -75,12 +85,11 @@ class InspectController(BaseController):
             self.services.limiter.record_success()
             self._log_activity("Inspect", path.name, "Success")
             self._put(
-                {
-                    "type": "inspect_result",
-                    "path": str(path),
-                    "metadata": metadata,
-                    "error": "",
-                },
+                InspectResultEvent(
+                    path=str(path),
+                    metadata=metadata,
+                    error="",
+                ),
                 timeout=1.0,
             )
         except AuthenticationError:
@@ -88,26 +97,24 @@ class InspectController(BaseController):
             self._log_activity("Inspect", path.name, "Failed", "Authentication Error")
             _, secs = self.services.limiter.is_locked()
             rem = self.services.limiter.attempts_remaining()
-            self._put({"type": "auth_error", "remaining": rem, "lockout": secs})
+            self._put(AuthErrorEvent(remaining=rem, lockout=secs))
             self._put(
-                {
-                    "type": "inspect_result",
-                    "path": str(path),
-                    "metadata": {},
-                    "error": "Invalid password or corrupted vault envelope",
-                },
+                InspectResultEvent(
+                    path=str(path),
+                    metadata={},
+                    error="Invalid password or corrupted vault envelope",
+                ),
                 timeout=1.0,
             )
         except Exception as exc:
             logger.exception("Vault inspection failed for %s", redact_path(path))
             self._log_activity("Inspect", path.name, "Failed", str(exc))
             self._put(
-                {
-                    "type": "inspect_result",
-                    "path": str(path),
-                    "metadata": {},
-                    "error": f"Inspection failed: {exc}",
-                },
+                InspectResultEvent(
+                    path=str(path),
+                    metadata={},
+                    error=f"Inspection failed: {exc}",
+                ),
                 timeout=1.0,
             )
 
@@ -121,25 +128,23 @@ class InspectController(BaseController):
                 self._save_fingerprint(path, sha)
                 self._log_activity("Integrity", path.name, "Success")
             self._put(
-                {
-                    "type": "integrity_result",
-                    "path": str(path),
-                    "ok": ok,
-                    "msg": msg,
-                    "sha": sha,
-                },
+                IntegrityResultEvent(
+                    path=str(path),
+                    ok=ok,
+                    msg=msg,
+                    sha=sha,
+                ),
                 timeout=1.0,
             )
         except Exception as exc:
             logger.exception("Integrity check failed for %s", redact_path(path))
             self._put(
-                {
-                    "type": "integrity_result",
-                    "path": str(path),
-                    "ok": False,
-                    "msg": str(exc),
-                    "sha": "",
-                },
+                IntegrityResultEvent(
+                    path=str(path),
+                    ok=False,
+                    msg=str(exc),
+                    sha="",
+                ),
                 timeout=1.0,
             )
 
@@ -151,16 +156,15 @@ class InspectController(BaseController):
             rec = fps.get(str(path))
             if not rec:
                 self._put(
-                    {
-                        "type": "verify_result",
-                        "path": str(path),
-                        "status": "missing",
-                        "current_sha": "",
-                        "saved_sha": "",
-                        "recorded": "",
-                        "filename": path.name,
-                        "error": "No saved fingerprint for this vault",
-                    },
+                    VerifyResultEvent(
+                        path=str(path),
+                        status="missing",
+                        current_sha="",
+                        saved_sha="",
+                        recorded="",
+                        filename=path.name,
+                        error="No saved fingerprint for this vault",
+                    ),
                     timeout=1.0,
                 )
                 return
@@ -168,16 +172,15 @@ class InspectController(BaseController):
             ok, msg, current_sha = self._check_vault_integrity(path)
             if not ok or not current_sha:
                 self._put(
-                    {
-                        "type": "verify_result",
-                        "path": str(path),
-                        "status": "error",
-                        "current_sha": "",
-                        "saved_sha": rec.get("sha256", ""),
-                        "recorded": rec.get("recorded", ""),
-                        "filename": rec.get("filename", path.name),
-                        "error": msg,
-                    },
+                    VerifyResultEvent(
+                        path=str(path),
+                        status="error",
+                        current_sha="",
+                        saved_sha=rec.get("sha256", ""),
+                        recorded=rec.get("recorded", ""),
+                        filename=rec.get("filename", path.name),
+                        error=msg,
+                    ),
                     timeout=1.0,
                 )
                 return
@@ -185,31 +188,29 @@ class InspectController(BaseController):
             saved_sha = rec.get("sha256", "")
             status = "unchanged" if current_sha == saved_sha else "mismatch"
             self._put(
-                {
-                    "type": "verify_result",
-                    "path": str(path),
-                    "status": status,
-                    "current_sha": current_sha,
-                    "saved_sha": saved_sha,
-                    "recorded": rec.get("recorded", ""),
-                    "filename": rec.get("filename", path.name),
-                    "error": "",
-                },
+                VerifyResultEvent(
+                    path=str(path),
+                    status=status,
+                    current_sha=current_sha,
+                    saved_sha=saved_sha,
+                    recorded=rec.get("recorded", ""),
+                    filename=rec.get("filename", path.name),
+                    error="",
+                ),
                 timeout=1.0,
             )
         except Exception as exc:
             logger.exception("Verify-vs-saved failed for %s", redact_path(path))
             self._put(
-                {
-                    "type": "verify_result",
-                    "path": str(path),
-                    "status": "error",
-                    "current_sha": "",
-                    "saved_sha": "",
-                    "recorded": "",
-                    "filename": path.name,
-                    "error": str(exc),
-                },
+                VerifyResultEvent(
+                    path=str(path),
+                    status="error",
+                    current_sha="",
+                    saved_sha="",
+                    recorded="",
+                    filename=path.name,
+                    error=str(exc),
+                ),
                 timeout=1.0,
             )
 
@@ -226,7 +227,7 @@ class InspectController(BaseController):
         temp_extract_dir: Optional[Path] = None
         extracted_count = 0
         success = False
-        self._put({"type": "progress_start"})
+        self._put(ProgressStartEvent())
         try:
             temp_fd, temp_name = tempfile.mkstemp(suffix=".zip", prefix=".rpm_extract_")
             os.close(temp_fd)
@@ -264,14 +265,13 @@ class InspectController(BaseController):
             msg = f"Successfully extracted {extracted_count} file(s)."
             self._log_activity("Selective Extract", vault_path.name, "Success", msg)
             self._put(
-                {
-                    "type": "selective_extract_result",
-                    "path": str(vault_path),
-                    "selected": selected_files,
-                    "output_dir": str(output_dir),
-                    "count": extracted_count,
-                    "error": "",
-                },
+                SelectiveExtractResultEvent(
+                    path=str(vault_path),
+                    selected=selected_files,
+                    output_dir=str(output_dir),
+                    count=extracted_count,
+                    error="",
+                ),
                 timeout=1.0,
             )
         except OperationCancelledError:
@@ -282,27 +282,26 @@ class InspectController(BaseController):
             msg = f"Extraction failed: {exc}"
             self._log_activity("Selective Extract", vault_path.name, "Failed", str(exc))
             self._put(
-                {
-                    "type": "selective_extract_result",
-                    "path": str(vault_path),
-                    "selected": selected_files,
-                    "output_dir": str(output_dir),
-                    "count": extracted_count,
-                    "error": str(exc),
-                },
+                SelectiveExtractResultEvent(
+                    path=str(vault_path),
+                    selected=selected_files,
+                    output_dir=str(output_dir),
+                    count=extracted_count,
+                    error=str(exc),
+                ),
                 timeout=1.0,
             )
         finally:
             self._wipe_temp_file(temp_zip)
             self._wipe_temp_dir(temp_extract_dir)
             self.services.is_processing = False
-            self._put({"type": "batch_done", "text": msg, "success": success}, timeout=1.0)
+            self._put(BatchDoneEvent(text=msg, success=success), timeout=1.0)
 
     # ---------------------------------------------------------------- vault diff
     def _vault_diff_worker(
         self, path_a: Path, password_a: str, path_b: Path, password_b: str
     ) -> None:
-        self._put({"type": "progress_start"})
+        self._put(ProgressStartEvent())
         success = False
         try:
             with open(path_a, "rb") as f:
@@ -316,16 +315,15 @@ class InspectController(BaseController):
             result_text = self.format_diff_result(path_a, path_b, added, removed, modified)
             success = True
             self._put(
-                {
-                    "type": "vault_diff_result",
-                    "path_a": str(path_a),
-                    "path_b": str(path_b),
-                    "added": added,
-                    "removed": removed,
-                    "modified": modified,
-                    "text": result_text,
-                    "error": "",
-                },
+                VaultDiffResultEvent(
+                    path_a=str(path_a),
+                    path_b=str(path_b),
+                    added=added,
+                    removed=removed,
+                    modified=modified,
+                    text=result_text,
+                    error="",
+                ),
                 timeout=1.0,
             )
             self._log_activity("Vault Diff", f"{path_a.name} vs {path_b.name}", "Success")
@@ -334,22 +332,21 @@ class InspectController(BaseController):
             logger.exception("Vault Diff failed")
             msg = f"Diff failed: {exc}"
             self._put(
-                {
-                    "type": "vault_diff_result",
-                    "path_a": str(path_a),
-                    "path_b": str(path_b),
-                    "added": [],
-                    "removed": [],
-                    "modified": [],
-                    "text": msg,
-                    "error": str(exc),
-                },
+                VaultDiffResultEvent(
+                    path_a=str(path_a),
+                    path_b=str(path_b),
+                    added=[],
+                    removed=[],
+                    modified=[],
+                    text=msg,
+                    error=str(exc),
+                ),
                 timeout=1.0,
             )
             self._log_activity("Vault Diff", f"{path_a.name} vs {path_b.name}", "Failed", str(exc))
         finally:
             self.services.is_processing = False
-            self._put({"type": "batch_done", "text": msg, "success": success}, timeout=1.0)
+            self._put(BatchDoneEvent(text=msg, success=success), timeout=1.0)
 
     @staticmethod
     def _files_by_path(metadata) -> Dict[str, Dict[str, Any]]:

@@ -103,7 +103,7 @@ def test_atomic_output_real_crypto_failure_no_leftover(tmp_path, fast_crypto):
     missing_src = tmp_path / "does_not_exist.bin"   # intentionally never created
     final = tmp_path / "data.bin.vault"
 
-    with pytest.raises(Exception):
+    with pytest.raises(FileNotFoundError):
         atomic_output(final, lambda p: fast_crypto.encrypt_file(
             missing_src, p, PASSWORD, original_filename="data.bin"))
 

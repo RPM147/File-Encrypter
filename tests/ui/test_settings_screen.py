@@ -701,12 +701,12 @@ def test_shell_mounts_settings_and_reuses_instance():
     shell = AppShell(page, _shell_services())
     assert shell.settings_screen is None
 
-    control = shell._placeholder("settings")
+    control = shell._mount_screen("settings")
     assert control is not None
     first = shell.settings_screen
     assert first is not None
 
-    shell._placeholder("settings")
+    shell._mount_screen("settings")
     assert shell.settings_screen is first  # reused
 
 

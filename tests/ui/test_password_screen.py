@@ -331,7 +331,7 @@ def test_password_screen_transfer_to_encrypt_fills_encrypt_password():
     shell = AppShell(page, _shell_services())
     # Mount the Password screen through the real shell so transfer uses the
     # real navigate() + real EncryptScreen.
-    shell._placeholder("password")
+    shell._mount_screen("password")
     screen = shell.password_screen
     assert screen is not None
 
@@ -356,12 +356,12 @@ def test_shell_mounts_password_screen_without_duplicate_clipboard():
     shell = AppShell(page, _shell_services())
     assert shell.password_screen is None
 
-    control = shell._placeholder("password")
+    control = shell._mount_screen("password")
     assert control is not None
     assert shell.password_screen is not None
 
     # Repeated mounting must not register a second clipboard service.
-    shell._placeholder("password")
+    shell._mount_screen("password")
     clipboards = [s for s in page.services if isinstance(s, ft.Clipboard)]
     assert len(clipboards) == 1
     assert page.overlay == []

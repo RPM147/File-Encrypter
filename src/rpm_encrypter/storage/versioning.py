@@ -377,7 +377,7 @@ class VaultVersionManager:
         # Sort oldest-first
         all_files.sort(key=lambda t: t[0])
 
-        for mtime, size, p in all_files:
+        for _mtime, size, p in all_files:
             if total_size <= self.max_total_size_bytes:
                 break
             try:

@@ -451,7 +451,7 @@ class StandardVaultMixin:
             raise AuthenticationError(
                 "Payload integrity check failed. The vault file has been corrupted, "
                 "truncated, or tampered with. Do not trust the decrypted data."
-            )
+            ) from None
 
         logger.info(
             "Decryption complete: %d bytes restored, filename='%s'",

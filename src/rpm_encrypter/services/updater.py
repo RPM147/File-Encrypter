@@ -1,5 +1,6 @@
 """Optional GitHub Releases update checker (off by default)."""
 
+import itertools
 import json
 import logging
 import urllib.error
@@ -39,7 +40,7 @@ def check_for_update(current_version: str):
                 latest_parts.append(0)
 
             is_newer = False
-            for c, l in zip(current_parts, latest_parts):
+            for c, l in itertools.zip_longest(current_parts, latest_parts, fillvalue=0):
                 if l > c:
                     is_newer = True
                     break

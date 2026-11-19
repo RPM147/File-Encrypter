@@ -47,6 +47,8 @@ def test_notes_controller_encrypts_and_decrypts_note_round_trip(fast_services, t
 
     vault = tmp_path / "mynote.vault"
     text = "Top secret note line 1\nLine 2 with symbols !@#$ and unicode-free ASCII"
+    from rpm_encrypter.services.events import BatchDoneEvent, NoteDecryptedEvent
+
     ctrl = NotesController(fast_services)
 
     ctrl._encrypt_worker(text, vault, "NotePw1!")
@@ -55,16 +57,17 @@ def test_notes_controller_encrypts_and_decrypts_note_round_trip(fast_services, t
     ctrl._decrypt_worker(vault, "NotePw1!")
     msgs = _drain(fast_services.msg_queue)
 
-    decrypted = [m for m in msgs if m["type"] == "note_decrypted"]
-    assert decrypted and decrypted[0]["text"] == text
+    decrypted = [m for m in msgs if isinstance(m, NoteDecryptedEvent)]
+    assert decrypted and decrypted[0].text == text
 
-    batch_texts = [m.get("text", "") for m in msgs if m["type"] == "batch_done"]
+    batch_texts = [m.text for m in msgs if isinstance(m, BatchDoneEvent)]
     assert any("Note saved to" in t for t in batch_texts)
     assert any("Note loaded" in t for t in batch_texts)
 
 
 def test_notes_wrong_password_posts_batch_done_not_auth_error(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.notes_controller import NotesController
+    from rpm_encrypter.services.events import AuthErrorEvent, BatchDoneEvent, NoteDecryptedEvent
 
     vault = tmp_path / "n.vault"
     ctrl = NotesController(fast_services)
@@ -74,14 +77,15 @@ def test_notes_wrong_password_posts_batch_done_not_auth_error(fast_services, tmp
     ctrl._decrypt_worker(vault, "WrongPw1!")
     msgs = _drain(fast_services.msg_queue)
 
-    assert not any(m["type"] == "note_decrypted" for m in msgs)
-    assert not any(m["type"] == "auth_error" for m in msgs)
-    batch = [m for m in msgs if m["type"] == "batch_done"]
-    assert batch and any("Wrong Password" in m.get("text", "") for m in batch)
+    assert not any(isinstance(m, NoteDecryptedEvent) for m in msgs)
+    assert not any(isinstance(m, AuthErrorEvent) for m in msgs)
+    batch = [m for m in msgs if isinstance(m, BatchDoneEvent)]
+    assert batch and any("Wrong Password" in m.text for m in batch)
 
 
 def test_notes_encrypt_failure_does_not_leave_final_partial(fast_services, tmp_path, monkeypatch):
     from rpm_encrypter.services.controllers.notes_controller import NotesController
+    from rpm_encrypter.services.events import BatchDoneEvent
 
     final = tmp_path / "fail.vault"
 
@@ -98,7 +102,7 @@ def test_notes_encrypt_failure_does_not_leave_final_partial(fast_services, tmp_p
     assert list(tmp_path.glob(".rpm_vaulttmp_*.part")) == []
     msgs = _drain(fast_services.msg_queue)
     assert any(
-        m["type"] == "batch_done" and "Note save failed" in m.get("text", "") for m in msgs
+        isinstance(m, BatchDoneEvent) and "Note save failed" in m.text for m in msgs
     )
 
 
@@ -113,6 +117,7 @@ def test_notes_controller_is_flet_free_and_uses_note_api_only():
 
 
 def test_event_dispatcher_routes_note_decrypted():
+    from rpm_encrypter.services.events import NoteDecryptedEvent
     from rpm_encrypter.ui.events import EventDispatcher
 
     captured = []
@@ -121,7 +126,7 @@ def test_event_dispatcher_routes_note_decrypted():
         def on_note_decrypted(self, text):
             captured.append(text)
 
-    EventDispatcher(FakeSink()).dispatch({"type": "note_decrypted", "text": "hello"})
+    EventDispatcher(FakeSink()).dispatch(NoteDecryptedEvent(text="hello"))
     assert captured == ["hello"]
 
 

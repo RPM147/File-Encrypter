@@ -11,6 +11,7 @@ from .constants import (
     container_label_to_mb,
     zxcvbn,
 )
+from .events import AppEvent
 from .recovery_copy import (
     DECRYPT_RECOVERY_LABEL,
     INSPECT_RECOVERY_LABEL,
@@ -28,6 +29,7 @@ from .updater import check_for_update
 
 __all__ = [
     "MSG_QUEUE_SIZE",
+    "AppEvent",
     "AppServices",
     "APP_NAME",
     "APP_VERSION",

@@ -70,7 +70,7 @@ class HiddenVaultMixin:
         try:
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         except InvalidTag:
-            raise AuthenticationError("Hidden mini-header tag invalid")
+            raise AuthenticationError("Hidden mini-header tag invalid") from None
 
         if len(plaintext) != self.HIDDEN_MINI_HEADER_SIZE:
             raise AuthenticationError("Invalid hidden mini-header length")
@@ -116,7 +116,7 @@ class HiddenVaultMixin:
             if not isinstance(metadata, dict):
                 raise ValueError("hidden metadata must be a JSON object")
         except Exception:
-            raise AuthenticationError("Invalid hidden metadata JSON")
+            raise AuthenticationError("Invalid hidden metadata JSON") from None
 
         return hidden_dek, hidden_payload_nonce, hidden_payload_offset, metadata
 

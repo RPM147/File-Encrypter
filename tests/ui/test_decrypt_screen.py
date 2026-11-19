@@ -69,6 +69,7 @@ def _make_vault(services, tmp_path, password="PwStage3!", name="secret.txt", rec
 
 def test_decrypt_controller_round_trips_by_password(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.decrypt_controller import DecryptController
+    from rpm_encrypter.services.events import BatchDoneEvent
 
     vault, payload, filename = _make_vault(fast_services, tmp_path)
     out_dir = tmp_path / "out"
@@ -77,7 +78,7 @@ def test_decrypt_controller_round_trips_by_password(fast_services, tmp_path):
     DecryptController(fast_services)._worker([str(vault)], "PwStage3!", out_dir, None)
 
     msgs = _drain(fast_services.msg_queue)
-    assert any(m["type"] == "batch_done" and "1/1" in m.get("text", "") for m in msgs)
+    assert any(isinstance(m, BatchDoneEvent) and "1/1" in m.text for m in msgs)
     restored = out_dir / Path(filename).stem / filename
     assert restored.read_bytes() == payload
 
@@ -104,6 +105,7 @@ def test_decrypt_controller_round_trips_by_recovery_phrase(fast_services, tmp_pa
 def test_decrypt_wrong_password_posts_auth_error(fast_services, tmp_path):
     from rpm_encrypter.services.state import MAX_ATTEMPTS
     from rpm_encrypter.services.controllers.decrypt_controller import DecryptController
+    from rpm_encrypter.services.events import AuthErrorEvent, BatchDoneEvent
 
     vault, _payload, _filename = _make_vault(fast_services, tmp_path, password="RightPw1!")
     out_dir = tmp_path / "out"
@@ -117,9 +119,9 @@ def test_decrypt_wrong_password_posts_auth_error(fast_services, tmp_path):
     expected_remaining = MAX_ATTEMPTS - 1
     msgs = _drain(fast_services.msg_queue)
     assert any(
-        m["type"] == "auth_error" and m["remaining"] == expected_remaining for m in msgs
+        isinstance(m, AuthErrorEvent) and m.remaining == expected_remaining for m in msgs
     )
-    assert any(m["type"] == "batch_done" and "Wrong password" in m.get("text", "") for m in msgs)
+    assert any(isinstance(m, BatchDoneEvent) and "Wrong password" in m.text for m in msgs)
     assert fast_services.limiter.attempts_remaining() == expected_remaining
 
 

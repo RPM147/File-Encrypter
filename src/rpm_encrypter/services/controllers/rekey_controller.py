@@ -6,6 +6,12 @@ from pathlib import Path
 
 from rpm_encrypter.core import AuthenticationError, CryptoError, OperationCancelledError
 from rpm_encrypter.services.constants import ZXCVBN_AVAILABLE, zxcvbn
+from rpm_encrypter.services.events import (
+    BatchDoneEvent,
+    RekeyPasswordStrengthEvent,
+    RekeyVersionActionEvent,
+    RekeyVersionsEvent,
+)
 from rpm_encrypter.storage import versioning
 from rpm_encrypter.storage.config import push_recent
 from rpm_encrypter.storage.log_hygiene import redact_path
@@ -52,28 +58,28 @@ class RekeyController(BaseController):
             self._log_activity("Re-Key", vault.name, "Success")
             push_recent("rekey_vaults", str(vault))
             self._post_versions(vault)
-            self._put({"type": "batch_done", "text": f"Re-key complete: {vault.name}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Re-key complete: {vault.name}"), timeout=1.0)
 
         except OperationCancelledError:
             self._log("Cancelling and cleaning up...")
-            self._put({"type": "batch_done", "text": "Cancelled - 0/1 done"}, timeout=1.0)
+            self._put(BatchDoneEvent(text="Cancelled - 0/1 done"), timeout=1.0)
         except AuthenticationError:
             self._log("Wrong current password")
             self._log_activity("Re-Key", vault.name, "Failed", "Wrong current password")
             self._put(
-                {"type": "batch_done", "text": "Re-key failed: wrong current password"},
+                BatchDoneEvent(text="Re-key failed: wrong current password"),
                 timeout=1.0,
             )
         except CryptoError as exc:
             logger.exception("Re-key failed for %s", redact_path(vault))
             self._log(f"FAILED: {exc}")
             self._log_activity("Re-Key", vault.name, "Failed", str(exc))
-            self._put({"type": "batch_done", "text": f"Re-key failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Re-key failed: {exc}"), timeout=1.0)
         except Exception as exc:
             logger.exception("Re-key failed for %s", redact_path(vault))
             self._log(f"FAILED: {exc}")
             self._log_activity("Re-Key", vault.name, "Failed", str(exc))
-            self._put({"type": "batch_done", "text": f"Re-key failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Re-key failed: {exc}"), timeout=1.0)
         finally:
             try:
                 if tmp.exists():
@@ -87,22 +93,21 @@ class RekeyController(BaseController):
 
     def _strength_worker(self, password):
         if not password:
-            self._put({"type": "rekey_password_strength", "score": 0, "crack_time": ""})
+            self._put(RekeyPasswordStrengthEvent(score=0, crack_time=""))
             return
         if ZXCVBN_AVAILABLE:
             try:
                 res = zxcvbn(password)
                 self._put(
-                    {
-                        "type": "rekey_password_strength",
-                        "score": res["score"],
-                        "crack_time": res["crack_times_display"]["offline_slow_hashing_1e4_per_second"],
-                    }
+                    RekeyPasswordStrengthEvent(
+                        score=res["score"],
+                        crack_time=res["crack_times_display"]["offline_slow_hashing_1e4_per_second"],
+                    )
                 )
                 return
             except Exception:
                 pass
-        self._put({"type": "rekey_password_strength", "score": 0, "crack_time": ""})
+        self._put(RekeyPasswordStrengthEvent(score=0, crack_time=""))
 
     # -------------------------------------------------------- version history
     @staticmethod
@@ -120,23 +125,21 @@ class RekeyController(BaseController):
         try:
             entries = list(reversed(self.services.versioner.list_versions(vault)))
             self._put(
-                {
-                    "type": "rekey_versions",
-                    "vault": str(vault),
-                    "entries": [self.serialize_entry(e) for e in entries],
-                    "error": "",
-                },
+                RekeyVersionsEvent(
+                    vault=str(vault),
+                    entries=[self.serialize_entry(e) for e in entries],
+                    error="",
+                ),
                 timeout=1.0,
             )
         except Exception as exc:
             logger.exception("Version refresh failed for %s", redact_path(vault))
             self._put(
-                {
-                    "type": "rekey_versions",
-                    "vault": str(vault),
-                    "entries": [],
-                    "error": f"Version refresh failed: {exc}",
-                },
+                RekeyVersionsEvent(
+                    vault=str(vault),
+                    entries=[],
+                    error=f"Version refresh failed: {exc}",
+                ),
                 timeout=1.0,
             )
 
@@ -165,23 +168,22 @@ class RekeyController(BaseController):
             self._log_activity("Version Restore", vault.name, "Success", f"Copy: {copy_path.name}")
             text = f"Restored copy: {copy_path.name}"
             self._put(
-                {"type": "rekey_version_action", "text": text, "error": "", "refresh": False},
+                RekeyVersionActionEvent(text=text, error="", refresh=False),
                 timeout=1.0,
             )
-            self._put({"type": "batch_done", "text": text}, timeout=1.0)
+            self._put(BatchDoneEvent(text=text), timeout=1.0)
         except Exception as exc:
             logger.exception("Version restore failed for %s", redact_path(vault))
             self._log_activity("Version Restore", vault.name, "Failed", str(exc))
             self._put(
-                {
-                    "type": "rekey_version_action",
-                    "text": "Restore failed",
-                    "error": str(exc),
-                    "refresh": False,
-                },
+                RekeyVersionActionEvent(
+                    text="Restore failed",
+                    error=str(exc),
+                    refresh=False,
+                ),
                 timeout=1.0,
             )
-            self._put({"type": "batch_done", "text": f"Restore failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Restore failed: {exc}"), timeout=1.0)
 
     def start_replace_current(self, entry_payload, vault):
         self._spawn(self._replace_current_worker, entry_payload, Path(vault))
@@ -196,24 +198,23 @@ class RekeyController(BaseController):
             )
             text = "Vault restored from version"
             self._put(
-                {"type": "rekey_version_action", "text": text, "error": "", "refresh": True},
+                RekeyVersionActionEvent(text=text, error="", refresh=True),
                 timeout=1.0,
             )
             self._post_versions(vault)
-            self._put({"type": "batch_done", "text": text}, timeout=1.0)
+            self._put(BatchDoneEvent(text=text), timeout=1.0)
         except Exception as exc:
             logger.exception("Version replace failed for %s", redact_path(vault))
             self._log_activity("Version Replace", vault.name, "Failed", str(exc))
             self._put(
-                {
-                    "type": "rekey_version_action",
-                    "text": "Replace failed",
-                    "error": str(exc),
-                    "refresh": False,
-                },
+                RekeyVersionActionEvent(
+                    text="Replace failed",
+                    error=str(exc),
+                    refresh=False,
+                ),
                 timeout=1.0,
             )
-            self._put({"type": "batch_done", "text": f"Replace failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Replace failed: {exc}"), timeout=1.0)
 
     def start_delete_version(self, entry_payload, vault):
         self._spawn(self._delete_version_worker, entry_payload, Path(vault))
@@ -226,21 +227,20 @@ class RekeyController(BaseController):
             self._log_activity("Version Delete", vault.name, "Success", f"File: {entry.path.name}")
             text = "Version deleted"
             self._put(
-                {"type": "rekey_version_action", "text": text, "error": "", "refresh": True},
+                RekeyVersionActionEvent(text=text, error="", refresh=True),
                 timeout=1.0,
             )
             self._post_versions(vault)
-            self._put({"type": "batch_done", "text": text}, timeout=1.0)
+            self._put(BatchDoneEvent(text=text), timeout=1.0)
         except Exception as exc:
             logger.exception("Version delete failed for %s", redact_path(vault))
             self._log_activity("Version Delete", vault.name, "Failed", str(exc))
             self._put(
-                {
-                    "type": "rekey_version_action",
-                    "text": "Delete failed",
-                    "error": str(exc),
-                    "refresh": False,
-                },
+                RekeyVersionActionEvent(
+                    text="Delete failed",
+                    error=str(exc),
+                    refresh=False,
+                ),
                 timeout=1.0,
             )
-            self._put({"type": "batch_done", "text": f"Delete failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Delete failed: {exc}"), timeout=1.0)

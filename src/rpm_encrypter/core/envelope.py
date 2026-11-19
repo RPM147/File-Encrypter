@@ -40,7 +40,7 @@ class EnvelopeMixin:
         except InvalidTag:
             raise AuthenticationError(
                 "DEK decryption failed: invalid password or corrupted vault envelope."
-            )
+            ) from None
         if len(dek) != AES_KEY_SIZE:
             raise AuthenticationError(
                 f"DEK has unexpected length {len(dek)} (expected {AES_KEY_SIZE}). "

@@ -141,6 +141,7 @@ def test_library_controller_add_dedupes_legacy_slash_paths(hermetic_cfg, tmp_pat
 
 def test_library_controller_scan_posts_results_with_fake_scanner(tmp_path):
     from rpm_encrypter.services.controllers.library_controller import LibraryController
+    from rpm_encrypter.services.events import LibraryResultsEvent
 
     scanner = _FakeScanner([{"path": "x", "filename": "x.vault"}])
     services = SimpleNamespace(scanner=scanner, msg_queue=queue.Queue(), activity_logger=None)
@@ -148,13 +149,14 @@ def test_library_controller_scan_posts_results_with_fake_scanner(tmp_path):
     LibraryController(services)._scan_worker([str(tmp_path)])
 
     msgs = _drain(services.msg_queue)
-    results = [m for m in msgs if m["type"] == "library_results"]
-    assert results and results[0]["error"] == "" and results[0]["data"]
+    results = [m for m in msgs if isinstance(m, LibraryResultsEvent)]
+    assert results and results[0].error == "" and results[0].data
     assert scanner.received == [str(Path(tmp_path).resolve())]
 
 
 def test_library_controller_scan_error_posts_library_results_error(tmp_path):
     from rpm_encrypter.services.controllers.library_controller import LibraryController
+    from rpm_encrypter.services.events import LibraryResultsEvent
 
     scanner = _FakeScanner([], exc=RuntimeError("boom"))
     services = SimpleNamespace(scanner=scanner, msg_queue=queue.Queue(), activity_logger=None)
@@ -162,13 +164,14 @@ def test_library_controller_scan_error_posts_library_results_error(tmp_path):
     LibraryController(services)._scan_worker([str(tmp_path)])
 
     msgs = _drain(services.msg_queue)
-    results = [m for m in msgs if m["type"] == "library_results"]
-    assert results and results[0]["data"] == []
-    assert "Scan failed" in results[0]["error"]
+    results = [m for m in msgs if isinstance(m, LibraryResultsEvent)]
+    assert results and results[0].data == []
+    assert "Scan failed" in results[0].error
 
 
 def test_real_scanner_finds_vault_without_sensitive_metadata(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.library_controller import LibraryController
+    from rpm_encrypter.services.events import LibraryResultsEvent
 
     vault, original_name = _make_vault(fast_services, tmp_path, name="secret.txt")
     # Rename to an opaque on-disk name so the scan can't possibly echo the
@@ -181,9 +184,9 @@ def test_real_scanner_finds_vault_without_sensitive_metadata(fast_services, tmp_
     LibraryController(fast_services)._scan_worker([str(scan_dir)])
 
     msgs = _drain(fast_services.msg_queue)
-    results = [m for m in msgs if m["type"] == "library_results"]
-    assert results and results[0]["error"] == ""
-    data = results[0]["data"]
+    results = [m for m in msgs if isinstance(m, LibraryResultsEvent)]
+    assert results and results[0].error == ""
+    data = results[0].data
     assert len(data) == 1
     entry = data[0]
     assert entry["path"] == str(opaque.resolve())
@@ -208,6 +211,7 @@ def test_library_controller_is_flet_free_and_scan_only():
 
 
 def test_event_dispatcher_routes_library_results():
+    from rpm_encrypter.services.events import LibraryResultsEvent
     from rpm_encrypter.ui.events import EventDispatcher
 
     calls = []
@@ -216,8 +220,8 @@ def test_event_dispatcher_routes_library_results():
         def on_library_results(self, msg):
             calls.append(msg)
 
-    EventDispatcher(FakeSink()).dispatch({"type": "library_results", "data": []})
-    assert calls and calls[0]["data"] == []
+    EventDispatcher(FakeSink()).dispatch(LibraryResultsEvent(data=[]))
+    assert calls and calls[0].data == []
 
 
 # ------------------------------------------------------------------- screen
@@ -451,17 +455,19 @@ def test_library_stale_scan_results_ignore_removed_directory(hermetic_cfg, tmp_p
     screen = LibraryScreen(page, services, _FakeShell(page))
     screen.build()
 
+    from rpm_encrypter.services.events import LibraryResultsEvent
+
     removed_vault = first / "removed.vault"
     kept_vault = second / "kept.vault"
     screen._remove_dir(str(first))
-    screen.on_library_results({"data": [
+    screen.on_library_results(LibraryResultsEvent(data=[
         {"filename": "removed.vault", "path": str(removed_vault),
          "source_type": "Encrypted Metadata", "container_size": 1,
          "encrypted_size": 1, "created_at": "Requires Password"},
         {"filename": "kept.vault", "path": str(kept_vault),
          "source_type": "Encrypted Metadata", "container_size": 1,
          "encrypted_size": 1, "created_at": "Requires Password"},
-    ], "error": ""})
+    ], error=""))
 
     assert [r["filename"] for r in screen.last_results] == ["kept.vault"]
     assert len(screen.results_list.controls) == 1
@@ -502,6 +508,7 @@ def test_library_remove_last_dir_clears_results_and_updates(hermetic_cfg, tmp_pa
 
 def test_library_screen_on_results_renders_rows(hermetic_cfg, tmp_path):
     pytest.importorskip("flet")
+    from rpm_encrypter.services.events import LibraryResultsEvent
     from rpm_encrypter.ui.screens.library_screen import LibraryScreen
     from rpm_encrypter.services.controllers.library_controller import LibraryController
 
@@ -511,11 +518,11 @@ def test_library_screen_on_results_renders_rows(hermetic_cfg, tmp_path):
     screen.build()
     LibraryController.add_dir(tmp_path)
 
-    screen.on_library_results({"data": [
+    screen.on_library_results(LibraryResultsEvent(data=[
         {"filename": "one.vault", "path": str(tmp_path / "one.vault"),
          "source_type": "Encrypted Metadata", "container_size": 1048576,
          "encrypted_size": 1100000, "created_at": "Requires Password"},
-    ], "error": ""})
+    ], error=""))
 
     assert len(screen.results_list.controls) == 1
     assert services.is_processing is False

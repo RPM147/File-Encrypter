@@ -324,12 +324,12 @@ def test_shell_mounts_activity_screen_and_reuses_instance():
     shell = AppShell(page, _shell_services(FakeLogger(rows=list(SAMPLE_ROWS), enabled=False)))
     assert shell.activity_screen is None
 
-    control = shell._placeholder("activity")
+    control = shell._mount_screen("activity")
     assert control is not None
     first = shell.activity_screen
     assert first is not None
 
-    shell._placeholder("activity")
+    shell._mount_screen("activity")
     assert shell.activity_screen is first  # reused
 
 

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import List
 
+from rpm_encrypter.services.events import LibraryResultsEvent
 from rpm_encrypter.storage.config import _load_cfg, _mutate_cfg
 from .base import BaseController
 
@@ -88,11 +89,11 @@ class LibraryController(BaseController):
                 "Success",
                 f"Found {len(results)} vaults",
             )
-            self._put({"type": "library_results", "data": results, "error": ""}, timeout=1.0)
+            self._put(LibraryResultsEvent(data=results, error=""), timeout=1.0)
         except Exception as exc:
             logger.exception("Library scan failed")
             self._log_activity("Library Scan", f"{len(dirs)} directories", "Failed", str(exc))
             self._put(
-                {"type": "library_results", "data": [], "error": f"Scan failed: {exc}"},
+                LibraryResultsEvent(data=[], error=f"Scan failed: {exc}"),
                 timeout=1.0,
             )

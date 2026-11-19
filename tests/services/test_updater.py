@@ -4,6 +4,7 @@ import time
 
 from rpm_encrypter.services import updater
 from rpm_encrypter.services.app_services import AppServices
+from rpm_encrypter.services.events import UpdateAvailableEvent
 from rpm_encrypter.storage import activity_log, config as app_config, scanner, versioning
 
 
@@ -86,7 +87,6 @@ def test_start_update_check_posts_queue_event_when_enabled(tmp_path, monkeypatch
             break
         time.sleep(0.02)
 
-    assert msg == {
-        "type": "update_available",
-        "info": {"version": "3.2.0", "url": "https://example.invalid/v3.2.0", "changelog": ""},
-    }
+    assert msg == UpdateAvailableEvent(
+        info={"version": "3.2.0", "url": "https://example.invalid/v3.2.0", "changelog": ""},
+    )

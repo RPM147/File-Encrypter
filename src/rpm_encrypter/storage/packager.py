@@ -341,7 +341,7 @@ class FolderPackager:
                 try:
                     member_resolved = member_path.resolve()
                     member_resolved.relative_to(output_dir_resolved)
-                except (ValueError, RuntimeError):
+                except (ValueError, RuntimeError) as exc:
                     logger.error(
                         "Zip Slip attempt blocked: member %r would escape output dir %s",
                         member,
@@ -350,7 +350,7 @@ class FolderPackager:
                     raise VaultFormatError(
                         f"Archive contains a path-traversal entry: {member!r}. "
                         f"The vault may have been tampered with."
-                    )
+                    ) from exc
 
                 zf.extract(member, output_dir)
                 if progress_callback:

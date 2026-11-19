@@ -81,13 +81,15 @@ def test_rekey_controller_rekeys_vault_and_saves_version(fast_services, tmp_path
     assert fast_services.crypto.decrypt_note(versions[0].path, "OldPw1!") == text
 
     assert not vault.with_suffix(".rekey.tmp").exists()
+    from rpm_encrypter.services.events import BatchDoneEvent
     msgs = _drain(fast_services.msg_queue)
-    assert any(m["type"] == "batch_done" and "Re-key complete" in m.get("text", "") for m in msgs)
+    assert any(isinstance(m, BatchDoneEvent) and "Re-key complete" in m.text for m in msgs)
 
 
 def test_rekey_wrong_password_leaves_original_and_removes_tmp(fast_services, tmp_path):
     from rpm_encrypter.core import AuthenticationError
     from rpm_encrypter.services.controllers.rekey_controller import RekeyController
+    from rpm_encrypter.services.events import BatchDoneEvent
 
     vault, text = _make_vault(fast_services, tmp_path / "v.vault", "RightPw1!")
 
@@ -99,13 +101,14 @@ def test_rekey_wrong_password_leaves_original_and_removes_tmp(fast_services, tmp
     assert not vault.with_suffix(".rekey.tmp").exists()
     msgs = _drain(fast_services.msg_queue)
     assert any(
-        m["type"] == "batch_done" and "wrong current password" in m.get("text", "") for m in msgs
+        isinstance(m, BatchDoneEvent) and "wrong current password" in m.text for m in msgs
     )
 
 
 def test_rekey_controller_cancel_removes_tmp(fast_services, tmp_path, monkeypatch):
     from rpm_encrypter.core import OperationCancelledError
     from rpm_encrypter.services.controllers.rekey_controller import RekeyController
+    from rpm_encrypter.services.events import BatchDoneEvent
 
     vault, _text = _make_vault(fast_services, tmp_path / "v.vault", "OldPw1!")
 
@@ -119,11 +122,12 @@ def test_rekey_controller_cancel_removes_tmp(fast_services, tmp_path, monkeypatc
 
     assert not vault.with_suffix(".rekey.tmp").exists()
     msgs = _drain(fast_services.msg_queue)
-    assert any(m["type"] == "batch_done" and "Cancelled" in m.get("text", "") for m in msgs)
+    assert any(isinstance(m, BatchDoneEvent) and "Cancelled" in m.text for m in msgs)
 
 
 def test_rekey_controller_version_history_actions(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.rekey_controller import RekeyController
+    from rpm_encrypter.services.events import RekeyVersionsEvent
 
     versioner = _enable_versioning(fast_services, tmp_path)
     vault, _text = _make_vault(fast_services, tmp_path / "v.vault", "Pw1!")
@@ -140,9 +144,9 @@ def test_rekey_controller_version_history_actions(fast_services, tmp_path):
 
     ctrl._post_versions(vault)
     msgs = _drain(fast_services.msg_queue)
-    versions_msg = [m for m in msgs if m["type"] == "rekey_versions"][0]
-    assert versions_msg["error"] == ""
-    entries = versions_msg["entries"]
+    versions_msg = [m for m in msgs if isinstance(m, RekeyVersionsEvent)][0]
+    assert versions_msg.error == ""
+    entries = versions_msg.entries
     assert len(entries) == 2
     assert entries[0]["name"] == "v__2026-06-03T12-00-00.vault"  # newest first
     assert entries[1]["name"] == "v__2026-06-03T10-00-00.vault"
@@ -182,6 +186,11 @@ def test_rekey_controller_is_flet_free_and_rekey_only():
 
 
 def test_event_dispatcher_routes_rekey_events():
+    from rpm_encrypter.services.events import (
+        RekeyPasswordStrengthEvent,
+        RekeyVersionActionEvent,
+        RekeyVersionsEvent,
+    )
     from rpm_encrypter.ui.events import EventDispatcher
 
     calls = []
@@ -197,9 +206,9 @@ def test_event_dispatcher_routes_rekey_events():
             calls.append(("action", msg))
 
     dispatcher = EventDispatcher(FakeSink())
-    dispatcher.dispatch({"type": "rekey_versions", "entries": []})
-    dispatcher.dispatch({"type": "rekey_password_strength", "score": 3})
-    dispatcher.dispatch({"type": "rekey_version_action", "text": "ok"})
+    dispatcher.dispatch(RekeyVersionsEvent(entries=[]))
+    dispatcher.dispatch(RekeyPasswordStrengthEvent(score=3))
+    dispatcher.dispatch(RekeyVersionActionEvent(text="ok"))
     assert [c[0] for c in calls] == ["versions", "strength", "action"]
 
 
@@ -349,13 +358,15 @@ def test_rekey_screen_renders_and_selects_versions():
     screen = RekeyScreen(page, _screen_services(), _FakeShell(page))
     screen.build()
 
+    from rpm_encrypter.services.events import RekeyVersionsEvent
+
     entries = [
         {"path": "C:/v/a__2.vault", "name": "a__2.vault",
          "display_timestamp": "2026-06-03 12:00:00", "display_size": "1.00 MiB", "size_bytes": 1},
         {"path": "C:/v/a__1.vault", "name": "a__1.vault",
          "display_timestamp": "2026-06-03 10:00:00", "display_size": "1.00 MiB", "size_bytes": 1},
     ]
-    screen.on_rekey_versions({"entries": entries, "error": "", "vault": "C:/v/a.vault"})
+    screen.on_rekey_versions(RekeyVersionsEvent(entries=entries, error="", vault="C:/v/a.vault"))
     assert len(screen.version_list.controls) == 2
 
     screen._select_version(1)
@@ -391,11 +402,14 @@ def test_rekey_screen_replace_and_delete_require_confirmation_dialog(tmp_path):
 
 def test_rekey_password_strength_event_updates_label():
     pytest.importorskip("flet")
+    from rpm_encrypter.services.events import RekeyPasswordStrengthEvent
     from rpm_encrypter.ui.screens.rekey_screen import RekeyScreen
 
     page = _FakePage()
     screen = RekeyScreen(page, _screen_services(), _FakeShell(page))
 
-    screen.on_rekey_password_strength({"score": 4, "crack_time": "centuries"})
+    screen.on_rekey_password_strength(
+        RekeyPasswordStrengthEvent(score=4, crack_time="centuries")
+    )
     assert "Strong" in screen.strength_text.value
     assert "centuries" in screen.strength_text.value

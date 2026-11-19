@@ -8,6 +8,12 @@ from rpm_encrypter.core import (
     PayloadTooLargeError,
 )
 from rpm_encrypter.services.constants import container_label_to_mb
+from rpm_encrypter.services.events import (
+    BatchDoneEvent,
+    ErrorEvent,
+    ProgressEvent,
+    ProgressStartEvent,
+)
 from rpm_encrypter.storage.atomic import atomic_output
 from rpm_encrypter.storage.config import push_recent
 from .base import BaseController
@@ -102,7 +108,7 @@ class EncryptController(BaseController):
         success = 0
         cancelled = False
         had_error = False
-        self._put({"type": "progress_start"})
+        self._put(ProgressStartEvent())
 
         for idx, src in enumerate(sources, 1):
             if self._cancel_check():
@@ -149,21 +155,23 @@ class EncryptController(BaseController):
                     counter += 1
 
                 def prog(done, total_b):
-                    self._put({"type": "progress", "done": done, "total": total_b}, timeout=0.01)
+                    self._put(ProgressEvent(done=done, total=total_b), timeout=0.01)
 
                 self._log(f"[{idx}/{total}] Encrypting ->  {path.name}")
                 atomic_output(
                     out_path,
-                    lambda p: crypto.encrypt_file(
-                        temp_zip,
-                        p,
-                        password,
-                        original_filename=path.name,
-                        metadata=manifest,
-                        progress_callback=prog,
-                        recovery_key=recovery_key,
-                        target_container_mb=container_mb,
-                        cancel_check=self._cancel_check,
+                    lambda p, src_zip=temp_zip, fname=path.name, meta=manifest, cb=prog: (
+                        crypto.encrypt_file(
+                            src_zip,
+                            p,
+                            password,
+                            original_filename=fname,
+                            metadata=meta,
+                            progress_callback=cb,
+                            recovery_key=recovery_key,
+                            target_container_mb=container_mb,
+                            cancel_check=self._cancel_check,
+                        )
                     ),
                 )
 
@@ -191,7 +199,7 @@ class EncryptController(BaseController):
                 had_error = True
                 self._log(f"[{idx}/{total}] FAILED: {exc}")
                 self._log_activity("Encrypt", path.name, "Failed", str(exc))
-                self._put({"type": "error", "text": f"{path.name}: {exc}"})
+                self._put(ErrorEvent(text=f"{path.name}: {exc}"))
             finally:
                 self._wipe_temp_file(temp_zip)
 
@@ -202,11 +210,10 @@ class EncryptController(BaseController):
             else f"Batch complete: {success}/{total} encrypted"
         )
         self._put(
-            {
-                "type": "batch_done",
-                "text": text,
-                "success": bool(not cancelled and not had_error and success == total),
-            },
+            BatchDoneEvent(
+                text=text,
+                success=bool(not cancelled and not had_error and success == total),
+            ),
             timeout=1.0,
         )
 
@@ -232,7 +239,7 @@ class EncryptController(BaseController):
         had_error = False
         decoy_tmp = None
         hidden_tmp = None
-        self._put({"type": "progress_start"})
+        self._put(ProgressStartEvent())
         self._log("--- Creating hidden vault ---")
 
         try:
@@ -315,7 +322,7 @@ class EncryptController(BaseController):
                 counter += 1
 
             def prog(done, total_b):
-                self._put({"type": "progress", "done": done, "total": total_b}, timeout=0.01)
+                self._put(ProgressEvent(done=done, total=total_b), timeout=0.01)
 
             decoy_filename = paths[0].name if len(paths) == 1 else "DecoyArchive"
             hidden_filename = h_paths[0].name if len(h_paths) == 1 else h_paths[0].parent.name
@@ -375,7 +382,7 @@ class EncryptController(BaseController):
             had_error = True
             self._log(f"FAILED: {exc}")
             self._log_activity("Encrypt", "HiddenArchive", "Failed", str(exc))
-            self._put({"type": "error", "text": f"Hidden vault: {exc}"})
+            self._put(ErrorEvent(text=f"Hidden vault: {exc}"))
         finally:
             self._wipe_temp_file(decoy_tmp)
             self._wipe_temp_file(hidden_tmp)
@@ -387,10 +394,9 @@ class EncryptController(BaseController):
             else f"Batch complete: {success}/{total} encrypted"
         )
         self._put(
-            {
-                "type": "batch_done",
-                "text": text,
-                "success": bool(not cancelled and not had_error and success == total),
-            },
+            BatchDoneEvent(
+                text=text,
+                success=bool(not cancelled and not had_error and success == total),
+            ),
             timeout=1.0,
         )

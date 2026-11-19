@@ -8,6 +8,13 @@ import flet as ft
 from rpm_encrypter.core import mnemonic_to_entropy
 from rpm_encrypter.services.recovery_copy import INSPECT_RECOVERY_LABEL
 from rpm_encrypter.services.controllers.inspect_controller import InspectController
+from rpm_encrypter.services.events import (
+    InspectResultEvent,
+    IntegrityResultEvent,
+    SelectiveExtractResultEvent,
+    VaultDiffResultEvent,
+    VerifyResultEvent,
+)
 from rpm_encrypter.ui.components import (
     AutoClearClipboard,
     card_panel,
@@ -504,8 +511,8 @@ class InspectScreen:
             set_screen_status(self.shell, "Dialog unavailable", is_error=True)
 
     # --- result handlers (called by AppShell on the poll loop) ---
-    def on_inspect_result(self, msg):
-        error = msg.get("error", "")
+    def on_inspect_result(self, event: InspectResultEvent):
+        error = event.error
         if error:
             self.current_metadata = {}
             self.current_path = None
@@ -514,8 +521,8 @@ class InspectScreen:
             self._set_results(error)
             finish_screen_operation(self.services, self.shell, error)
             return
-        self.current_metadata = msg.get("metadata", {})
-        path_str = msg.get("path", "")
+        self.current_metadata = event.metadata
+        path_str = event.path
         self.current_path = Path(path_str) if path_str else self._pending_auth_path
         self.current_auth_password = self._pending_auth_password
         self.current_auth_recovery_key = self._pending_auth_recovery_key
@@ -526,20 +533,20 @@ class InspectScreen:
         self._set_results(self._format_metadata(self.current_metadata))
         finish_screen_operation(self.services, self.shell, "Vault inspection complete")
 
-    def on_integrity_result(self, msg):
-        ok = bool(msg.get("ok", False))
+    def on_integrity_result(self, event: IntegrityResultEvent):
+        ok = bool(event.ok)
         if ok:
-            self.last_sha = msg.get("sha", "")
-        self._set_results(msg.get("msg", ""))
+            self.last_sha = event.sha
+        self._set_results(event.msg)
         if ok:
             self._refresh_fingerprint_panel()
         finish_screen_operation(self.services, self.shell, "Integrity check complete" if ok else "Integrity check failed")
 
-    def on_verify_result(self, msg):
-        status = msg.get("status", "")
-        current_sha = msg.get("current_sha", "")
-        saved_sha = msg.get("saved_sha", "")
-        recorded = msg.get("recorded", "")
+    def on_verify_result(self, event: VerifyResultEvent):
+        status = event.status
+        current_sha = event.current_sha
+        saved_sha = event.saved_sha
+        recorded = event.recorded
         if status == "missing":
             text = "No saved fingerprint for this vault"
             status_line = "No saved fingerprint"
@@ -560,21 +567,21 @@ class InspectScreen:
             )
             status_line = "Fingerprint mismatch"
         else:
-            text = msg.get("error", "Verification error")
+            text = event.error or "Verification error"
             status_line = "Verification error"
         self._set_results(text)
         finish_screen_operation(self.services, self.shell, status_line)
 
-    def on_selective_extract_result(self, msg):
-        if msg.get("error"):
-            self._set_results(f"Selective Extract failed: {msg.get('error')}")
+    def on_selective_extract_result(self, event: SelectiveExtractResultEvent):
+        if event.error:
+            self._set_results(f"Selective Extract failed: {event.error}")
         else:
             self._set_results(
-                f"Selective Extract complete\n\nCopied {msg.get('count', 0)} file(s) to:\n{msg.get('output_dir', '')}"
+                f"Selective Extract complete\n\nCopied {event.count} file(s) to:\n{event.output_dir}"
             )
 
-    def on_vault_diff_result(self, msg):
-        self._set_results(msg.get("text", "No diff results."))
+    def on_vault_diff_result(self, event: VaultDiffResultEvent):
+        self._set_results(event.text or "No diff results.")
 
     # --- rendering ---
     def _format_metadata(self, metadata):

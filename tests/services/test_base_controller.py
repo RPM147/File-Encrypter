@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from rpm_encrypter.services.controllers import BaseController
+from rpm_encrypter.services.events import LogEvent, ProgressEvent
 from rpm_encrypter.services.controllers.activity_controller import ActivityController
 from rpm_encrypter.services.controllers.decrypt_controller import DecryptController
 from rpm_encrypter.services.controllers.encrypt_controller import EncryptController
@@ -61,17 +62,17 @@ def _services(**overrides):
 def test_put_and_log_enqueue_messages():
     services = _services()
     ctrl = BaseController(services)
-    ctrl._put({"type": "progress", "value": 0.5})
+    ctrl._put(ProgressEvent(done=1, total=2))
     ctrl._log("hello")
-    assert services.msg_queue.get_nowait() == {"type": "progress", "value": 0.5}
-    assert services.msg_queue.get_nowait() == {"type": "log", "text": "hello"}
+    assert services.msg_queue.get_nowait() == ProgressEvent(done=1, total=2)
+    assert services.msg_queue.get_nowait() == LogEvent(text="hello")
 
 
 def test_put_drops_message_when_queue_is_full():
     services = _services(msg_queue=queue.Queue(maxsize=1))
     ctrl = BaseController(services)
-    ctrl._put({"n": 1})
-    ctrl._put({"n": 2}, timeout=0.01)  # must not raise
+    ctrl._put(LogEvent(text="1"))
+    ctrl._put(LogEvent(text="2"), timeout=0.01)  # must not raise
     assert services.msg_queue.qsize() == 1
 
 

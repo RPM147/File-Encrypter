@@ -95,15 +95,24 @@ class _FakeSink:
 
 
 def test_event_dispatcher_routes_every_message_type():
+    from rpm_encrypter.services.events import (
+        AuthErrorEvent,
+        BatchDoneEvent,
+        ErrorEvent,
+        LogEvent,
+        ProgressEvent,
+        ProgressStartEvent,
+    )
     from rpm_encrypter.ui.events import EventDispatcher
+
     sink = _FakeSink()
     d = EventDispatcher(sink)
-    d.dispatch({"type": "log", "text": "hi"})
-    d.dispatch({"type": "progress_start"})
-    d.dispatch({"type": "progress", "done": 3, "total": 4})
-    d.dispatch({"type": "error", "text": "boom"})
-    d.dispatch({"type": "auth_error", "remaining": 2, "lockout": 0})
-    d.dispatch({"type": "batch_done", "text": "done"})
+    d.dispatch(LogEvent(text="hi"))
+    d.dispatch(ProgressStartEvent())
+    d.dispatch(ProgressEvent(done=3, total=4))
+    d.dispatch(ErrorEvent(text="boom"))
+    d.dispatch(AuthErrorEvent(remaining=2, lockout=0))
+    d.dispatch(BatchDoneEvent(text="done"))
     assert sink.calls == [
         ("log", "hi"),
         ("progress_start",),
@@ -137,7 +146,11 @@ def test_cleanup_orphaned_temp_files_targets_rpm_temp_patterns(hermetic_home, tm
 
 
 def test_stage1_bridge_modules_are_flet_free():
-    for rel in ("src/rpm_encrypter/services/app_services.py", "src/rpm_encrypter/ui/events.py"):
+    for rel in (
+        "src/rpm_encrypter/services/app_services.py",
+        "src/rpm_encrypter/services/events.py",
+        "src/rpm_encrypter/ui/events.py",
+    ):
         src = (ROOT / rel).read_text(encoding="utf-8")
         assert "import flet" not in src
         assert "from flet" not in src
@@ -233,16 +246,16 @@ def test_status_bar_cancel_button_lifecycle(hermetic_home):
 
 def test_update_available_event_shows_and_dismisses_banner(hermetic_home):
     pytest.importorskip("flet")
+    from rpm_encrypter.services.events import UpdateAvailableEvent
     from rpm_encrypter.ui.events import EventDispatcher
 
     shell, _ = _make_shell(hermetic_home)
     assert shell._update_banner.visible is False
 
     EventDispatcher(shell).dispatch(
-        {
-            "type": "update_available",
-            "info": {"version": "3.1.0", "url": "https://example.invalid/v3.1.0"},
-        }
+        UpdateAvailableEvent(
+            info={"version": "3.1.0", "url": "https://example.invalid/v3.1.0"},
+        )
     )
     assert shell._update_banner.visible is True
     assert "3.1.0" in shell._update_banner_title.value
@@ -255,3 +268,11 @@ def test_update_available_event_shows_and_dismisses_banner(hermetic_home):
     shell._dismiss_update_banner()
     assert shell._update_banner.visible is False
     assert shell._update_info is None
+
+
+def test_shell_mount_screen_rejects_unknown_key(hermetic_home):
+    pytest.importorskip("flet")
+    shell, _ = _make_shell(hermetic_home)
+    assert shell._mount_screen("encrypt") is not None
+    with pytest.raises(KeyError):
+        shell._mount_screen("does_not_exist")

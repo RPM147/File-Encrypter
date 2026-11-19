@@ -9,7 +9,7 @@ src/
   rpm_encrypter/
     core/                       # Cryptographic primitives, vault format v4, BIP-39 recovery
     storage/                    # Atomic I/O, wiping, zip packaging, inspection, scanner, versioning, config, SQLite log
-    services/                   # Flet-free application wiring, state, updater, BaseController & controllers
+    services/                   # Flet-free application wiring, state, updater, events, BaseController & controllers
     ui/                         # Flet shell, events, tokens, theme, reusable components/, screens/
 launcher/                       # Windows Unicode-path C wrapper and .rc/.ico
 tests/                          # Layered test suite (core, storage, services, ui, packaging/docs)
@@ -19,7 +19,7 @@ tests/                          # Layered test suite (core, storage, services, u
 
 1. **`core`** depends only on the Python stdlib, `cryptography`, and `argon2-cffi`. It never imports `storage`, `services`, or `ui`.
 2. **`storage`** may import `core`, never `services` or `ui`.
-3. **`services`** (including `BaseController` and all `controllers/*`) may import `core` and `storage`. It must remain **100% Flet-free** so business workflows are testable headlessly.
+3. **`services`** (including `events.py`, `BaseController`, and all `controllers/*`) may import `core` and `storage`. Typed `AppEvent` dataclasses in `services/events.py` define the worker-to-UI queue contract. It must remain **100% Flet-free** so business workflows are testable headlessly.
 4. **`ui`** (including `components/*` and `screens/*`) wires Flet controls to `services`, `storage`, and `core`. Only `ui/events.py` stays Flet-free to simplify queue-dispatch testing.
 
 ## Clean-Slate / No Backward Compatibility Policy

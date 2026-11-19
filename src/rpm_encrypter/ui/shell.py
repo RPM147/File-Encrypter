@@ -7,6 +7,17 @@ import webbrowser
 import flet as ft
 
 from rpm_encrypter.services import APP_NAME, APP_VERSION, AppServices
+from rpm_encrypter.services.events import (
+    InspectResultEvent,
+    IntegrityResultEvent,
+    LibraryResultsEvent,
+    RekeyPasswordStrengthEvent,
+    RekeyVersionActionEvent,
+    RekeyVersionsEvent,
+    SelectiveExtractResultEvent,
+    VaultDiffResultEvent,
+    VerifyResultEvent,
+)
 from rpm_encrypter.storage.config import get_setting, save_setting
 from .events import EventDispatcher
 from .screens.activity_screen import ActivityScreen
@@ -27,6 +38,19 @@ from .tokens import (
     TYPE,
     apply_ui_scale as apply_token_scale,
 )
+
+
+_SCREEN_REGISTRY: dict[str, tuple[str, type]] = {
+    "encrypt": ("encrypt_screen", EncryptScreen),
+    "decrypt": ("decrypt_screen", DecryptScreen),
+    "inspect": ("inspect_screen", InspectScreen),
+    "library": ("library_screen", LibraryScreen),
+    "notes": ("notes_screen", NotesScreen),
+    "rekey": ("rekey_screen", RekeyScreen),
+    "password": ("password_screen", PasswordScreen),
+    "activity": ("activity_screen", ActivityScreen),
+    "settings": ("settings_screen", SettingsScreen),
+}
 
 
 class AppShell:
@@ -70,7 +94,7 @@ class AppShell:
             color=COLORS["text_secondary"],
         )
         self._content = ft.AnimatedSwitcher(
-            content=self._placeholder("encrypt"),
+            content=self._mount_screen("encrypt"),
             transition=ft.AnimatedSwitcherTransition.FADE,
             duration=180,
         )
@@ -148,62 +172,13 @@ class AppShell:
         self._sync_update_banner()
         self.safe_update()
 
-    def _placeholder(self, key: str) -> ft.Control:
-        if key == "encrypt":
-            if self.encrypt_screen is None:
-                self.encrypt_screen = EncryptScreen(self.page, self.services, self)
-            return self.encrypt_screen.build()
-
-        if key == "decrypt":
-            if self.decrypt_screen is None:
-                self.decrypt_screen = DecryptScreen(self.page, self.services, self)
-            return self.decrypt_screen.build()
-
-        if key == "inspect":
-            if self.inspect_screen is None:
-                self.inspect_screen = InspectScreen(self.page, self.services, self)
-            return self.inspect_screen.build()
-
-        if key == "library":
-            if self.library_screen is None:
-                self.library_screen = LibraryScreen(self.page, self.services, self)
-            return self.library_screen.build()
-
-        if key == "notes":
-            if self.notes_screen is None:
-                self.notes_screen = NotesScreen(self.page, self.services, self)
-            return self.notes_screen.build()
-
-        if key == "rekey":
-            if self.rekey_screen is None:
-                self.rekey_screen = RekeyScreen(self.page, self.services, self)
-            return self.rekey_screen.build()
-
-        if key == "password":
-            if self.password_screen is None:
-                self.password_screen = PasswordScreen(self.page, self.services, self)
-            return self.password_screen.build()
-
-        if key == "activity":
-            if self.activity_screen is None:
-                self.activity_screen = ActivityScreen(self.page, self.services, self)
-            return self.activity_screen.build()
-
-        if key == "settings":
-            if self.settings_screen is None:
-                self.settings_screen = SettingsScreen(self.page, self.services, self)
-            return self.settings_screen.build()
-
-        return ft.Container(
-            content=ft.Text(
-                f"{self._labels[key]} -- coming soon",
-                size=TYPE["page_title"]["size"],
-                weight=ft.FontWeight.W_600,
-                color=COLORS["text_primary"],
-            ),
-            alignment=ft.Alignment.CENTER,
-            expand=True,
-        )
+    def _mount_screen(self, key: str) -> ft.Control:
+        attr, screen_cls = _SCREEN_REGISTRY[key]
+        screen = getattr(self, attr)
+        if screen is None:
+            screen = screen_cls(self.page, self.services, self)
+            setattr(self, attr, screen)
+        return screen.build()
 
     def _nav_button(self, key: str) -> ft.Control:
         is_active = key == self.active_key
@@ -228,7 +203,7 @@ class AppShell:
             active = k == key
             c.bgcolor = COLORS["surface_card"] if active else None
             c.content.color = COLORS["accent"] if active else COLORS["text_primary"]
-        self._content.content = self._placeholder(key)
+        self._content.content = self._mount_screen(key)
         self.safe_update()
 
     def on_keyboard_event(self, e) -> None:
@@ -245,15 +220,8 @@ class AppShell:
                     self.navigate(NAV_ITEMS[idx][0])
 
     def _clear_screen_cache(self) -> None:
-        self.encrypt_screen = None
-        self.decrypt_screen = None
-        self.inspect_screen = None
-        self.library_screen = None
-        self.notes_screen = None
-        self.rekey_screen = None
-        self.password_screen = None
-        self.activity_screen = None
-        self.settings_screen = None
+        for attr, _ in _SCREEN_REGISTRY.values():
+            setattr(self, attr, None)
 
     def _rebuild_root(self) -> None:
         active = self.active_key
@@ -265,7 +233,7 @@ class AppShell:
         if isinstance(controls, list) and controls:
             controls[0] = root
         else:
-            self._content.content = self._placeholder(active)
+            self._content.content = self._mount_screen(active)
         self.safe_update()
 
     def apply_theme(self, choice: str) -> None:
@@ -357,45 +325,45 @@ class AppShell:
         if self.inspect_screen is not None:
             self.inspect_screen.on_auth_error(rem, lock)
 
-    def on_inspect_result(self, msg: dict) -> None:
+    def on_inspect_result(self, event: InspectResultEvent) -> None:
         if self.inspect_screen is not None:
-            self.inspect_screen.on_inspect_result(msg)
+            self.inspect_screen.on_inspect_result(event)
 
-    def on_integrity_result(self, msg: dict) -> None:
+    def on_integrity_result(self, event: IntegrityResultEvent) -> None:
         if self.inspect_screen is not None:
-            self.inspect_screen.on_integrity_result(msg)
+            self.inspect_screen.on_integrity_result(event)
 
-    def on_verify_result(self, msg: dict) -> None:
+    def on_verify_result(self, event: VerifyResultEvent) -> None:
         if self.inspect_screen is not None:
-            self.inspect_screen.on_verify_result(msg)
+            self.inspect_screen.on_verify_result(event)
 
-    def on_selective_extract_result(self, msg: dict) -> None:
+    def on_selective_extract_result(self, event: SelectiveExtractResultEvent) -> None:
         if self.inspect_screen is not None:
-            self.inspect_screen.on_selective_extract_result(msg)
+            self.inspect_screen.on_selective_extract_result(event)
 
-    def on_vault_diff_result(self, msg: dict) -> None:
+    def on_vault_diff_result(self, event: VaultDiffResultEvent) -> None:
         if self.inspect_screen is not None:
-            self.inspect_screen.on_vault_diff_result(msg)
+            self.inspect_screen.on_vault_diff_result(event)
 
-    def on_library_results(self, msg: dict) -> None:
+    def on_library_results(self, event: LibraryResultsEvent) -> None:
         if self.library_screen is not None:
-            self.library_screen.on_library_results(msg)
+            self.library_screen.on_library_results(event)
 
     def on_note_decrypted(self, text: str) -> None:
         if self.notes_screen is not None:
             self.notes_screen.on_note_decrypted(text)
 
-    def on_rekey_versions(self, msg: dict) -> None:
+    def on_rekey_versions(self, event: RekeyVersionsEvent) -> None:
         if self.rekey_screen is not None:
-            self.rekey_screen.on_rekey_versions(msg)
+            self.rekey_screen.on_rekey_versions(event)
 
-    def on_rekey_password_strength(self, msg: dict) -> None:
+    def on_rekey_password_strength(self, event: RekeyPasswordStrengthEvent) -> None:
         if self.rekey_screen is not None:
-            self.rekey_screen.on_rekey_password_strength(msg)
+            self.rekey_screen.on_rekey_password_strength(event)
 
-    def on_rekey_version_action(self, msg: dict) -> None:
+    def on_rekey_version_action(self, event: RekeyVersionActionEvent) -> None:
         if self.rekey_screen is not None:
-            self.rekey_screen.on_rekey_version_action(msg)
+            self.rekey_screen.on_rekey_version_action(event)
 
     def on_update_available(self, info: dict) -> None:
         if not info:

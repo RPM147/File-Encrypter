@@ -26,6 +26,7 @@ from rpm_encrypter.storage import (
 )
 from . import updater
 from .controllers.settings_controller import ensure_modern_settings_defaults
+from .events import UpdateAvailableEvent
 from .state import AttemptLimiter, SessionStats
 
 MSG_QUEUE_SIZE = 1000
@@ -92,7 +93,7 @@ class AppServices:
             if info is not None:
                 try:
                     self.msg_queue.put(
-                        {"type": "update_available", "info": info},
+                        UpdateAvailableEvent(info=info),
                         timeout=0.5,
                     )
                 except queue.Full:

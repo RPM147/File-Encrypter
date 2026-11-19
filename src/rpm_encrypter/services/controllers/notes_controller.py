@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from rpm_encrypter.core import AuthenticationError
+from rpm_encrypter.services.events import BatchDoneEvent, NoteDecryptedEvent
 from rpm_encrypter.storage.atomic import atomic_output
 from rpm_encrypter.storage.log_hygiene import redact_path
 from .base import BaseController
@@ -33,23 +34,23 @@ class NotesController(BaseController):
                 ),
             )
             self._log_activity("Note Encrypt", path.name, "Success")
-            self._put({"type": "batch_done", "text": f"Note saved to {path.name}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Note saved to {path.name}"), timeout=1.0)
         except Exception as exc:
             logger.exception("Note encryption failed for %s", redact_path(path))
             self._log_activity("Note Encrypt", path.name, "Failed", str(exc))
-            self._put({"type": "batch_done", "text": f"Note save failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Note save failed: {exc}"), timeout=1.0)
 
     def _decrypt_worker(self, path, password):
         path = Path(path)
         try:
             text = self.services.crypto.decrypt_note(path, password)
             self._log_activity("Note Decrypt", path.name, "Success")
-            self._put({"type": "note_decrypted", "text": text}, timeout=1.0)
-            self._put({"type": "batch_done", "text": f"Note loaded: {path.name}"}, timeout=1.0)
+            self._put(NoteDecryptedEvent(text=text), timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Note loaded: {path.name}"), timeout=1.0)
         except AuthenticationError:
             self._log_activity("Note Decrypt", path.name, "Failed", "Auth Error")
-            self._put({"type": "batch_done", "text": "Note load failed: Wrong Password"}, timeout=1.0)
+            self._put(BatchDoneEvent(text="Note load failed: Wrong Password"), timeout=1.0)
         except Exception as exc:
             logger.exception("Note decryption failed for %s", redact_path(path))
             self._log_activity("Note Decrypt", path.name, "Failed", str(exc))
-            self._put({"type": "batch_done", "text": f"Note load failed: {exc}"}, timeout=1.0)
+            self._put(BatchDoneEvent(text=f"Note load failed: {exc}"), timeout=1.0)

@@ -410,16 +410,23 @@ def test_vault_diff_is_header_only_and_reports_added_removed_modified(fast_servi
         raise AssertionError("Vault Diff must not decrypt payload")
 
     monkeypatch.setattr(fast_services.crypto, "decrypt_file", fail_decrypt)
+    from rpm_encrypter.services.events import VaultDiffResultEvent
+
     InspectController(fast_services)._vault_diff_worker(vault_a, "PwA-1", vault_b, "PwB-1")
     msgs = _drain(fast_services.msg_queue)
-    result = [m for m in msgs if m["type"] == "vault_diff_result"][0]
+    result = [m for m in msgs if isinstance(m, VaultDiffResultEvent)][0]
 
-    assert any("added.txt" in item for item in result["added"])
-    assert any("removed.txt" in item for item in result["removed"])
-    assert any("mod.txt" in item for item in result["modified"])
+    assert any("added.txt" in item for item in result.added)
+    assert any("removed.txt" in item for item in result.removed)
+    assert any("mod.txt" in item for item in result.modified)
 
 
 def test_event_dispatcher_routes_stage11_results():
+    from rpm_encrypter.services.events import (
+        BatchDoneEvent,
+        SelectiveExtractResultEvent,
+        VaultDiffResultEvent,
+    )
     from rpm_encrypter.ui.events import EventDispatcher
 
     calls = []
@@ -435,12 +442,14 @@ def test_event_dispatcher_routes_stage11_results():
             calls.append(("done", text, success))
 
     dispatcher = EventDispatcher(Sink())
-    dispatcher.dispatch({"type": "selective_extract_result", "count": 1})
-    dispatcher.dispatch({"type": "vault_diff_result", "text": "diff"})
-    dispatcher.dispatch({"type": "batch_done", "text": "Done", "success": True})
+    selective_ev = SelectiveExtractResultEvent(count=1)
+    diff_ev = VaultDiffResultEvent(text="diff")
+    dispatcher.dispatch(selective_ev)
+    dispatcher.dispatch(diff_ev)
+    dispatcher.dispatch(BatchDoneEvent(text="Done", success=True))
     assert calls == [
-        ("selective", {"type": "selective_extract_result", "count": 1}),
-        ("diff", {"type": "vault_diff_result", "text": "diff"}),
+        ("selective", selective_ev),
+        ("diff", diff_ev),
         ("done", "Done", True),
     ]
 
@@ -630,7 +639,7 @@ def test_encrypt_and_decrypt_reset_after_success(hermetic_cfg):
     services = FakeServices()
     shell = AppShell(page, services)
 
-    shell._placeholder("encrypt")
+    shell._mount_screen("encrypt")
     shell.encrypt_screen.sources = ["C:/tmp/a.txt"]
     shell.encrypt_screen.password_field.value = "pw"
     shell.encrypt_screen.confirm_password_field.value = "pw"
@@ -639,7 +648,7 @@ def test_encrypt_and_decrypt_reset_after_success(hermetic_cfg):
     assert shell.encrypt_screen.password_field.value == ""
     assert shell.encrypt_screen.confirm_password_field.value == ""
 
-    shell._placeholder("decrypt")
+    shell._mount_screen("decrypt")
     shell.decrypt_screen.paths = ["C:/tmp/a.vault"]
     shell.decrypt_screen.password_field.value = "pw"
     shell.decrypt_screen.output_field.value = "C:/tmp"

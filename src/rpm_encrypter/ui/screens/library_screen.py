@@ -13,6 +13,7 @@ from pathlib import Path
 import flet as ft
 
 from rpm_encrypter.services.controllers.library_controller import LibraryController
+from rpm_encrypter.services.events import LibraryResultsEvent
 from rpm_encrypter.ui.components import (
     card_panel,
     empty_text,
@@ -140,17 +141,19 @@ class LibraryScreen:
         self.shell.safe_update()
 
     # --- result handler (called by AppShell on the poll loop) ---
-    def on_library_results(self, msg):
-        error = msg.get("error", "")
+    def on_library_results(self, event: LibraryResultsEvent):
+        error = event.error
         if error:
             self.last_results = []
             self._render_results()
             finish_screen_operation(self.services, self.shell, error)
             return
-        self.last_results = self._filter_current_dir_results(msg.get("data", []))
+        self.last_results = self._filter_current_dir_results(event.data)
         self._render_results()
-        finish_screen_operation(self.services, self.shell, 
-            f"Library scan complete. Found {len(self.last_results)} vaults."
+        finish_screen_operation(
+            self.services,
+            self.shell,
+            f"Library scan complete. Found {len(self.last_results)} vaults.",
         )
 
     # --- rendering ---

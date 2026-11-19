@@ -155,3 +155,11 @@ def test_storage_split_has_no_legacy_file_handler_shim():
         assert (storage / module).is_file(), module
     for py in sorted((ROOT / "src").rglob("*.py")):
         assert "file_handler" not in py.read_text(encoding="utf-8"), py.relative_to(ROOT)
+
+
+def test_repo_hygiene_gitattributes_python_floor_and_ruff_b():
+    assert (ROOT / ".gitattributes").is_file()
+    data = _pyproject_data()
+    assert data["project"]["requires-python"] == ">=3.11"
+    lint_select = data["tool"]["ruff"]["lint"]["select"]
+    assert "B" in lint_select

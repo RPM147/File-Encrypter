@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Optional
 
 from rpm_encrypter.core import AuthenticationError, OperationCancelledError
+from rpm_encrypter.services.events import (
+    AuthErrorEvent,
+    BatchDoneEvent,
+    ProgressEvent,
+    ProgressStartEvent,
+)
 from rpm_encrypter.storage.config import push_recent
 from rpm_encrypter.storage.log_hygiene import redact_path
 from .base import BaseController
@@ -51,11 +57,11 @@ class DecryptController(BaseController):
                 self._track_temp(temp_zip)
 
                 self._log(f"[{idx}/{total}] Decrypting -> {path.name}")
-                self._put({"type": "progress_start"})
+                self._put(ProgressStartEvent())
 
                 def prog(done, total_b):
                     self._put(
-                        {"type": "progress", "done": done, "total": total_b},
+                        ProgressEvent(done=done, total=total_b),
                         timeout=0.01,
                     )
 
@@ -112,7 +118,7 @@ class DecryptController(BaseController):
                     self._log(f"[{idx}/{total}] Wrong password - locked for {secs}s")
                 else:
                     self._log(f"[{idx}/{total}] Wrong password - {rem} attempts remaining")
-                self._put({"type": "auth_error", "remaining": rem, "lockout": secs})
+                self._put(AuthErrorEvent(remaining=rem, lockout=secs))
                 break
 
             except Exception as exc:
@@ -135,10 +141,9 @@ class DecryptController(BaseController):
             )
         )
         self._put(
-            {
-                "type": "batch_done",
-                "text": text,
-                "success": bool(not cancelled and not auth_error and success == total),
-            },
+            BatchDoneEvent(
+                text=text,
+                success=bool(not cancelled and not auth_error and success == total),
+            ),
             timeout=1.0,
         )

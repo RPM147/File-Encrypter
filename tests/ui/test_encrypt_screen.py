@@ -33,6 +33,7 @@ def _drain(q):
 
 def test_encrypt_controller_round_trips(fast_services, tmp_path):
     from rpm_encrypter.services.controllers.encrypt_controller import EncryptController
+    from rpm_encrypter.services.events import BatchDoneEvent
 
     src = tmp_path / "secret.txt"
     src.write_bytes(b"stage 2 payload " * 200)
@@ -43,7 +44,7 @@ def test_encrypt_controller_round_trips(fast_services, tmp_path):
         [str(src)], "PwStage2!", None, True, False, str(out_dir)
     )
     msgs = _drain(fast_services.msg_queue)
-    assert any(m["type"] == "batch_done" and "1/1" in m.get("text", "") for m in msgs)
+    assert any(isinstance(m, BatchDoneEvent) and "1/1" in m.text for m in msgs)
     vaults = list(out_dir.glob("*.vault"))
     assert len(vaults) == 1
 
