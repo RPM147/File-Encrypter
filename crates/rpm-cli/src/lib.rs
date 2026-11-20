@@ -442,14 +442,9 @@ where
                         .filter(|p| !p.as_os_str().is_empty())
                         .unwrap_or_else(|| Path::new("."))
                 });
-                let stem = v
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "restored".into());
-                let dest_dir = unique_path(&target_root.join(stem));
                 match decrypt_vault_v5(
                     v,
-                    &dest_dir,
+                    target_root,
                     match auth {
                         Auth::RecoveryKey(r) => Auth::RecoveryKey(r),
                         Auth::Password {
@@ -468,7 +463,7 @@ where
                             stdout,
                             "Decrypted: {} -> {} ({} file(s))",
                             v.display(),
-                            dest_dir.display(),
+                            summary.output_path.display(),
                             summary.files_extracted
                         );
                     }
@@ -506,6 +501,7 @@ where
                                 "sha256": rep.sha256_hex,
                                 "has_keyfile": rep.has_keyfile,
                                 "has_recovery": rep.has_recovery,
+                                "chunk_count": rep.chunk_count,
                                 "message": rep.message,
                             });
                             let _ =

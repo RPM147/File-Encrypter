@@ -10,12 +10,12 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::constants::{
-    AES_KEY_SIZE, AES_NONCE_SIZE, CHUNKED_CIPHER_NAME, FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY,
-    KDF_NAME, MAX_CHUNK_SIZE, MAX_HEADER_SIZE, MIN_CHUNK_SIZE, SALT_SIZE, VAULT_MAGIC,
-    VAULT_VERSION,
+    AES_KEY_SIZE, AES_NONCE_SIZE, ALL_KNOWN_FLAGS, CHUNKED_CIPHER_NAME, FLAG_COMPRESSED,
+    FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY, KDF_NAME, MAX_CHUNK_SIZE, MAX_HEADER_SIZE, MIN_CHUNK_SIZE,
+    SALT_SIZE, VAULT_MAGIC, VAULT_VERSION,
 };
 use crate::error::CryptoError;
 use crate::kdf::{derive_kek, derive_recovery_kek, KdfParams};
@@ -87,6 +87,10 @@ impl VaultHeader {
         (self.flags & FLAG_HAS_KEYFILE) != 0
     }
 
+    pub fn is_compressed(&self) -> bool {
+        (self.flags & FLAG_COMPRESSED) != 0
+    }
+
     pub fn kdf_params(&self) -> KdfParams {
         KdfParams {
             memory_kib: self.kdf.memory_kib,
@@ -100,7 +104,13 @@ impl VaultHeader {
     }
 
     pub fn payload_context(&self) -> [u8; 32] {
-        payload_context(self.version, self.chunk_size, &self.vault_id)
+        payload_context(
+            self.version,
+            &self.cipher,
+            self.chunk_size,
+            self.is_compressed(),
+            &self.vault_id,
+        )
     }
 }
 
@@ -112,11 +122,23 @@ pub fn decode_fixed<const N: usize>(b64: &str, field: &str) -> Result<[u8; N], C
         .map_err(|_| CryptoError::InvalidFormat(format!("invalid length for {field}")))
 }
 
-pub fn payload_context(version: u8, chunk_size: u32, vault_id: &str) -> [u8; 32] {
+/// Cryptographic domain context binding all immutable Vault v5 payload
+/// parameters (`version`, `cipher`, `chunk_size`, `compressed`, `vault_id`) to
+/// metadata, key slots, stream nonce prefix, and every chunk AAD.
+pub fn payload_context(
+    version: u8,
+    cipher: &str,
+    chunk_size: u32,
+    compressed: bool,
+    vault_id: &str,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"RPMV5-CTX");
     h.update([version]);
+    h.update((cipher.len() as u32).to_be_bytes());
+    h.update(cipher.as_bytes());
     h.update(chunk_size.to_be_bytes());
+    h.update([u8::from(compressed)]);
     h.update(vault_id.as_bytes());
     h.finalize().into()
 }
@@ -173,12 +195,12 @@ pub fn unwrap_dek(kek: &SecretKey, slot: &KeySlot, aad: &[u8]) -> Result<SecretK
         .map_err(|_| CryptoError::InvalidFormat("invalid wrapped_dek base64".into()))?;
     let cipher =
         Aes256Gcm::new_from_slice(kek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
-    let mut plain = cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: &wrapped, aad })
-        .map_err(|_| CryptoError::AuthenticationFailed)?;
-    let key = SecretKey::from_slice(&plain).ok_or(CryptoError::AuthenticationFailed)?;
-    plain.zeroize();
-    Ok(key)
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &wrapped, aad })
+            .map_err(|_| CryptoError::AuthenticationFailed)?,
+    );
+    SecretKey::from_slice(&plain).ok_or(CryptoError::AuthenticationFailed)
 }
 
 pub fn build_password_slot_and_kdf(
@@ -188,14 +210,14 @@ pub fn build_password_slot_and_kdf(
     keyfile_hash: Option<&SecretKey>,
     payload_ctx: &[u8; 32],
 ) -> Result<(HeaderKdf, KeySlot), CryptoError> {
-    let mut salt = [0u8; SALT_SIZE];
-    OsRng.fill_bytes(&mut salt);
+    let mut salt = Zeroizing::new([0u8; SALT_SIZE]);
+    OsRng.fill_bytes(salt.as_mut());
     let kek = derive_kek(password, &salt, kdf, keyfile_hash)?;
     let aad = password_slot_aad(payload_ctx, &salt, kdf, keyfile_hash.is_some());
     let slot = wrap_dek(&kek, dek, &aad)?;
     let hdr_kdf = HeaderKdf {
         algorithm: KDF_NAME.to_string(),
-        salt: B64.encode(salt),
+        salt: B64.encode(*salt),
         memory_kib: kdf.memory_kib,
         iterations: kdf.iterations,
         parallelism: kdf.parallelism,
@@ -208,13 +230,13 @@ pub fn build_recovery_slot(
     recovery_entropy: &SecretKey,
     payload_ctx: &[u8; 32],
 ) -> Result<RecoverySlot, CryptoError> {
-    let mut rec_salt = [0u8; SALT_SIZE];
-    OsRng.fill_bytes(&mut rec_salt);
+    let mut rec_salt = Zeroizing::new([0u8; SALT_SIZE]);
+    OsRng.fill_bytes(rec_salt.as_mut());
     let rec_kek = derive_recovery_kek(recovery_entropy, &rec_salt)?;
     let aad = recovery_slot_aad(payload_ctx, &rec_salt);
     let slot = wrap_dek(&rec_kek, dek, &aad)?;
     Ok(RecoverySlot {
-        salt: B64.encode(rec_salt),
+        salt: B64.encode(*rec_salt),
         nonce: slot.nonce,
         wrapped_dek: slot.wrapped_dek,
     })
@@ -225,8 +247,9 @@ pub fn encrypt_metadata(
     metadata: &VaultMetadata,
     payload_ctx: &[u8; 32],
 ) -> Result<([u8; AES_NONCE_SIZE], Vec<u8>), CryptoError> {
-    let mut meta_json =
-        serde_json::to_vec(metadata).map_err(|e| CryptoError::InvalidFormat(e.to_string()))?;
+    let meta_json = Zeroizing::new(
+        serde_json::to_vec(metadata).map_err(|e| CryptoError::InvalidFormat(e.to_string()))?,
+    );
     let mut nonce = [0u8; AES_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
     let cipher =
@@ -240,7 +263,6 @@ pub fn encrypt_metadata(
             },
         )
         .map_err(|_| CryptoError::CryptoFailure)?;
-    meta_json.zeroize();
     Ok((nonce, enc))
 }
 
@@ -253,19 +275,19 @@ pub fn decrypt_metadata(
     let payload_ctx = header.payload_context();
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
-    let mut plain = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: encrypted_meta,
-                aad: &payload_ctx,
-            },
-        )
-        .map_err(|_| CryptoError::AuthenticationFailed)?;
-    let meta: VaultMetadata = serde_json::from_slice(&plain)
-        .map_err(|e| CryptoError::InvalidFormat(format!("invalid metadata JSON: {e}")))?;
-    plain.zeroize();
-    Ok(meta)
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: encrypted_meta,
+                    aad: &payload_ctx,
+                },
+            )
+            .map_err(|_| CryptoError::AuthenticationFailed)?,
+    );
+    serde_json::from_slice(&plain)
+        .map_err(|e| CryptoError::InvalidFormat(format!("invalid metadata JSON: {e}")))
 }
 
 pub fn write_header_and_meta(
@@ -288,29 +310,33 @@ pub fn write_header_and_meta(
     Ok(())
 }
 
+fn read_exact_header(reader: &mut impl Read, buf: &mut [u8], msg: &str) -> Result<(), CryptoError> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            CryptoError::InvalidFormat(msg.into())
+        } else {
+            CryptoError::Io(e)
+        }
+    })
+}
+
 pub fn read_header_and_meta(
     reader: &mut impl Read,
 ) -> Result<(VaultHeader, Vec<u8>, u64), CryptoError> {
     let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            CryptoError::InvalidFormat("file too short for vault header".into())
-        } else {
-            CryptoError::Io(e)
-        }
-    })?;
+    read_exact_header(reader, &mut magic, "file too short for vault header")?;
     if magic != VAULT_MAGIC {
         return Err(CryptoError::InvalidFormat("invalid magic bytes".into()));
     }
 
     let mut ver = [0u8; 1];
-    reader.read_exact(&mut ver)?;
+    read_exact_header(reader, &mut ver, "truncated vault version")?;
     if ver[0] != VAULT_VERSION {
         return Err(CryptoError::UnsupportedVersion(ver[0]));
     }
 
     let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
+    read_exact_header(reader, &mut len_buf, "truncated vault header length")?;
     let hlen = u32::from_be_bytes(len_buf) as usize;
     if hlen == 0 || hlen > MAX_HEADER_SIZE {
         return Err(CryptoError::InvalidFormat(format!(
@@ -319,7 +345,7 @@ pub fn read_header_and_meta(
     }
 
     let mut hdr_bytes = vec![0u8; hlen];
-    reader.read_exact(&mut hdr_bytes)?;
+    read_exact_header(reader, &mut hdr_bytes, "truncated vault header JSON")?;
     let header: VaultHeader = serde_json::from_slice(&hdr_bytes)
         .map_err(|e| CryptoError::InvalidFormat(format!("corrupt header JSON: {e}")))?;
 
@@ -327,7 +353,7 @@ pub fn read_header_and_meta(
 
     let mlen = header.encrypted_meta_len as usize;
     let mut enc_meta = vec![0u8; mlen];
-    reader.read_exact(&mut enc_meta)?;
+    read_exact_header(reader, &mut enc_meta, "truncated encrypted metadata block")?;
     let total_header_bytes = 4 + 1 + 4 + (hlen as u64) + (mlen as u64);
     Ok((header, enc_meta, total_header_bytes))
 }
@@ -341,6 +367,18 @@ pub fn validate_header(header: &VaultHeader) -> Result<(), CryptoError> {
             "unsupported cipher: {}",
             header.cipher
         )));
+    }
+    if (header.flags & !ALL_KNOWN_FLAGS) != 0 {
+        return Err(CryptoError::InvalidFormat(format!(
+            "unsupported header flags: {:#x}",
+            header.flags
+        )));
+    }
+    let has_recovery_flag = (header.flags & FLAG_HAS_RECOVERY) != 0;
+    if has_recovery_flag != header.recovery_slot.is_some() {
+        return Err(CryptoError::InvalidFormat(
+            "header recovery flag inconsistent with recovery_slot".into(),
+        ));
     }
     if header.kdf.algorithm != KDF_NAME {
         return Err(CryptoError::InvalidFormat(format!(
@@ -360,18 +398,21 @@ pub fn validate_header(header: &VaultHeader) -> Result<(), CryptoError> {
             "invalid encrypted_meta_len".into(),
         ));
     }
-    if header.vault_id.len() < 16 {
+    if !(16..=128).contains(&header.vault_id.len())
+        || !header
+            .vault_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(CryptoError::InvalidFormat("invalid vault_id".into()));
     }
     Ok(())
 }
 
 pub fn random_dek() -> SecretKey {
-    let mut raw = [0u8; AES_KEY_SIZE];
-    OsRng.fill_bytes(&mut raw);
-    let key = SecretKey::new(raw);
-    raw.zeroize();
-    key
+    let mut raw = Zeroizing::new([0u8; AES_KEY_SIZE]);
+    OsRng.fill_bytes(raw.as_mut());
+    SecretKey::new(*raw)
 }
 
 pub fn random_vault_id() -> String {

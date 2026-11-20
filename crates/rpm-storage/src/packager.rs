@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
@@ -236,11 +236,27 @@ pub fn pack_sources<W: Write>(
     Ok(())
 }
 
-fn sanitize_archive_path(entry_path: &Path) -> Result<PathBuf, StorageError> {
+fn sanitize_archive_path(entry_path: &Path, max_depth: usize) -> Result<PathBuf, StorageError> {
+    let raw = entry_path.to_string_lossy();
+    if raw.contains('\0') {
+        return Err(StorageError::InvalidPath(
+            "archive entry path contains NUL byte".into(),
+        ));
+    }
+
     let mut clean = PathBuf::new();
+    let mut depth = 0usize;
     for comp in entry_path.components() {
         match comp {
-            Component::Normal(part) => clean.push(part),
+            Component::Normal(part) => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(StorageError::LimitExceeded(format!(
+                        "archive entry exceeds maximum path depth {max_depth}"
+                    )));
+                }
+                clean.push(part);
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(StorageError::InvalidPath(format!(
@@ -256,14 +272,36 @@ fn sanitize_archive_path(entry_path: &Path) -> Result<PathBuf, StorageError> {
     Ok(clean)
 }
 
+/// Hard upper bounds enforced while unpacking decrypted tar streams (tar-bomb defense).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnpackLimits {
+    pub max_total_bytes: u64,
+    pub max_file_count: u64,
+    pub max_path_depth: usize,
+}
+
+impl Default for UnpackLimits {
+    fn default() -> Self {
+        Self {
+            max_total_bytes: 64 * 1024 * 1024 * 1024, // 64 GiB
+            max_file_count: 500_000,
+            max_path_depth: 128,
+        }
+    }
+}
+
 fn unpack_tar_stream<R: Read>(
     reader: R,
     dest_dir: &Path,
+    limits: UnpackLimits,
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
     fs::create_dir_all(dest_dir)?;
     let mut archive = Archive::new(reader);
-    let mut count = 0u64;
+    let mut file_count = 0u64;
+    let mut entries_seen = 0u64;
+    let mut total_bytes = 0u64;
+    let mut buf = [0u8; 64 * 1024];
 
     for entry_res in archive.entries()? {
         check_cancelled(cancel)?;
@@ -275,35 +313,83 @@ fn unpack_tar_stream<R: Read>(
             )));
         }
 
+        entries_seen += 1;
+        if entries_seen > limits.max_file_count {
+            return Err(StorageError::LimitExceeded(format!(
+                "archive exceeds maximum entry count {}",
+                limits.max_file_count
+            )));
+        }
+
         let raw_path = entry.path()?.into_owned();
-        let rel = sanitize_archive_path(&raw_path)?;
+        let rel = sanitize_archive_path(&raw_path, limits.max_path_depth)?;
         let out_path = dest_dir.join(&rel);
 
         if etype == EntryType::Directory {
             fs::create_dir_all(&out_path)?;
         } else {
+            let declared_size = entry.header().size()?;
+            if total_bytes.saturating_add(declared_size) > limits.max_total_bytes {
+                return Err(StorageError::LimitExceeded(format!(
+                    "archive exceeds maximum unpacked size {} bytes",
+                    limits.max_total_bytes
+                )));
+            }
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)?;
             }
             let mut out_file = File::create(&out_path)?;
-            io::copy(&mut entry, &mut out_file)?;
+            loop {
+                check_cancelled(cancel)?;
+                let n = entry.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                total_bytes = total_bytes
+                    .checked_add(n as u64)
+                    .ok_or_else(|| StorageError::LimitExceeded("unpacked size overflow".into()))?;
+                if total_bytes > limits.max_total_bytes {
+                    return Err(StorageError::LimitExceeded(format!(
+                        "archive exceeds maximum unpacked size {} bytes",
+                        limits.max_total_bytes
+                    )));
+                }
+                out_file.write_all(&buf[..n])?;
+            }
             out_file.flush()?;
-            count += 1;
+            file_count += 1;
         }
     }
-    Ok(count)
+    Ok(file_count)
 }
 
-/// Safely unpack a tar (or tar.gz) stream into `dest_dir`, blocking symlinks and Tar-Slip paths.
+/// Safely unpack a tar (or tar.gz) stream into `dest_dir` with explicit safety bounds.
+pub fn unpack_vault_stream_with_limits<R: Read>(
+    reader: R,
+    dest_dir: &Path,
+    compressed: bool,
+    limits: UnpackLimits,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, StorageError> {
+    if compressed {
+        unpack_tar_stream(GzDecoder::new(reader), dest_dir, limits, cancel)
+    } else {
+        unpack_tar_stream(reader, dest_dir, limits, cancel)
+    }
+}
+
+/// Safely unpack a tar (or tar.gz) stream into `dest_dir`, blocking symlinks, Tar-Slip paths, and tar bombs.
 pub fn unpack_vault_stream<R: Read>(
     reader: R,
     dest_dir: &Path,
     compressed: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
-    if compressed {
-        unpack_tar_stream(GzDecoder::new(reader), dest_dir, cancel)
-    } else {
-        unpack_tar_stream(reader, dest_dir, cancel)
-    }
+    unpack_vault_stream_with_limits(
+        reader,
+        dest_dir,
+        compressed,
+        UnpackLimits::default(),
+        cancel,
+    )
 }

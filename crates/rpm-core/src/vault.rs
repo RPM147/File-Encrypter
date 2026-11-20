@@ -1,7 +1,7 @@
 //! Vault Format v5 streaming Chunked AEAD encryption, decryption, inspect, and O(1) re-key.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,7 +10,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::{
     AES_NONCE_SIZE, AES_TAG_SIZE, CHUNKED_CIPHER_NAME, DEFAULT_CHUNK_SIZE, FLAG_COMPRESSED,
@@ -77,6 +77,7 @@ pub struct IntegrityReport {
     pub message: String,
     pub has_keyfile: bool,
     pub has_recovery: bool,
+    pub chunk_count: u32,
 }
 
 fn chunk_nonce(prefix: &[u8; 7], chunk_idx: u32, final_flag: u8) -> [u8; AES_NONCE_SIZE] {
@@ -150,7 +151,13 @@ pub fn encrypt_stream(
 
     let vault_id = random_vault_id();
     let dek = random_dek();
-    let payload_ctx = crate::header::payload_context(VAULT_VERSION, opts.chunk_size, &vault_id);
+    let payload_ctx = crate::header::payload_context(
+        VAULT_VERSION,
+        CHUNKED_CIPHER_NAME,
+        opts.chunk_size,
+        opts.compressed,
+        &vault_id,
+    );
 
     let (hdr_kdf, password_slot) = build_password_slot_and_kdf(
         &dek,
@@ -196,14 +203,13 @@ pub fn encrypt_stream(
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
 
-    let mut plain_buf = vec![0u8; opts.chunk_size as usize];
+    let mut plain_buf = Zeroizing::new(vec![0u8; opts.chunk_size as usize]);
     let mut pending: Option<u8> = None;
     let mut chunk_idx: u32 = 0;
     let mut total_bytes: u64 = 0;
 
     loop {
         if is_cancelled(cancel) {
-            plain_buf.zeroize();
             return Err(CryptoError::Cancelled);
         }
 
@@ -335,15 +341,17 @@ pub fn decrypt_chunks_with_key(
         let nonce_bytes = chunk_nonce(&prefix, chunk_idx, final_flag);
         let aad = chunk_aad(&payload_ctx, chunk_idx, final_flag, plain_len);
 
-        let mut plain = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &ct_buf,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        let mut plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce_bytes),
+                    Payload {
+                        msg: &ct_buf,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| CryptoError::AuthenticationFailed)?,
+        );
 
         if !plain.is_empty() {
             writer.write_all(&plain)?;
@@ -389,65 +397,164 @@ pub fn inspect_header(reader: &mut impl Read, auth: Auth<'_>) -> Result<VaultInf
     })
 }
 
-/// Passwordless structural check + streaming SHA-256 hash of a vault file.
-pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
-    let mut f = File::open(path)?;
-    let file_size = f.metadata()?.len();
-    let header_res = read_header_and_meta(&mut f);
+struct HashingReader<R: Read> {
+    inner: BufReader<R>,
+    hasher: Sha256,
+}
 
-    let (ok, version, message, has_keyfile, has_recovery) = match header_res {
-        Ok((hdr, _, _)) => (
-            true,
-            hdr.version,
-            format!(
-                "Structure valid (v{}, {}, {} KiB chunk)",
-                hdr.version,
-                hdr.cipher,
-                hdr.chunk_size / 1024
-            ),
-            hdr.has_keyfile(),
-            hdr.has_recovery(),
-        ),
-        Err(CryptoError::UnsupportedVersion(v)) => {
-            return Ok(IntegrityReport {
-                ok: false,
-                version: v,
-                file_size,
-                sha256_hex: String::new(),
-                message: format!("Unsupported vault version: {v} (expected v5)"),
-                has_keyfile: false,
-                has_recovery: false,
-            });
+impl<R: Read> HashingReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::with_capacity(64 * 1024, reader),
+            hasher: Sha256::new(),
         }
-        Err(err) => {
-            return Ok(IntegrityReport {
-                ok: false,
-                version: 0,
-                file_size,
-                sha256_hex: String::new(),
-                message: err.to_string(),
-                has_keyfile: false,
-                has_recovery: false,
-            });
-        }
-    };
-
-    let mut hash_file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = hash_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
     }
-    let sha256_hex: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let full_message = format!("{message}\nSHA-256: {sha256_hex}");
+
+    fn drain_and_finalize(mut self) -> io::Result<String> {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = self.inner.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(self
+            .hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+fn skip_exact(reader: &mut impl Read, mut remaining: usize) -> Result<(), CryptoError> {
+    let mut scratch = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = scratch.len().min(remaining);
+        let n = reader.read(&mut scratch[..want])?;
+        if n == 0 {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        remaining -= n;
+    }
+    Ok(())
+}
+
+fn scan_chunk_frames(reader: &mut impl Read, max_chunk_size: u32) -> Result<u32, String> {
+    let mut chunk_count: u32 = 0;
+    loop {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err("Truncated chunk payload (missing final chunk)".into());
+            }
+            Err(e) => return Err(format!("I/O error reading chunk frame: {e}")),
+        }
+
+        let plain_len = u32::from_be_bytes(len_buf);
+        if plain_len > max_chunk_size {
+            return Err(format!(
+                "Chunk length {plain_len} exceeds header chunk_size {max_chunk_size}"
+            ));
+        }
+
+        let mut flag_buf = [0u8; 1];
+        match reader.read_exact(&mut flag_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err("Truncated chunk header flags".into());
+            }
+            Err(e) => return Err(format!("I/O error reading chunk flags: {e}")),
+        }
+        let final_flag = flag_buf[0];
+        if final_flag > 1 {
+            return Err(format!("Invalid chunk final flag: {final_flag}"));
+        }
+        if plain_len == 0 && final_flag == 0 {
+            return Err("Invalid empty non-final chunk frame".into());
+        }
+
+        let payload_len = (plain_len as usize) + AES_TAG_SIZE;
+        if let Err(err) = skip_exact(reader, payload_len) {
+            return Err(match err {
+                CryptoError::AuthenticationFailed => "Truncated chunk ciphertext/tag bytes".into(),
+                other => other.to_string(),
+            });
+        }
+
+        chunk_count = chunk_count
+            .checked_add(1)
+            .ok_or_else(|| "Chunk counter overflow".to_string())?;
+
+        if final_flag == 1 {
+            let mut trailing = [0u8; 1];
+            match reader.read(&mut trailing) {
+                Ok(0) => return Ok(chunk_count),
+                Ok(_) => {
+                    return Err("Trailing unauthenticated bytes after final chunk".into());
+                }
+                Err(e) => return Err(format!("I/O error checking EOF: {e}")),
+            }
+        }
+    }
+}
+
+/// Passwordless single-pass structural check (header + chunk frames) + SHA-256 hash.
+pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
+    let f = File::open(path)?;
+    let file_size = f.metadata()?.len();
+    let mut hr = HashingReader::new(f);
+
+    let (ok, version, summary_msg, has_keyfile, has_recovery, chunk_count) =
+        match read_header_and_meta(&mut hr) {
+            Ok((hdr, _, _)) => match scan_chunk_frames(&mut hr, hdr.chunk_size) {
+                Ok(chunks) => (
+                    true,
+                    hdr.version,
+                    format!(
+                        "Structure valid (v{}, {}, {} KiB chunk, {chunks} chunk(s))",
+                        hdr.version,
+                        hdr.cipher,
+                        hdr.chunk_size / 1024
+                    ),
+                    hdr.has_keyfile(),
+                    hdr.has_recovery(),
+                    chunks,
+                ),
+                Err(msg) => (
+                    false,
+                    hdr.version,
+                    msg,
+                    hdr.has_keyfile(),
+                    hdr.has_recovery(),
+                    0,
+                ),
+            },
+            Err(CryptoError::UnsupportedVersion(v)) => (
+                false,
+                v,
+                format!("Unsupported vault version: {v} (expected v{VAULT_VERSION})"),
+                false,
+                false,
+                0,
+            ),
+            Err(err) => (false, 0, err.to_string(), false, false, 0),
+        };
+
+    let sha256_hex = hr.drain_and_finalize()?;
+    let full_message = format!("{summary_msg}\nSHA-256: {sha256_hex}");
 
     Ok(IntegrityReport {
         ok,
@@ -457,6 +564,7 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
         message: full_message,
         has_keyfile,
         has_recovery,
+        chunk_count,
     })
 }
 

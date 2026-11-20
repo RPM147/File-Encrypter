@@ -5,7 +5,7 @@ use std::io::Read;
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::{
     DEFAULT_ARGON_ITERATIONS, DEFAULT_ARGON_MEMORY_KIB, DEFAULT_ARGON_PARALLELISM, SALT_SIZE,
@@ -62,6 +62,13 @@ impl KdfParams {
                 self.parallelism
             )));
         }
+        if self.memory_kib < 8 * self.parallelism {
+            return Err(CryptoError::InvalidFormat(format!(
+                "Argon2 memory_kib ({}) must be at least 8 * parallelism ({})",
+                self.memory_kib,
+                8 * self.parallelism
+            )));
+        }
         Ok(())
     }
 }
@@ -83,8 +90,10 @@ pub fn hash_keyfile_reader(reader: &mut impl Read) -> Result<SecretKey, CryptoEr
     if total == 0 {
         return Err(CryptoError::InvalidFormat("keyfile cannot be empty".into()));
     }
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok(SecretKey::new(digest))
+    let mut digest: [u8; 32] = hasher.finalize().into();
+    let key = SecretKey::new(digest);
+    digest.zeroize();
+    Ok(key)
 }
 
 /// Derive a 32-byte KEK from `password`, `salt`, and optional `keyfile_hash`.
@@ -110,21 +119,18 @@ pub fn derive_kek(
     .map_err(|e| CryptoError::InvalidFormat(format!("invalid Argon2 params: {e}")))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
 
-    let mut raw = [0u8; 32];
+    let mut raw = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(password, salt, &mut raw)
+        .hash_password_into(password, salt, raw.as_mut())
         .map_err(|_| CryptoError::CryptoFailure)?;
-    let raw_key = SecretKey::new(raw);
-    raw.zeroize();
+    let raw_key = SecretKey::new(*raw);
 
     let hk_salt = keyfile_hash.map(|k| k.as_bytes().as_slice()).unwrap_or(&[]);
     let hk = Hkdf::<Sha256>::new(Some(hk_salt), raw_key.as_bytes());
-    let mut out = [0u8; 32];
-    hk.expand(b"rpm-v5-kek", &mut out)
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(b"rpm-v5-kek", out.as_mut())
         .map_err(|_| CryptoError::CryptoFailure)?;
-    let key = SecretKey::new(out);
-    out.zeroize();
-    Ok(key)
+    Ok(SecretKey::new(*out))
 }
 
 /// Derive a 32-byte recovery KEK from 32-byte BIP-39 entropy.
@@ -133,12 +139,10 @@ pub fn derive_recovery_kek(
     salt: &[u8; SALT_SIZE],
 ) -> Result<SecretKey, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), entropy.as_bytes());
-    let mut out = [0u8; 32];
-    hk.expand(b"rpm-v5-recovery-kek", &mut out)
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(b"rpm-v5-recovery-kek", out.as_mut())
         .map_err(|_| CryptoError::CryptoFailure)?;
-    let key = SecretKey::new(out);
-    out.zeroize();
-    Ok(key)
+    Ok(SecretKey::new(*out))
 }
 
 /// Derive the immutable 7-byte AES-GCM chunk stream nonce prefix for a vault.

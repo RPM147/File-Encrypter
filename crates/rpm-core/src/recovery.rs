@@ -26,7 +26,8 @@ pub fn entropy_to_mnemonic(entropy: &SecretKey) -> Result<Zeroizing<String>, Cry
 
 /// Parse and checksum-verify a 24-word BIP-39 phrase back into 32-byte entropy.
 pub fn mnemonic_to_entropy(phrase: &str) -> Result<SecretKey, CryptoError> {
-    let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase.trim())
+    let normalized = Zeroizing::new(phrase.trim().to_ascii_lowercase());
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, &normalized)
         .map_err(|e| CryptoError::InvalidFormat(format!("invalid recovery phrase: {e}")))?;
     let mut raw = mnemonic.to_entropy();
     if raw.len() != 32 {

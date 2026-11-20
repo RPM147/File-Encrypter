@@ -8,9 +8,9 @@ RPM Encrypter protects the **confidentiality and integrity of files at rest** ag
 
 - **Chunked Authenticated Encryption (v5):** File streams and encrypted metadata are sealed using **AES-256-GCM** in `1 MiB` authenticated chunks bound to the vault context, chunk sequence number, final-chunk marker, and plaintext length.
 - **No Unverified Plaintext Release:** Each chunk is authenticated in RAM **before** any decrypted byte enters the unpacking pipeline or touches disk. Truncation, chunk reordering, trailing bytes, or single-bit flips fail immediately.
-- **Zero Plaintext Temp Archives:** Packing and unpacking stream over a bounded in-memory pipe directly into/from AEAD chunk processing without creating temporary plaintext archive files on disk.
+- **Zero Plaintext Temp Archives & Atomic Stage-and-Swap:** Packing and unpacking stream over a bounded in-memory pipe directly into/from AEAD chunk processing without creating temporary plaintext archive files on disk. Decryption extracts into a hidden sibling staging folder (`.rpm_unpack_*.part`) enforced by tar-slip, symlink/hardlink, path-depth (`128`), file-count (`500,000`), and unpacked-size (`64 GiB`) limits, promoting verified files atomically only after the final chunk authenticates.
 - **Key Derivation & Keyfile Binding:** Passwords are stretched with **Argon2id** (`64 MiB`, `3` iterations, `4` lanes by default) and optionally bound via HKDF-SHA256 to a second-factor keyfile.
-- **Deterministic Memory Scrubbing:** Secret keys, keyfile hashes, passwords, recovery phrases, and plaintext chunk buffers are scrubbed on drop via `zeroize` and pinned best-effort against swapping (`VirtualLock` on Windows, `mlock` on Unix).
+- **Deterministic Memory Scrubbing:** Secret keys live at stable 32-byte-aligned heap addresses protected best-effort via refcounted OS page locking (`VirtualLock` on Windows, `mlock` on Unix). Keyfile hashes, passwords, recovery phrases, and plaintext chunk buffers are wrapped in `zeroize` / `Zeroizing` guards and scrubbed deterministically even on early error paths.
 
 ## What it does NOT protect against
 

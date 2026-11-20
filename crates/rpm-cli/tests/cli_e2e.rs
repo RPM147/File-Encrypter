@@ -73,6 +73,7 @@ fn cli_full_round_trip_encrypt_inspect_rekey_decrypt_and_password() {
     assert_eq!(integ["ok"], true);
     assert_eq!(integ["version"], 5);
     assert_eq!(integ["has_keyfile"], true);
+    assert!(integ["chunk_count"].as_u64().unwrap() >= 1);
 
     // 3. Re-key password via 2-line stdin
     out.clear();
@@ -132,7 +133,7 @@ fn cli_full_round_trip_encrypt_inspect_rekey_decrypt_and_password() {
     );
     assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
     assert_eq!(
-        fs::read(dec_out.join("report.txt/report.txt")).unwrap(),
+        fs::read(dec_out.join("report.txt")).unwrap(),
         b"pure rust cli payload!"
     );
 
@@ -148,4 +149,130 @@ fn cli_full_round_trip_encrypt_inspect_rekey_decrypt_and_password() {
     assert_eq!(code, 0);
     let pw_out = String::from_utf8(out).unwrap();
     assert_eq!(pw_out.lines().next().unwrap().len(), 20);
+}
+
+#[test]
+fn cli_recovery_rekey_keyfile_and_corrupt_integrity_exit_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("notes.md");
+    fs::write(&src, b"recovery + rekey keyfile e2e").unwrap();
+
+    let vaults_dir = dir.path().join("v");
+    fs::create_dir_all(&vaults_dir).unwrap();
+    let rec_file = dir.path().join("rec.txt");
+    let kf2 = dir.path().join("second.key");
+    fs::write(&kf2, b"second-keyfile-entropy").unwrap();
+
+    // 1. Encrypt without keyfile
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "encrypt",
+                src.to_str().unwrap(),
+                "-o",
+                vaults_dir.to_str().unwrap(),
+                "--recovery-out",
+                rec_file.to_str().unwrap(),
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"Alpha!1\n".to_vec()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    let vault = vaults_dir.join("notes.md.vault");
+    let phrase = fs::read_to_string(&rec_file).unwrap();
+
+    // 2. Re-key adding a new keyfile
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "rekey",
+                vault.to_str().unwrap(),
+                "--new-keyfile",
+                kf2.to_str().unwrap(),
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"Alpha!1\nBeta!2\n".to_vec()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+
+    // 3. Decrypt via --recovery-stdin directly (bypasses password & keyfile)
+    let out_rec = dir.path().join("rec_dec");
+    fs::create_dir_all(&out_rec).unwrap();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "decrypt",
+                vault.to_str().unwrap(),
+                "-o",
+                out_rec.to_str().unwrap(),
+                "--recovery-stdin",
+            ],
+            &mut Cursor::new(phrase.as_bytes().to_vec()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    assert_eq!(
+        fs::read(out_rec.join("notes.md")).unwrap(),
+        b"recovery + rekey keyfile e2e"
+    );
+
+    // 4. Inspect via --recovery-stdin JSON
+    let mut inspect_out = Vec::new();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "inspect",
+                vault.to_str().unwrap(),
+                "--json",
+                "--recovery-stdin",
+            ],
+            &mut Cursor::new(phrase.as_bytes().to_vec()),
+            &mut inspect_out,
+            &mut Vec::new(),
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    let info: serde_json::Value = serde_json::from_slice(&inspect_out).unwrap();
+    assert_eq!(info["has_keyfile"], true);
+    assert_eq!(info["metadata"]["filename"], "notes.md");
+
+    // 5. Corrupt integrity_only returns exit code 1
+    let mut corrupted = fs::read(&vault).unwrap();
+    corrupted.push(0x00);
+    fs::write(&vault, corrupted).unwrap();
+    let mut bad_json = Vec::new();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "inspect",
+                vault.to_str().unwrap(),
+                "--integrity-only",
+                "--json",
+            ],
+            &mut Cursor::new(Vec::new()),
+            &mut bad_json,
+            &mut Vec::new(),
+            None,
+        ),
+        1
+    );
+    let bad_val: serde_json::Value = serde_json::from_slice(&bad_json).unwrap();
+    assert_eq!(bad_val["ok"], false);
 }

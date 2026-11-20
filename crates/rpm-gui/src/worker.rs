@@ -199,11 +199,6 @@ pub fn spawn_decrypt(
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from("."))
             });
-            let stem = vault
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "restored".into());
-            let dest = unique_path(&root_out.join(stem));
 
             let auth = if let Some(ref rk) = recovery_key {
                 Auth::RecoveryKey(rk)
@@ -225,7 +220,7 @@ pub fn spawn_decrypt(
                 send(&tx_p, &ctx_p, WorkerUpdate::Progress(frac));
             });
 
-            match decrypt_vault_v5(vault, &dest, auth, progress, Arc::clone(&cancel)) {
+            match decrypt_vault_v5(vault, &root_out, auth, progress, Arc::clone(&cancel)) {
                 Ok(summary) => {
                     ok_count += 1;
                     send(
@@ -235,7 +230,7 @@ pub fn spawn_decrypt(
                             "Decrypted {} ({} file(s)) -> {}",
                             vault.display(),
                             summary.files_extracted,
-                            dest.display()
+                            summary.output_path.display()
                         )),
                     );
                 }
@@ -260,9 +255,10 @@ pub fn spawn_integrity_check(ctx: egui::Context, tx: mpsc::Sender<WorkerUpdate>,
     thread::spawn(move || match check_integrity(&vault) {
         Ok(rep) => {
             let text = format!(
-                "INTEGRITY CHECK\nFile Size: {} bytes\nVersion: v{}\nKeyfile Slot: {}\nRecovery Slot: {}\n\n{}",
+                "INTEGRITY CHECK\nFile Size: {} bytes\nVersion: v{}\nChunks: {}\nKeyfile Slot: {}\nRecovery Slot: {}\n\n{}",
                 rep.file_size,
                 rep.version,
+                rep.chunk_count,
                 if rep.has_keyfile { "Yes" } else { "No" },
                 if rep.has_recovery { "Yes" } else { "No" },
                 rep.message

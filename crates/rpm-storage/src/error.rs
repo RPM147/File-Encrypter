@@ -14,6 +14,9 @@ pub enum StorageError {
     #[error("invalid path or archive entry: {0}")]
     InvalidPath(String),
 
+    #[error("safety limit exceeded: {0}")]
+    LimitExceeded(String),
+
     #[error("operation cancelled by user")]
     Cancelled,
 
