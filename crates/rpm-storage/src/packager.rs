@@ -290,10 +290,45 @@ impl Default for UnpackLimits {
     }
 }
 
+/// Normalize an archive member selector path to canonical forward-slash form (`a/b/c`).
+pub fn normalize_archive_selector(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    s.trim_matches('/').to_string()
+}
+
+fn build_selector_set(selected_paths: &[String]) -> Result<HashSet<String>, StorageError> {
+    let set: HashSet<String> = selected_paths
+        .iter()
+        .map(|s| normalize_archive_selector(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if set.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "no valid archive paths selected for extraction".into(),
+        ));
+    }
+    Ok(set)
+}
+
+fn matches_selector(rel_unix: &str, selected: &HashSet<String>) -> bool {
+    if selected.contains(rel_unix) {
+        return true;
+    }
+    selected.iter().any(|sel| {
+        rel_unix
+            .strip_prefix(sel.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 fn unpack_tar_stream<R: Read>(
     reader: R,
     dest_dir: &Path,
     limits: UnpackLimits,
+    filter: Option<&HashSet<String>>,
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
     fs::create_dir_all(dest_dir)?;
@@ -323,6 +358,12 @@ fn unpack_tar_stream<R: Read>(
 
         let raw_path = entry.path()?.into_owned();
         let rel = sanitize_archive_path(&raw_path, limits.max_path_depth)?;
+        if let Some(selected) = filter {
+            let rel_unix = rel.to_string_lossy().replace('\\', "/");
+            if !matches_selector(&rel_unix, selected) {
+                continue;
+            }
+        }
         let out_path = dest_dir.join(&rel);
 
         if etype == EntryType::Directory {
@@ -363,6 +404,30 @@ fn unpack_tar_stream<R: Read>(
     Ok(file_count)
 }
 
+/// Safely unpack only the entries matching `selected_paths` (exact file or folder prefix)
+/// while still validating every entry header for Tar-Slip, symlinks, and bomb limits.
+pub fn unpack_vault_stream_selected<R: Read>(
+    reader: R,
+    dest_dir: &Path,
+    compressed: bool,
+    selected_paths: &[String],
+    limits: UnpackLimits,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, StorageError> {
+    let filter = build_selector_set(selected_paths)?;
+    if compressed {
+        unpack_tar_stream(
+            GzDecoder::new(reader),
+            dest_dir,
+            limits,
+            Some(&filter),
+            cancel,
+        )
+    } else {
+        unpack_tar_stream(reader, dest_dir, limits, Some(&filter), cancel)
+    }
+}
+
 /// Safely unpack a tar (or tar.gz) stream into `dest_dir` with explicit safety bounds.
 pub fn unpack_vault_stream_with_limits<R: Read>(
     reader: R,
@@ -372,9 +437,9 @@ pub fn unpack_vault_stream_with_limits<R: Read>(
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
     if compressed {
-        unpack_tar_stream(GzDecoder::new(reader), dest_dir, limits, cancel)
+        unpack_tar_stream(GzDecoder::new(reader), dest_dir, limits, None, cancel)
     } else {
-        unpack_tar_stream(reader, dest_dir, limits, cancel)
+        unpack_tar_stream(reader, dest_dir, limits, None, cancel)
     }
 }
 

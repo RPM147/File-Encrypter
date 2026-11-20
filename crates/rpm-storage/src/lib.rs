@@ -17,5 +17,6 @@ pub use launch::{parse_gui_launch_args, GuiLaunchIntent, LaunchTab};
 pub use packager::UnpackLimits;
 pub use wiper::SecureWiper;
 pub use workflow::{
-    decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path, DecryptSummary,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
+    DecryptSummary,
 };

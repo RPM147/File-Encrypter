@@ -13,7 +13,8 @@ use rpm_core::{
     EncryptOptions, KdfParams, SecretKey,
 };
 use rpm_storage::{
-    decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path, SecureWiper, StorageError,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
+    SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -355,14 +356,103 @@ pub fn spawn_inspect(
                         lines.push(format!("  ... and {} more", m.files.len() - 150));
                     }
                 }
+                let manifest = info.metadata.files.clone();
                 send(
                     &tx,
                     &ctx,
                     WorkerUpdate::InspectDone {
                         text: lines.join("\n"),
                         status: "Vault metadata unlocked".into(),
+                        manifest,
+                        vault_path: vault.clone(),
                     },
                 );
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_selective_extract(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    vault: PathBuf,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    selected_paths: Vec<String>,
+    output_dir: Option<PathBuf>,
+) {
+    thread::spawn(move || {
+        let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
+            Ok(k) => k,
+            Err(e) => {
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
+                );
+                return;
+            }
+        };
+        let recovery_key = if use_recovery {
+            match mnemonic_to_entropy(&secret) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let root_out = output_dir.unwrap_or_else(|| {
+            vault
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+
+        let auth = if let Some(ref rk) = recovery_key {
+            Auth::RecoveryKey(rk)
+        } else {
+            Auth::Password {
+                password: secret.as_bytes(),
+                keyfile_hash: keyfile_hash.as_ref(),
+            }
+        };
+
+        let tx_p = tx.clone();
+        let ctx_p = ctx.clone();
+        let progress = Arc::new(move |done: u64, total: u64| {
+            let frac = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            send(&tx_p, &ctx_p, WorkerUpdate::Progress(frac));
+        });
+
+        match decrypt_vault_selected_v5(
+            &vault,
+            &root_out,
+            auth,
+            &selected_paths,
+            progress,
+            Arc::clone(&cancel),
+        ) {
+            Ok(summary) => {
+                let msg = format!(
+                    "Extracted {} selected file(s) -> {}",
+                    summary.files_extracted,
+                    summary.output_path.display()
+                );
+                send(&tx, &ctx, WorkerUpdate::Log(msg.clone()));
+                send(&tx, &ctx, WorkerUpdate::DecryptDone { status: msg });
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }

@@ -1,12 +1,13 @@
 //! GUI state, launch routing, drag-and-drop triage, and zeroizing field management.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rand::rngs::OsRng;
 use rand::Rng;
-use rpm_core::SecretKey;
+use rpm_core::{FileManifestEntry, SecretKey};
 use rpm_storage::config::{
     default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode,
 };
@@ -56,11 +57,25 @@ impl Tab {
 pub enum WorkerUpdate {
     Progress(f32),
     Log(String),
-    EncryptDone { status: String },
-    DecryptDone { status: String },
-    InspectDone { text: String, status: String },
-    IntegrityDone { text: String, ok: bool },
-    RekeyDone { status: String },
+    EncryptDone {
+        status: String,
+    },
+    DecryptDone {
+        status: String,
+    },
+    InspectDone {
+        text: String,
+        status: String,
+        manifest: Vec<FileManifestEntry>,
+        vault_path: PathBuf,
+    },
+    IntegrityDone {
+        text: String,
+        ok: bool,
+    },
+    RekeyDone {
+        status: String,
+    },
     Error(String),
 }
 
@@ -121,6 +136,57 @@ pub struct InspectFields {
     pub show_password: bool,
     pub recovery_phrase: String,
     pub results: String,
+    pub manifest: Vec<FileManifestEntry>,
+    pub manifest_vault: Option<PathBuf>,
+    pub selected_paths: HashSet<String>,
+    pub filter_query: String,
+    pub extract_output_dir: String,
+}
+
+impl InspectFields {
+    pub fn set_manifest(&mut self, vault: PathBuf, entries: Vec<FileManifestEntry>) {
+        if self.extract_output_dir.trim().is_empty() {
+            if let Some(parent) = vault.parent().filter(|p| !p.as_os_str().is_empty()) {
+                self.extract_output_dir = parent.display().to_string();
+            }
+        }
+        self.manifest = entries;
+        self.manifest_vault = Some(vault);
+        self.selected_paths.clear();
+        self.filter_query.clear();
+    }
+
+    pub fn reset_manifest(&mut self) {
+        self.manifest.clear();
+        self.manifest_vault = None;
+        self.selected_paths.clear();
+        self.filter_query.clear();
+    }
+
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let q = self.filter_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return (0..self.manifest.len()).collect();
+        }
+        self.manifest
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.path.to_ascii_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn select_all_filtered(&mut self) {
+        for idx in self.filtered_indices() {
+            if let Some(entry) = self.manifest.get(idx) {
+                self.selected_paths.insert(entry.path.clone());
+            }
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected_paths.clear();
+    }
 }
 
 impl Drop for InspectFields {
@@ -231,6 +297,11 @@ impl Default for AppState {
                 show_password: false,
                 recovery_phrase: String::new(),
                 results: s.ins_default_results.into(),
+                manifest: Vec::new(),
+                manifest_vault: None,
+                selected_paths: HashSet::new(),
+                filter_query: String::new(),
+                extract_output_dir: String::new(),
             },
             rekey: RekeyFields {
                 vault_path: String::new(),
@@ -387,6 +458,7 @@ impl AppState {
                 if let Some(first) = paths.into_iter().next() {
                     self.active_tab = Tab::Inspect;
                     self.inspect.vault_path = first.display().to_string();
+                    self.inspect.reset_manifest();
                 }
             }
             Tab::Rekey => {

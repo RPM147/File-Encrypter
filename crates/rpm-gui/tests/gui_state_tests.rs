@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use eframe::egui;
-use rpm_core::SecretKey;
+use rpm_core::{FileManifestEntry, SecretKey};
 use rpm_gui::state::{strength_label_and_color_for, AppState, RecoveryPrompt, Tab};
 use rpm_gui::{fonts, i18n, load_app_icon};
 use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
@@ -121,4 +121,45 @@ fn config_backward_compat_and_strength_meter() {
     assert_eq!(strong_frac, strong_frac_en);
     assert_ne!(weak_tr, strong_tr);
     assert_ne!(strong_tr, strong_en);
+}
+
+#[test]
+fn inspect_manifest_selection_filtering_and_vault_change_reset() {
+    let mut st = AppState::default();
+    let entries = vec![
+        FileManifestEntry {
+            path: "docs/rapor.pdf".into(),
+            size: 1024,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "docs/notlar.txt".into(),
+            size: 256,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "images/foto.png".into(),
+            size: 2048,
+            modified_unix: 0,
+        },
+    ];
+    st.inspect
+        .set_manifest(PathBuf::from("C:\\tmp\\arsiv.vault"), entries);
+    assert_eq!(st.inspect.manifest.len(), 3);
+    assert_eq!(st.inspect.extract_output_dir, "C:\\tmp");
+
+    st.inspect.filter_query = "docs".into();
+    assert_eq!(st.inspect.filtered_indices(), vec![0, 1]);
+    st.inspect.select_all_filtered();
+    assert_eq!(st.inspect.selected_paths.len(), 2);
+    assert!(st.inspect.selected_paths.contains("docs/rapor.pdf"));
+    assert!(st.inspect.selected_paths.contains("docs/notlar.txt"));
+
+    st.inspect.clear_selection();
+    assert!(st.inspect.selected_paths.is_empty());
+
+    // Dropping another vault on Inspect clears previous manifest cleanly
+    st.add_dropped_paths(vec![PathBuf::from("other.vault")], Some(Tab::Inspect));
+    assert!(st.inspect.manifest.is_empty());
+    assert!(st.inspect.manifest_vault.is_none());
 }

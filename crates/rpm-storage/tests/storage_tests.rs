@@ -13,8 +13,9 @@ use rpm_storage::shell_integration::{
     DIR_MENU_KEY, FILE_MENU_KEY, PROG_ID_KEY, VAULT_EXT_KEY,
 };
 use rpm_storage::{
-    decrypt_vault_v5, encrypt_sources_v5, parse_gui_launch_args, rekey_vault_v5, unique_path,
-    GuiLaunchIntent, LaunchTab, SecureWiper, StorageError, UnpackLimits,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, parse_gui_launch_args,
+    rekey_vault_v5, unique_path, GuiLaunchIntent, LaunchTab, SecureWiper, StorageError,
+    UnpackLimits,
 };
 use tar::{Builder, EntryType, Header};
 
@@ -652,4 +653,153 @@ fn streaming_16mib_multichunk_and_cancellation_and_config_wiper() {
     fs::write(&zero_file, b"").unwrap();
     SecureWiper::default().wipe_file(&zero_file).unwrap();
     assert!(!zero_file.exists());
+}
+
+#[test]
+fn selective_extraction_files_folder_prefix_and_missing_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    fs::create_dir_all(root.join("alpha")).unwrap();
+    fs::create_dir_all(root.join("beta/sub")).unwrap();
+    fs::write(root.join("alpha/skip_large.bin"), vec![0x11u8; 90_000]).unwrap();
+    fs::write(root.join("alpha/keep.txt"), b"keep-alpha").unwrap();
+    fs::write(root.join("beta/sub/doc.txt"), b"nested-doc").unwrap();
+    fs::write(root.join("beta/other.bin"), vec![0x22u8; 40_000]).unwrap();
+
+    let vault = dir.path().join("workspace.vault");
+    let opts = EncryptOptions {
+        kdf: KdfParams::fast_test(),
+        chunk_size: 16 * 1024,
+        recovery_key: None,
+        keyfile_hash: None,
+        compressed: true,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    encrypt_sources_v5(
+        std::slice::from_ref(&root),
+        &vault,
+        b"SelPw!1",
+        &opts,
+        Arc::new(|_, _| {}),
+        Arc::clone(&cancel),
+        |_| {},
+    )
+    .unwrap();
+
+    // 1. Exact file + folder prefix selection (using mixed slashes and leading ./)
+    let out1 = dir.path().join("out1");
+    let sum1 = decrypt_vault_selected_v5(
+        &vault,
+        &out1,
+        Auth::Password {
+            password: b"SelPw!1",
+            keyfile_hash: None,
+        },
+        &[
+            "./workspace\\alpha\\keep.txt".into(),
+            "workspace/beta/sub".into(),
+        ],
+        Arc::new(|_, _| {}),
+        Arc::clone(&cancel),
+    )
+    .unwrap();
+    assert_eq!(sum1.files_extracted, 2);
+    assert_eq!(sum1.output_path, out1.join("workspace"));
+    assert_eq!(
+        fs::read(out1.join("workspace/alpha/keep.txt")).unwrap(),
+        b"keep-alpha"
+    );
+    assert_eq!(
+        fs::read(out1.join("workspace/beta/sub/doc.txt")).unwrap(),
+        b"nested-doc"
+    );
+    assert!(!out1.join("workspace/alpha/skip_large.bin").exists());
+    assert!(!out1.join("workspace/beta/other.bin").exists());
+
+    // 2. Non-existent selector cleanly fails without leaving staging or empty root
+    let out_missing = dir.path().join("out_missing");
+    let err_missing = decrypt_vault_selected_v5(
+        &vault,
+        &out_missing,
+        Auth::Password {
+            password: b"SelPw!1",
+            keyfile_hash: None,
+        },
+        &["workspace/does_not_exist.txt".into()],
+        Arc::new(|_, _| {}),
+        Arc::clone(&cancel),
+    );
+    assert!(matches!(err_missing, Err(StorageError::InvalidPath(_))));
+    assert!(!out_missing.exists());
+
+    // 3. Empty selector list rejected immediately
+    let err_empty = decrypt_vault_selected_v5(
+        &vault,
+        &dir.path().join("out_empty"),
+        Auth::Password {
+            password: b"SelPw!1",
+            keyfile_hash: None,
+        },
+        &["   ".into()],
+        Arc::new(|_, _| {}),
+        cancel,
+    );
+    assert!(matches!(err_empty, Err(StorageError::InvalidPath(_))));
+}
+
+#[test]
+fn selective_extraction_authenticates_final_chunk_and_rolls_back_on_tamper() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("pack");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("01_first.txt"), b"early-small-file").unwrap();
+    fs::write(folder.join("02_tail.bin"), vec![0x99u8; 80 * 1024]).unwrap();
+
+    let vault = dir.path().join("pack.vault");
+    let opts = EncryptOptions {
+        kdf: KdfParams::fast_test(),
+        chunk_size: 16 * 1024,
+        recovery_key: None,
+        keyfile_hash: None,
+        compressed: false,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    encrypt_sources_v5(
+        std::slice::from_ref(&folder),
+        &vault,
+        b"AuthTail!1",
+        &opts,
+        Arc::new(|_, _| {}),
+        Arc::clone(&cancel),
+        |_| {},
+    )
+    .unwrap();
+
+    // Corrupt final chunk even though selected file lives in chunk 0
+    let mut raw = fs::read(&vault).unwrap();
+    let len = raw.len();
+    raw[len - 4] ^= 0xFF;
+    fs::write(&vault, raw).unwrap();
+
+    let existing_dest = dir.path().join("existing_dest");
+    fs::create_dir_all(&existing_dest).unwrap();
+    let res = decrypt_vault_selected_v5(
+        &vault,
+        &existing_dest,
+        Auth::Password {
+            password: b"AuthTail!1",
+            keyfile_hash: None,
+        },
+        &["pack/01_first.txt".into()],
+        Arc::new(|_, _| {}),
+        cancel,
+    );
+    assert!(matches!(
+        res,
+        Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+    ));
+    assert!(
+        fs::read_dir(&existing_dest).unwrap().next().is_none(),
+        "01_first.txt must never be promoted if later vault chunks fail AEAD auth"
+    );
 }

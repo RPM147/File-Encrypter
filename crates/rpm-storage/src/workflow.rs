@@ -17,7 +17,10 @@ use rpm_core::{
 
 use crate::atomic::atomic_write;
 use crate::error::StorageError;
-use crate::packager::{collect_manifest, pack_sources, unpack_vault_stream};
+use crate::packager::{
+    collect_manifest, normalize_archive_selector, pack_sources, unpack_vault_stream,
+    unpack_vault_stream_selected, UnpackLimits,
+};
 use crate::pipe::bounded_pipe;
 
 #[derive(Clone, Debug)]
@@ -135,6 +138,54 @@ pub fn decrypt_vault_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DecryptSummary, StorageError> {
+    decrypt_vault_v5_inner(vault_path, output_root, auth, None, progress, cancel)
+}
+
+/// Stream-decrypt an entire Vault v5 archive (authenticating every AEAD chunk through EOF)
+/// while writing only entries matching `selected_paths` into `output_root`.
+pub fn decrypt_vault_selected_v5(
+    vault_path: &Path,
+    output_root: &Path,
+    auth: Auth<'_>,
+    selected_paths: &[String],
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<DecryptSummary, StorageError> {
+    decrypt_vault_v5_inner(
+        vault_path,
+        output_root,
+        auth,
+        Some(selected_paths),
+        progress,
+        cancel,
+    )
+}
+
+fn decrypt_vault_v5_inner(
+    vault_path: &Path,
+    output_root: &Path,
+    auth: Auth<'_>,
+    selected_paths: Option<&[String]>,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<DecryptSummary, StorageError> {
+    let selected_owned = match selected_paths {
+        Some(paths) => {
+            let cleaned: Vec<String> = paths
+                .iter()
+                .map(|p| normalize_archive_selector(p))
+                .filter(|p| !p.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return Err(StorageError::InvalidPath(
+                    "no files selected for extraction".into(),
+                ));
+            }
+            Some(cleaned)
+        }
+        None => None,
+    };
+
     let mut reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
     let (header, enc_meta, _hdr_len) = read_header_and_meta(&mut reader)?;
     let dek = rpm_core::header::unlock_dek(&header, auth)?;
@@ -152,8 +203,20 @@ pub fn decrypt_vault_v5(
     let (mut pipe_tx, pipe_rx) = bounded_pipe(8);
     let staging_owned = staging_dir.clone();
     let cancel_unpack = Arc::clone(&cancel);
+    let is_selective = selected_owned.is_some();
     let unpack_handle = thread::spawn(move || -> Result<u64, StorageError> {
-        unpack_vault_stream(pipe_rx, &staging_owned, compressed, Some(&cancel_unpack))
+        if let Some(paths) = selected_owned {
+            unpack_vault_stream_selected(
+                pipe_rx,
+                &staging_owned,
+                compressed,
+                &paths,
+                UnpackLimits::default(),
+                Some(&cancel_unpack),
+            )
+        } else {
+            unpack_vault_stream(pipe_rx, &staging_owned, compressed, Some(&cancel_unpack))
+        }
     });
 
     let dec_res = decrypt_chunks_with_key(
@@ -200,6 +263,11 @@ pub fn decrypt_vault_v5(
         let mut top_entries = Vec::new();
         for entry in fs::read_dir(&staging_dir)? {
             top_entries.push(entry?.path());
+        }
+        if is_selective && verified_count == 0 && top_entries.is_empty() {
+            return Err(StorageError::InvalidPath(
+                "no matching files found in vault".into(),
+            ));
         }
         if top_entries.len() == 1 {
             let single = &top_entries[0];

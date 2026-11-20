@@ -276,3 +276,84 @@ fn cli_recovery_rekey_keyfile_and_corrupt_integrity_exit_codes() {
     let bad_val: serde_json::Value = serde_json::from_slice(&bad_json).unwrap();
     assert_eq!(bad_val["ok"], false);
 }
+
+#[test]
+fn cli_selective_decrypt_with_only_flag_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("bundle");
+    fs::create_dir_all(folder.join("sub")).unwrap();
+    fs::write(folder.join("keep.txt"), b"kept").unwrap();
+    fs::write(folder.join("skip.txt"), b"skipped").unwrap();
+    fs::write(folder.join("sub/deep.txt"), b"deep-kept").unwrap();
+
+    let vaults = dir.path().join("vaults");
+    fs::create_dir_all(&vaults).unwrap();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "encrypt",
+                folder.to_str().unwrap(),
+                "-o",
+                vaults.to_str().unwrap(),
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"CliSel!1\n".to_vec()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    let vault = vaults.join("bundle.vault");
+
+    let out_dir = dir.path().join("sel_out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "decrypt",
+            vault.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--only",
+            "bundle/keep.txt",
+            "--only",
+            "bundle/sub",
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"CliSel!1\n".to_vec()),
+        &mut stdout,
+        &mut stderr,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(fs::read(out_dir.join("bundle/keep.txt")).unwrap(), b"kept");
+    assert_eq!(
+        fs::read(out_dir.join("bundle/sub/deep.txt")).unwrap(),
+        b"deep-kept"
+    );
+    assert!(!out_dir.join("bundle/skip.txt").exists());
+
+    // Passing --only with multiple vaults returns exit code 1 cleanly
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "decrypt",
+                vault.to_str().unwrap(),
+                vault.to_str().unwrap(),
+                "--only",
+                "bundle/keep.txt",
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"CliSel!1\n".to_vec()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            None,
+        ),
+        1
+    );
+}

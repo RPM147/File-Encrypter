@@ -16,7 +16,8 @@ use rpm_core::{
 };
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path, SecureWiper, StorageError,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
+    SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -58,6 +59,9 @@ pub enum Commands {
         output_dir: Option<PathBuf>,
         #[arg(long)]
         keyfile: Option<PathBuf>,
+        /// Extract only matching archive paths or folder prefixes (repeatable).
+        #[arg(long = "only", value_name = "PATH")]
+        only: Vec<String>,
         #[arg(long, conflicts_with_all = ["recovery", "recovery_stdin"])]
         password_stdin: bool,
         #[arg(long, conflicts_with_all = ["password_stdin", "recovery_stdin"])]
@@ -366,10 +370,18 @@ where
             vaults,
             output_dir,
             keyfile,
+            only,
             password_stdin,
             recovery,
             recovery_stdin,
         } => {
+            if !only.is_empty() && vaults.len() > 1 {
+                let _ = writeln!(
+                    stderr,
+                    "Error: --only can only be used with a single .vault file"
+                );
+                return 1;
+            }
             for v in &vaults {
                 if !v.is_file() {
                     let _ = writeln!(stderr, "Error: vault not found: {}", v.display());
@@ -442,22 +454,35 @@ where
                         .filter(|p| !p.as_os_str().is_empty())
                         .unwrap_or_else(|| Path::new("."))
                 });
-                match decrypt_vault_v5(
-                    v,
-                    target_root,
-                    match auth {
-                        Auth::RecoveryKey(r) => Auth::RecoveryKey(r),
-                        Auth::Password {
-                            password,
-                            keyfile_hash,
-                        } => Auth::Password {
-                            password,
-                            keyfile_hash,
-                        },
+                let auth_for_vault = match auth {
+                    Auth::RecoveryKey(r) => Auth::RecoveryKey(r),
+                    Auth::Password {
+                        password,
+                        keyfile_hash,
+                    } => Auth::Password {
+                        password,
+                        keyfile_hash,
                     },
-                    Arc::new(|_, _| {}),
-                    Arc::clone(&cancel),
-                ) {
+                };
+                let dec_res = if only.is_empty() {
+                    decrypt_vault_v5(
+                        v,
+                        target_root,
+                        auth_for_vault,
+                        Arc::new(|_, _| {}),
+                        Arc::clone(&cancel),
+                    )
+                } else {
+                    decrypt_vault_selected_v5(
+                        v,
+                        target_root,
+                        auth_for_vault,
+                        &only,
+                        Arc::new(|_, _| {}),
+                        Arc::clone(&cancel),
+                    )
+                };
+                match dec_res {
                     Ok(summary) => {
                         let _ = writeln!(
                             stdout,

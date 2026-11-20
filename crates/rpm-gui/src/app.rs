@@ -50,14 +50,21 @@ impl RpmApp {
                     self.state.progress = 1.0;
                     self.state.set_status(status, false);
                 }
-                WorkerUpdate::InspectDone { text, status } => {
+                WorkerUpdate::InspectDone {
+                    text,
+                    status,
+                    manifest,
+                    vault_path,
+                } => {
                     self.state.busy = false;
                     self.state.inspect.results = text;
+                    self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::IntegrityDone { text, ok } => {
                     self.state.busy = false;
                     self.state.inspect.results = text;
+                    self.state.inspect.reset_manifest();
                     let s = self.state.strings();
                     let label = match self.state.config.language {
                         AppLanguage::Tr => {
@@ -264,7 +271,7 @@ impl eframe::App for RpmApp {
                         tabs::decrypt::ui(ui, ctx, &mut self.state, &self.tx, &self.cancel);
                     }
                     Tab::Inspect => {
-                        tabs::inspect::ui(ui, ctx, &mut self.state, &self.tx);
+                        tabs::inspect::ui(ui, ctx, &mut self.state, &self.tx, &self.cancel);
                     }
                     Tab::Rekey => {
                         tabs::rekey::ui(ui, ctx, &mut self.state, &self.tx, &self.cancel);
