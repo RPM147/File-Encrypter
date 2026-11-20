@@ -1,0 +1,22 @@
+[package]
+name = "rpm-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust native desktop UI for RPM Encrypter (Vault Format v5)."
+
+[[bin]]
+name = "rpm-encrypter"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+rand.workspace = true
+rfd.workspace = true
+rpm-core = { path = "../rpm-core" }
+rpm-storage = { path = "../rpm-storage" }
+zeroize.workspace = true
+zxcvbn.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"

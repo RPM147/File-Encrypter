@@ -1,0 +1,23 @@
+[package]
+name = "rpm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Pure-Rust CLI for RPM Encrypter (Vault Format v5)."
+
+[[bin]]
+name = "rpm-encrypter-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rand.workspace = true
+rpm-core = { path = "../rpm-core" }
+rpm-storage = { path = "../rpm-storage" }
+rpassword.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+zxcvbn.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"

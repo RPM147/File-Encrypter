@@ -1,0 +1,25 @@
+[package]
+name = "rpm-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust streaming tar packaging, atomic I/O, wiping, config, and Windows shell integration."
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+flate2.workspace = true
+rand.workspace = true
+rpm-core = { path = "../rpm-core" }
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Shell"] }
+winreg.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
