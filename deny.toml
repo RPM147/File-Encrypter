@@ -1,0 +1,32 @@
+[advisories]
+version = 2
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "Transitive Linux-only dep via eframe 0.31 -> accesskit_unix -> atspi -> zbus_xml 4.0.0 -> quick-xml 0.30.0; parses local AT-SPI D-Bus introspection only, never untrusted or vault inputs. Remove when upgrading eframe." },
+    { id = "RUSTSEC-2026-0195", reason = "Transitive Linux-only dep via eframe 0.31 -> accesskit_unix -> atspi -> zbus_xml 4.0.0 -> quick-xml 0.30.0; parses local AT-SPI D-Bus introspection only, never untrusted or vault inputs. Remove when upgrading eframe." },
+    { id = "RUSTSEC-2026-0543", reason = "Transitive unmaintained notice for chrono 0.4.45 via zxcvbn 3.1.1 (latest release); used only for offline password-strength date-pattern checks. Direct chrono usage was removed from rpm-storage." },
+]
+
+[licenses]
+version = 2
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Bundled typefaces in egui's default font package.
+exceptions = [
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

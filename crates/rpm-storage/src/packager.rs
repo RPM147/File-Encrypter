@@ -5,9 +5,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -21,6 +20,37 @@ fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), StorageError> {
         return Err(StorageError::Cancelled);
     }
     Ok(())
+}
+
+/// Format Unix epoch seconds as an ISO-8601 / RFC-3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn format_unix_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // Howard Hinnant's proleptic Gregorian civil_from_days algorithm (epoch 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn utc_now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_unix_rfc3339(secs)
 }
 
 /// Assign collision-free top-level archive names when packing multiple inputs
@@ -157,7 +187,7 @@ pub fn collect_manifest(
         source_type,
         original_size: total_bytes,
         file_count: entries.len() as u64,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: utc_now_rfc3339(),
         compressed,
         files: entries,
     })
@@ -358,6 +388,17 @@ fn unpack_tar_stream<R: Read>(
 
         let raw_path = entry.path()?.into_owned();
         let rel = sanitize_archive_path(&raw_path, limits.max_path_depth)?;
+        // The tar reader consumes skipped entries too. Charge their effective
+        // size (including PAX size overrides) before applying the selection.
+        total_bytes = total_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| StorageError::LimitExceeded("unpacked size overflow".into()))?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(StorageError::LimitExceeded(format!(
+                "archive exceeds maximum unpacked size {} bytes",
+                limits.max_total_bytes
+            )));
+        }
         if let Some(selected) = filter {
             let rel_unix = rel.to_string_lossy().replace('\\', "/");
             if !matches_selector(&rel_unix, selected) {
@@ -369,13 +410,6 @@ fn unpack_tar_stream<R: Read>(
         if etype == EntryType::Directory {
             fs::create_dir_all(&out_path)?;
         } else {
-            let declared_size = entry.header().size()?;
-            if total_bytes.saturating_add(declared_size) > limits.max_total_bytes {
-                return Err(StorageError::LimitExceeded(format!(
-                    "archive exceeds maximum unpacked size {} bytes",
-                    limits.max_total_bytes
-                )));
-            }
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -385,15 +419,6 @@ fn unpack_tar_stream<R: Read>(
                 let n = entry.read(&mut buf)?;
                 if n == 0 {
                     break;
-                }
-                total_bytes = total_bytes
-                    .checked_add(n as u64)
-                    .ok_or_else(|| StorageError::LimitExceeded("unpacked size overflow".into()))?;
-                if total_bytes > limits.max_total_bytes {
-                    return Err(StorageError::LimitExceeded(format!(
-                        "archive exceeds maximum unpacked size {} bytes",
-                        limits.max_total_bytes
-                    )));
                 }
                 out_file.write_all(&buf[..n])?;
             }
@@ -457,4 +482,17 @@ pub fn unpack_vault_stream<R: Read>(
         UnpackLimits::default(),
         cancel,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_unix_rfc3339;
+
+    #[test]
+    fn utc_rfc3339_formatting_handles_epoch_and_leap_day() {
+        assert_eq!(format_unix_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_unix_rfc3339(1_709_251_199), "2024-02-29T23:59:59Z");
+        assert_eq!(format_unix_rfc3339(1_709_251_200), "2024-03-01T00:00:00Z");
+        assert_eq!(format_unix_rfc3339(1_767_225_600), "2026-01-01T00:00:00Z");
+    }
 }

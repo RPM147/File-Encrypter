@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and publish (e.g. v4.0.0)
+        description: Existing release tag (select the same tag as the workflow ref)
         required: true
         type: string
 
@@ -41,6 +41,14 @@ jobs:
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
+
+      - name: Verify that the release source matches the workflow commit
+        shell: bash
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" ]]; then
+            echo "Run this workflow from the release tag so provenance identifies the built commit." >&2
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -83,7 +91,32 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Read the tagged version's release notes
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+
+          heading = "## " + os.environ["RELEASE_TAG"]
+          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          matches = [i for i, line in enumerate(lines) if line.rstrip() == heading]
+          if len(matches) != 1:
+              raise SystemExit(f"Expected one {heading!r} heading in CHANGELOG.md")
+          start = matches[0] + 1
+          end = next((i for i in range(start, len(lines)) if lines[i].startswith("## ")), len(lines))
+          notes = "\n".join(lines[start:end]).strip()
+          if not notes:
+              raise SystemExit(f"Empty release notes for {heading!r}")
+          Path("release-notes.md").write_text(notes + "\n", encoding="utf-8")
+
       - uses: actions/download-artifact@v8
         with:
           pattern: package-*
@@ -94,10 +127,16 @@ jobs:
         working-directory: dist
         run: sha256sum *.zip *.tar.gz > SHA256SUMS.txt
 
+      - name: Attest the release archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+          create-storage-record: false
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
             dist/*.zip

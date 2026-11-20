@@ -6,7 +6,6 @@ license.workspace = true
 description = "Pure-Rust streaming tar packaging, atomic I/O, wiping, config, and Windows shell integration."
 
 [dependencies]
-chrono.workspace = true
 directories.workspace = true
 flate2.workspace = true
 rand.workspace = true
