@@ -155,6 +155,7 @@ pub fn ui(
                 state.rekey.current_keyfile.clone(),
                 new_kf,
                 state.config.kdf_params(),
+                state.config.language,
             );
         }
     });

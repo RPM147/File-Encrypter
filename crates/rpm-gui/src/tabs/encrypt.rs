@@ -252,6 +252,7 @@ pub fn ui(
                 state.encrypt.secure_wipe,
                 state.config.wipe_passes,
                 state.config.kdf_params(),
+                state.config.language,
             );
         }
     }

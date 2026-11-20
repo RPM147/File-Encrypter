@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use eframe::egui;
-use rpm_core::{FileManifestEntry, SecretKey};
+use rpm_core::{FileManifestEntry, IntegrityReport, SecretKey, VaultInfo, VaultMetadata};
 use rpm_gui::state::{strength_label_and_color_for, AppState, RecoveryPrompt, Tab};
-use rpm_gui::{fonts, i18n, load_app_icon};
+use rpm_gui::{fonts, i18n, load_app_icon, worker};
 use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
 use rpm_storage::{GuiLaunchIntent, LaunchTab};
 
@@ -143,10 +143,14 @@ fn inspect_manifest_selection_filtering_and_vault_change_reset() {
             modified_unix: 0,
         },
     ];
-    st.inspect
-        .set_manifest(PathBuf::from("C:\\tmp\\arsiv.vault"), entries);
+    let fake_dir = PathBuf::from("tmp_vault_dir");
+    let fake_vault = fake_dir.join("arsiv.vault");
+    st.inspect.set_manifest(fake_vault, entries);
     assert_eq!(st.inspect.manifest.len(), 3);
-    assert_eq!(st.inspect.extract_output_dir, "C:\\tmp");
+    assert_eq!(
+        st.inspect.extract_output_dir,
+        fake_dir.display().to_string()
+    );
 
     st.inspect.filter_query = "docs".into();
     assert_eq!(st.inspect.filtered_indices(), vec![0, 1]);
@@ -162,4 +166,56 @@ fn inspect_manifest_selection_filtering_and_vault_change_reset() {
     st.add_dropped_paths(vec![PathBuf::from("other.vault")], Some(Tab::Inspect));
     assert!(st.inspect.manifest.is_empty());
     assert!(st.inspect.manifest_vault.is_none());
+}
+
+#[test]
+fn worker_reports_format_cleanly_in_tr_and_en() {
+    let rep = IntegrityReport {
+        ok: true,
+        version: 5,
+        file_size: 4096,
+        sha256_hex: "0".repeat(64),
+        message: "ok".into(),
+        has_keyfile: true,
+        has_recovery: false,
+        chunk_count: 2,
+    };
+    let rep_tr = worker::format_integrity_report(&rep, AppLanguage::Tr);
+    let rep_en = worker::format_integrity_report(&rep, AppLanguage::En);
+    assert!(rep_tr.contains("BÜTÜNLÜK KONTROLÜ"));
+    assert!(rep_tr.contains("Evet") && rep_tr.contains("Hayır"));
+    assert!(rep_en.contains("INTEGRITY CHECK"));
+    assert!(rep_en.contains("Yes") && rep_en.contains("No"));
+
+    let info = VaultInfo {
+        version: 5,
+        vault_id: "0123456789abcdef".into(),
+        cipher: "AES-256-GCM-CHUNKED".into(),
+        chunk_size: 1024 * 1024,
+        has_recovery: true,
+        has_keyfile: false,
+        compressed: true,
+        argon_memory_kib: 65_536,
+        argon_iterations: 3,
+        argon_parallelism: 4,
+        metadata: VaultMetadata {
+            filename: "belgeler".into(),
+            source_type: "folder".into(),
+            original_size: 2048,
+            file_count: 1,
+            created_at: "2026-11-20T00:00:00Z".into(),
+            compressed: true,
+            files: vec![FileManifestEntry {
+                path: "belgeler/not.txt".into(),
+                size: 2048,
+                modified_unix: 0,
+            }],
+        },
+    };
+    let ins_tr = worker::format_inspect_report(&info, AppLanguage::Tr);
+    let ins_en = worker::format_inspect_report(&info, AppLanguage::En);
+    assert!(ins_tr.contains("KASA META VERİSİ"));
+    assert!(ins_tr.contains("Evet") && ins_tr.contains("Hayır"));
+    assert!(ins_en.contains("VAULT METADATA"));
+    assert!(ins_en.contains("Yes") && ins_en.contains("No"));
 }

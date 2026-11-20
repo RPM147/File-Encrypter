@@ -10,8 +10,9 @@ use std::thread;
 use eframe::egui;
 use rpm_core::{
     check_integrity, hash_keyfile_reader, inspect_header, mnemonic_to_entropy, Auth,
-    EncryptOptions, KdfParams, SecretKey,
+    EncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultInfo,
 };
+use rpm_storage::config::AppLanguage;
 use rpm_storage::{
     decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
     SecureWiper, StorageError,
@@ -33,6 +34,109 @@ fn load_optional_keyfile(path: Option<&Path>) -> Result<Option<SecretKey>, Stora
     Ok(Some(hash_keyfile_reader(&mut f)?))
 }
 
+fn keyfile_error_msg(err: &StorageError, lang: AppLanguage) -> String {
+    match lang {
+        AppLanguage::Tr => format!("Anahtar dosyası hatası: {err}"),
+        AppLanguage::En => format!("Keyfile error: {err}"),
+    }
+}
+
+fn yes_no(flag: bool, lang: AppLanguage) -> &'static str {
+    match (lang, flag) {
+        (AppLanguage::Tr, true) => "Evet",
+        (AppLanguage::Tr, false) => "Hayır",
+        (AppLanguage::En, true) => "Yes",
+        (AppLanguage::En, false) => "No",
+    }
+}
+
+/// Format a passwordless structural integrity report for localized GUI display.
+pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> String {
+    let kf = yes_no(rep.has_keyfile, lang);
+    let rec = yes_no(rep.has_recovery, lang);
+    match lang {
+        AppLanguage::Tr => format!(
+            "BÜTÜNLÜK KONTROLÜ\nDosya Boyutu : {} bayt\nSürüm        : v{}\nParça Sayısı : {}\nAnahtar Dosyası : {kf}\nKurtarma Slotu  : {rec}\n\n{}",
+            rep.file_size, rep.version, rep.chunk_count, rep.message
+        ),
+        AppLanguage::En => format!(
+            "INTEGRITY CHECK\nFile Size     : {} bytes\nVersion       : v{}\nChunks        : {}\nKeyfile Slot  : {kf}\nRecovery Slot : {rec}\n\n{}",
+            rep.file_size, rep.version, rep.chunk_count, rep.message
+        ),
+    }
+}
+
+/// Format unlocked Vault v5 metadata & file manifest summary for localized GUI display.
+pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
+    let m = &info.metadata;
+    let mib = (m.original_size as f64) / (1024.0 * 1024.0);
+    let kf = yes_no(info.has_keyfile, lang);
+    let rec = yes_no(info.has_recovery, lang);
+    let mut lines = match lang {
+        AppLanguage::Tr => vec![
+            "KASA META VERİSİ (v5 Parçalı AEAD)".to_string(),
+            format!("Özgün Ad        : {}", m.filename),
+            format!("Özgün Boyut     : {} bayt ({mib:.2} MiB)", m.original_size),
+            format!("Dosya Sayısı    : {}", m.file_count),
+            format!("Oluşturulma     : {}", m.created_at),
+            format!(
+                "Şifreleme       : {} ({} KiB parça)",
+                info.cipher,
+                info.chunk_size / 1024
+            ),
+            format!(
+                "Argon2id        : bellek={} KiB, tekrar={}, paralel={}",
+                info.argon_memory_kib, info.argon_iterations, info.argon_parallelism
+            ),
+            format!("Anahtar Dosyası : {kf}"),
+            format!("Kurtarma Slotu  : {rec}"),
+        ],
+        AppLanguage::En => vec![
+            "VAULT METADATA (v5 Chunked AEAD)".to_string(),
+            format!("Original Name  : {}", m.filename),
+            format!("Original Size  : {} bytes ({mib:.2} MiB)", m.original_size),
+            format!("File Count     : {}", m.file_count),
+            format!("Created        : {}", m.created_at),
+            format!(
+                "Cipher         : {} ({} KiB chunks)",
+                info.cipher,
+                info.chunk_size / 1024
+            ),
+            format!(
+                "Argon2id       : mem={} KiB, iters={}, par={}",
+                info.argon_memory_kib, info.argon_iterations, info.argon_parallelism
+            ),
+            format!("Keyfile Bound  : {kf}"),
+            format!("Recovery Slot  : {rec}"),
+        ],
+    };
+
+    if !m.files.is_empty() {
+        lines.push(String::new());
+        match lang {
+            AppLanguage::Tr => {
+                lines.push(format!("DOSYA LİSTESİ ({} girdi):", m.files.len()));
+                for entry in m.files.iter().take(150) {
+                    lines.push(format!("  - {} ({} bayt)", entry.path, entry.size));
+                }
+                if m.files.len() > 150 {
+                    lines.push(format!("  ... ve {} girdi daha", m.files.len() - 150));
+                }
+            }
+            AppLanguage::En => {
+                lines.push(format!("FILE MANIFEST ({} entries):", m.files.len()));
+                for entry in m.files.iter().take(150) {
+                    lines.push(format!("  - {} ({} bytes)", entry.path, entry.size));
+                }
+                if m.files.len() > 150 {
+                    lines.push(format!("  ... and {} more", m.files.len() - 150));
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_encrypt(
     ctx: egui::Context,
@@ -47,16 +151,13 @@ pub fn spawn_encrypt(
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
+    lang: AppLanguage,
 ) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
-                );
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
                 return;
             }
         };
@@ -85,11 +186,11 @@ pub fn spawn_encrypt(
             "Archive".into()
         };
         let out_vault = unique_path(&base_dir.join(format!("{base_name}.vault")));
-        send(
-            &tx,
-            &ctx,
-            WorkerUpdate::Log(format!("Encrypting -> {}", out_vault.display())),
-        );
+        let start_log = match lang {
+            AppLanguage::Tr => format!("Şifreleniyor -> {}", out_vault.display()),
+            AppLanguage::En => format!("Encrypting -> {}", out_vault.display()),
+        };
+        send(&tx, &ctx, WorkerUpdate::Log(start_log));
 
         let tx_p = tx.clone();
         let ctx_p = ctx.clone();
@@ -112,11 +213,11 @@ pub fn spawn_encrypt(
             progress,
             cancel,
             move |msg| {
-                send(
-                    &tx_skip,
-                    &ctx_skip,
-                    WorkerUpdate::Log(format!("Skipped: {msg}")),
-                );
+                let line = match lang {
+                    AppLanguage::Tr => format!("Atlandı: {msg}"),
+                    AppLanguage::En => format!("Skipped: {msg}"),
+                };
+                send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
             },
         );
 
@@ -131,24 +232,27 @@ pub fn spawn_encrypt(
                             wiper.wipe_file(s)
                         };
                         if let Err(err) = wres {
-                            send(&tx, &ctx, WorkerUpdate::Log(format!("Wipe warning: {err}")));
+                            let warn = match lang {
+                                AppLanguage::Tr => format!("Güvenli silme uyarısı: {err}"),
+                                AppLanguage::En => format!("Wipe warning: {err}"),
+                            };
+                            send(&tx, &ctx, WorkerUpdate::Log(warn));
                         }
                     }
                 }
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::EncryptDone {
-                        status: format!(
-                            "Encrypted {} file(s) -> {}",
-                            meta.file_count,
-                            out_vault
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "vault".into())
-                        ),
-                    },
-                );
+                let vault_name = out_vault
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "vault".into());
+                let status = match lang {
+                    AppLanguage::Tr => {
+                        format!("{} dosya şifrelendi -> {vault_name}", meta.file_count)
+                    }
+                    AppLanguage::En => {
+                        format!("Encrypted {} file(s) -> {vault_name}", meta.file_count)
+                    }
+                };
+                send(&tx, &ctx, WorkerUpdate::EncryptDone { status });
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
@@ -165,16 +269,13 @@ pub fn spawn_decrypt(
     secret: Zeroizing<String>,
     keyfile: Option<PathBuf>,
     output_dir: Option<PathBuf>,
+    lang: AppLanguage,
 ) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
-                );
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
                 return;
             }
         };
@@ -224,16 +325,21 @@ pub fn spawn_decrypt(
             match decrypt_vault_v5(vault, &root_out, auth, progress, Arc::clone(&cancel)) {
                 Ok(summary) => {
                     ok_count += 1;
-                    send(
-                        &tx,
-                        &ctx,
-                        WorkerUpdate::Log(format!(
+                    let line = match lang {
+                        AppLanguage::Tr => format!(
+                            "Çözüldü: {} ({} dosya) -> {}",
+                            vault.display(),
+                            summary.files_extracted,
+                            summary.output_path.display()
+                        ),
+                        AppLanguage::En => format!(
                             "Decrypted {} ({} file(s)) -> {}",
                             vault.display(),
                             summary.files_extracted,
                             summary.output_path.display()
-                        )),
-                    );
+                        ),
+                    };
+                    send(&tx, &ctx, WorkerUpdate::Log(line));
                 }
                 Err(e) => {
                     send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
@@ -242,28 +348,23 @@ pub fn spawn_decrypt(
             }
         }
 
-        send(
-            &tx,
-            &ctx,
-            WorkerUpdate::DecryptDone {
-                status: format!("Decrypted {ok_count}/{} vault(s)", vaults.len()),
-            },
-        );
+        let status = match lang {
+            AppLanguage::Tr => format!("{ok_count}/{} kasa çözüldü", vaults.len()),
+            AppLanguage::En => format!("Decrypted {ok_count}/{} vault(s)", vaults.len()),
+        };
+        send(&tx, &ctx, WorkerUpdate::DecryptDone { status });
     });
 }
 
-pub fn spawn_integrity_check(ctx: egui::Context, tx: mpsc::Sender<WorkerUpdate>, vault: PathBuf) {
+pub fn spawn_integrity_check(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    vault: PathBuf,
+    lang: AppLanguage,
+) {
     thread::spawn(move || match check_integrity(&vault) {
         Ok(rep) => {
-            let text = format!(
-                "INTEGRITY CHECK\nFile Size: {} bytes\nVersion: v{}\nChunks: {}\nKeyfile Slot: {}\nRecovery Slot: {}\n\n{}",
-                rep.file_size,
-                rep.version,
-                rep.chunk_count,
-                if rep.has_keyfile { "Yes" } else { "No" },
-                if rep.has_recovery { "Yes" } else { "No" },
-                rep.message
-            );
+            let text = format_integrity_report(&rep, lang);
             send(&tx, &ctx, WorkerUpdate::IntegrityDone { text, ok: rep.ok });
         }
         Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
@@ -277,16 +378,13 @@ pub fn spawn_inspect(
     use_recovery: bool,
     secret: Zeroizing<String>,
     keyfile: Option<PathBuf>,
+    lang: AppLanguage,
 ) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
-                );
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
                 return;
             }
         };
@@ -320,49 +418,18 @@ pub fn spawn_inspect(
 
         match inspect_header(&mut reader, auth) {
             Ok(info) => {
-                let m = &info.metadata;
-                let mib = (m.original_size as f64) / (1024.0 * 1024.0);
-                let mut lines = vec![
-                    "VAULT METADATA (v5 Chunked AEAD)".to_string(),
-                    format!("Original Name  : {}", m.filename),
-                    format!("Original Size  : {} bytes ({mib:.2} MiB)", m.original_size),
-                    format!("File Count     : {}", m.file_count),
-                    format!("Created        : {}", m.created_at),
-                    format!(
-                        "Cipher         : {} ({} KiB chunks)",
-                        info.cipher,
-                        info.chunk_size / 1024
-                    ),
-                    format!(
-                        "Argon2id       : mem={} KiB, iters={}, par={}",
-                        info.argon_memory_kib, info.argon_iterations, info.argon_parallelism
-                    ),
-                    format!(
-                        "Keyfile Bound  : {}",
-                        if info.has_keyfile { "Yes" } else { "No" }
-                    ),
-                    format!(
-                        "Recovery Slot  : {}",
-                        if info.has_recovery { "Yes" } else { "No" }
-                    ),
-                ];
-                if !m.files.is_empty() {
-                    lines.push(String::new());
-                    lines.push(format!("FILE MANIFEST ({} entries):", m.files.len()));
-                    for entry in m.files.iter().take(150) {
-                        lines.push(format!("  - {} ({} bytes)", entry.path, entry.size));
-                    }
-                    if m.files.len() > 150 {
-                        lines.push(format!("  ... and {} more", m.files.len() - 150));
-                    }
-                }
+                let text = format_inspect_report(&info, lang);
+                let status = match lang {
+                    AppLanguage::Tr => "Kasa meta verisi açıldı",
+                    AppLanguage::En => "Vault metadata unlocked",
+                };
                 let manifest = info.metadata.files.clone();
                 send(
                     &tx,
                     &ctx,
                     WorkerUpdate::InspectDone {
-                        text: lines.join("\n"),
-                        status: "Vault metadata unlocked".into(),
+                        text,
+                        status: status.into(),
                         manifest,
                         vault_path: vault.clone(),
                     },
@@ -384,16 +451,13 @@ pub fn spawn_selective_extract(
     keyfile: Option<PathBuf>,
     selected_paths: Vec<String>,
     output_dir: Option<PathBuf>,
+    lang: AppLanguage,
 ) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
-                );
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
                 return;
             }
         };
@@ -446,11 +510,18 @@ pub fn spawn_selective_extract(
             Arc::clone(&cancel),
         ) {
             Ok(summary) => {
-                let msg = format!(
-                    "Extracted {} selected file(s) -> {}",
-                    summary.files_extracted,
-                    summary.output_path.display()
-                );
+                let msg = match lang {
+                    AppLanguage::Tr => format!(
+                        "{} seçili dosya çıkarıldı -> {}",
+                        summary.files_extracted,
+                        summary.output_path.display()
+                    ),
+                    AppLanguage::En => format!(
+                        "Extracted {} selected file(s) -> {}",
+                        summary.files_extracted,
+                        summary.output_path.display()
+                    ),
+                };
                 send(&tx, &ctx, WorkerUpdate::Log(msg.clone()));
                 send(&tx, &ctx, WorkerUpdate::DecryptDone { status: msg });
             }
@@ -470,27 +541,24 @@ pub fn spawn_rekey(
     old_keyfile: Option<PathBuf>,
     new_keyfile: Option<PathBuf>,
     new_kdf: KdfParams,
+    lang: AppLanguage,
 ) {
     thread::spawn(move || {
         let old_kf = match load_optional_keyfile(old_keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("Keyfile error: {e}")),
-                );
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
                 return;
             }
         };
         let new_kf = match load_optional_keyfile(new_keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::Error(format!("New keyfile error: {e}")),
-                );
+                let msg = match lang {
+                    AppLanguage::Tr => format!("Yeni anahtar dosyası hatası: {e}"),
+                    AppLanguage::En => format!("New keyfile error: {e}"),
+                };
+                send(&tx, &ctx, WorkerUpdate::Error(msg));
                 return;
             }
         };
@@ -504,13 +572,15 @@ pub fn spawn_rekey(
             Some(new_kdf),
             Some(&cancel),
         ) {
-            Ok(()) => send(
-                &tx,
-                &ctx,
-                WorkerUpdate::RekeyDone {
-                    status: format!("Re-key complete: {}", vault.display()),
-                },
-            ),
+            Ok(()) => {
+                let status = match lang {
+                    AppLanguage::Tr => {
+                        format!("Anahtar güncelleme tamamlandı: {}", vault.display())
+                    }
+                    AppLanguage::En => format!("Re-key complete: {}", vault.display()),
+                };
+                send(&tx, &ctx, WorkerUpdate::RekeyDone { status });
+            }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
     });

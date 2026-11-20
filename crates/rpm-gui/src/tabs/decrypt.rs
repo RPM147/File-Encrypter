@@ -160,6 +160,7 @@ pub fn ui(
                 Zeroizing::new(secret_raw),
                 state.decrypt.keyfile.clone(),
                 out_opt,
+                state.config.language,
             );
         }
     });

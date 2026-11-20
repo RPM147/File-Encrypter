@@ -107,7 +107,12 @@ pub fn ui(
                     } else {
                         state.busy = true;
                         state.set_status(s.status_checking_integrity, false);
-                        worker::spawn_integrity_check(ctx.clone(), tx.clone(), p);
+                        worker::spawn_integrity_check(
+                            ctx.clone(),
+                            tx.clone(),
+                            p,
+                            state.config.language,
+                        );
                     }
                 }
                 if ui
@@ -139,6 +144,7 @@ pub fn ui(
                         state.inspect.use_recovery,
                         Zeroizing::new(sec),
                         state.inspect.keyfile.clone(),
+                        state.config.language,
                     );
                 }
             });
@@ -282,6 +288,7 @@ pub fn ui(
                         state.inspect.keyfile.clone(),
                         chosen,
                         out_opt,
+                        state.config.language,
                     );
                 }
             });
