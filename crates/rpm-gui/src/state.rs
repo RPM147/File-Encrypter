@@ -1,16 +1,20 @@
 //! GUI state, launch routing, drag-and-drop triage, and zeroizing field management.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rand::rngs::OsRng;
 use rand::Rng;
 use rpm_core::SecretKey;
-use rpm_storage::config::{default_config_path, load_config_from, AppConfig, ThemeMode};
+use rpm_storage::config::{
+    default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode,
+};
 use rpm_storage::shell_integration::{self, ShellIntegrationStatus};
 use rpm_storage::{GuiLaunchIntent, LaunchTab};
 use zeroize::Zeroize;
+
+use crate::i18n::{self, Strings};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -33,13 +37,17 @@ impl Tab {
     ];
 
     pub fn label(self) -> &'static str {
+        self.localized_label(&i18n::EN)
+    }
+
+    pub fn localized_label(self, s: &'static Strings) -> &'static str {
         match self {
-            Tab::Encrypt => "Encrypt",
-            Tab::Decrypt => "Decrypt",
-            Tab::Inspect => "Inspect",
-            Tab::Rekey => "Re-Key",
-            Tab::Password => "Password Gen",
-            Tab::Settings => "Settings",
+            Tab::Encrypt => s.tab_encrypt,
+            Tab::Decrypt => s.tab_decrypt,
+            Tab::Inspect => s.tab_inspect,
+            Tab::Rekey => s.tab_rekey,
+            Tab::Password => s.tab_password,
+            Tab::Settings => s.tab_settings,
         }
     }
 }
@@ -73,6 +81,7 @@ pub struct EncryptFields {
     pub keyfile: Option<PathBuf>,
     pub password: String,
     pub confirm_password: String,
+    pub show_password: bool,
     pub compress: bool,
     pub secure_wipe: bool,
     pub save_next_to_source: bool,
@@ -92,6 +101,7 @@ pub struct DecryptFields {
     pub keyfile: Option<PathBuf>,
     pub use_recovery: bool,
     pub password: String,
+    pub show_password: bool,
     pub recovery_phrase: String,
     pub output_dir: String,
 }
@@ -108,6 +118,7 @@ pub struct InspectFields {
     pub keyfile: Option<PathBuf>,
     pub use_recovery: bool,
     pub password: String,
+    pub show_password: bool,
     pub recovery_phrase: String,
     pub results: String,
 }
@@ -127,6 +138,7 @@ pub struct RekeyFields {
     pub current_password: String,
     pub new_password: String,
     pub confirm_password: String,
+    pub show_password: bool,
 }
 
 impl Drop for RekeyFields {
@@ -141,7 +153,6 @@ pub struct PasswordGenFields {
     pub length: usize,
     pub include_symbols: bool,
     pub generated: String,
-    pub clipboard_deadline: Option<Instant>,
 }
 
 impl Drop for PasswordGenFields {
@@ -161,6 +172,7 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     pub shell_status: ShellIntegrationStatus,
     pub show_shell_install_modal: bool,
+    pub clipboard_deadline: Option<Instant>,
     pub encrypt: EncryptFields,
     pub decrypt: DecryptFields,
     pub inspect: InspectFields,
@@ -176,23 +188,26 @@ impl Default for AppState {
             .map(load_config_from)
             .unwrap_or_default();
         let compress = config.compress_by_default;
+        let s = i18n::strings(config.language);
 
         Self {
             active_tab: Tab::Encrypt,
             busy: false,
             progress: 0.0,
-            status: "Ready — drag files or folders onto the window anytime".into(),
+            status: s.status_ready.into(),
             is_error: false,
             logs: Vec::new(),
             config,
             config_path: cfg_path,
             shell_status: shell_integration::get_status(),
             show_shell_install_modal: false,
+            clipboard_deadline: None,
             encrypt: EncryptFields {
                 sources: Vec::new(),
                 keyfile: None,
                 password: String::new(),
                 confirm_password: String::new(),
+                show_password: false,
                 compress,
                 secure_wipe: false,
                 save_next_to_source: true,
@@ -204,6 +219,7 @@ impl Default for AppState {
                 keyfile: None,
                 use_recovery: false,
                 password: String::new(),
+                show_password: false,
                 recovery_phrase: String::new(),
                 output_dir: String::new(),
             },
@@ -212,9 +228,9 @@ impl Default for AppState {
                 keyfile: None,
                 use_recovery: false,
                 password: String::new(),
+                show_password: false,
                 recovery_phrase: String::new(),
-                results: "Select a .vault file and click Integrity Check or Inspect Metadata."
-                    .into(),
+                results: s.ins_default_results.into(),
             },
             rekey: RekeyFields {
                 vault_path: String::new(),
@@ -224,18 +240,22 @@ impl Default for AppState {
                 current_password: String::new(),
                 new_password: String::new(),
                 confirm_password: String::new(),
+                show_password: false,
             },
             pwgen: PasswordGenFields {
                 length: 24,
                 include_symbols: true,
                 generated: String::new(),
-                clipboard_deadline: None,
             },
         }
     }
 }
 
 impl AppState {
+    pub fn strings(&self) -> &'static Strings {
+        i18n::strings(self.config.language)
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>, error: bool) {
         self.status = msg.into();
         self.is_error = error;
@@ -246,6 +266,23 @@ impl AppState {
         if self.logs.len() > 200 {
             let overflow = self.logs.len() - 200;
             self.logs.drain(0..overflow);
+        }
+    }
+
+    pub fn copy_secret_with_autoclear(
+        &mut self,
+        ctx: &egui::Context,
+        secret: String,
+        status_msg: &str,
+    ) {
+        ctx.copy_text(secret);
+        self.clipboard_deadline = Some(Instant::now() + Duration::from_secs(30));
+        self.set_status(status_msg, false);
+    }
+
+    pub fn persist_config_best_effort(&self) {
+        if let Some(ref path) = self.config_path {
+            let _ = save_config_to(path, &self.config);
         }
     }
 
@@ -266,6 +303,32 @@ impl AppState {
         self.rekey.confirm_password.zeroize();
     }
 
+    pub fn handle_shortcut_tab(&mut self, digit: u8) -> bool {
+        if let Some(&tab) = digit
+            .checked_sub(1)
+            .and_then(|idx| Tab::ALL.get(idx as usize))
+        {
+            self.active_tab = tab;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn dismiss_modals(&mut self) -> bool {
+        let mut closed = false;
+        if self.show_shell_install_modal {
+            self.show_shell_install_modal = false;
+            closed = true;
+        }
+        if self.encrypt.recovery_prompt.take().is_some() {
+            let msg = self.strings().status_enc_cancelled;
+            self.set_status(msg, false);
+            closed = true;
+        }
+        closed
+    }
+
     /// Add external paths (from OS drag-and-drop or Explorer/CLI args), switching tabs smartly.
     pub fn add_dropped_paths(&mut self, paths: Vec<PathBuf>, forced_tab: Option<Tab>) {
         if paths.is_empty() {
@@ -281,6 +344,7 @@ impl AppState {
         } else {
             Tab::Encrypt
         });
+        let lang = self.config.language;
 
         match target {
             Tab::Decrypt => {
@@ -306,9 +370,17 @@ impl AppState {
                     }
                 }
                 if added > 0 {
-                    self.set_status(format!("Loaded {added} vault(s) for decryption"), false);
+                    let msg = match lang {
+                        AppLanguage::Tr => format!("Çözme için {added} .vault dosyası eklendi"),
+                        AppLanguage::En => format!("Loaded {added} vault(s) for decryption"),
+                    };
+                    self.set_status(msg, false);
                 } else if skipped > 0 {
-                    self.set_status("Only .vault files can be decrypted", true);
+                    let msg = match lang {
+                        AppLanguage::Tr => "Yalnızca .vault dosyaları çözülebilir",
+                        AppLanguage::En => "Only .vault files can be decrypted",
+                    };
+                    self.set_status(msg, true);
                 }
             }
             Tab::Inspect => {
@@ -333,7 +405,11 @@ impl AppState {
                     }
                 }
                 if added > 0 {
-                    self.set_status(format!("Added {added} item(s) to Encrypt"), false);
+                    let msg = match lang {
+                        AppLanguage::Tr => format!("Şifreleme listesine {added} öğe eklendi"),
+                        AppLanguage::En => format!("Added {added} item(s) to Encrypt"),
+                    };
+                    self.set_status(msg, false);
                 }
             }
         }
@@ -367,28 +443,50 @@ impl AppState {
             out.push(alphabet[idx] as char);
         }
         self.pwgen.generated = out;
-        self.set_status("Generated new random password", false);
+        let msg = self.strings().status_pw_generated;
+        self.set_status(msg, false);
+    }
+
+    pub fn toggle_language(&mut self) {
+        self.config.language = match self.config.language {
+            AppLanguage::Tr => AppLanguage::En,
+            AppLanguage::En => AppLanguage::Tr,
+        };
+        self.set_status(self.strings().status_ready, false);
+    }
+
+    pub fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.config.theme = match self.config.theme {
+            ThemeMode::Dark => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Dark,
+        };
+        self.apply_theme_visuals(ctx);
     }
 
     pub fn apply_theme_visuals(&self, ctx: &egui::Context) {
-        let visuals = match self.config.theme {
-            ThemeMode::Dark => egui::Visuals::dark(),
-            ThemeMode::Light => egui::Visuals::light(),
-        };
-        ctx.set_visuals(visuals);
+        crate::theme::apply_theme(ctx, self.config.theme);
     }
 }
 
 pub fn strength_label_and_color(pw: &str) -> (&'static str, egui::Color32) {
+    let (lbl, _frac, color) = strength_label_and_color_for(pw, AppLanguage::En);
+    (lbl, color)
+}
+
+pub fn strength_label_and_color_for(
+    pw: &str,
+    lang: AppLanguage,
+) -> (&'static str, f32, egui::Color32) {
+    let s = i18n::strings(lang);
     if pw.is_empty() {
-        return ("-", egui::Color32::GRAY);
+        return (s.str_empty, 0.0, egui::Color32::GRAY);
     }
     let est = zxcvbn::zxcvbn(pw, &[]);
     match u8::from(est.score()) {
-        0 => ("Very Weak", egui::Color32::from_rgb(220, 65, 65)),
-        1 => ("Weak", egui::Color32::from_rgb(230, 120, 50)),
-        2 => ("Fair", egui::Color32::from_rgb(225, 185, 50)),
-        3 => ("Good", egui::Color32::from_rgb(95, 190, 95)),
-        _ => ("Strong", egui::Color32::from_rgb(50, 200, 140)),
+        0 => (s.str_very_weak, 0.15, egui::Color32::from_rgb(220, 65, 65)),
+        1 => (s.str_weak, 0.35, egui::Color32::from_rgb(230, 120, 50)),
+        2 => (s.str_fair, 0.58, egui::Color32::from_rgb(225, 185, 50)),
+        3 => (s.str_good, 0.80, egui::Color32::from_rgb(95, 190, 95)),
+        _ => (s.str_strong, 1.0, egui::Color32::from_rgb(20, 184, 166)),
     }
 }

@@ -640,6 +640,7 @@ fn streaming_16mib_multichunk_and_cancellation_and_config_wiper() {
         argon_iterations: 4,
         argon_parallelism: 4,
         compress_by_default: false,
+        ..AppConfig::default()
     };
     save_config_to(&cfg_path, &cfg).unwrap();
     assert_eq!(load_config_from(&cfg_path), cfg);

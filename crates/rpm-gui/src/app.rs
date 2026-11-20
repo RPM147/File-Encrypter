@@ -1,15 +1,16 @@
-//! Main `eframe::App` shell: sidebar navigation, OS file drag-and-drop, progress bar, logs.
+//! Main `eframe::App` shell: branded sidebar, shortcuts, OS drag-and-drop, progress bar, logs.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
+use rpm_storage::config::{AppLanguage, ThemeMode};
 use rpm_storage::GuiLaunchIntent;
 
 use crate::state::{AppState, Tab, WorkerUpdate};
-use crate::tabs;
+use crate::{tabs, theme};
 
 pub struct RpmApp {
     pub state: AppState,
@@ -57,14 +58,25 @@ impl RpmApp {
                 WorkerUpdate::IntegrityDone { text, ok } => {
                     self.state.busy = false;
                     self.state.inspect.results = text;
-                    self.state.set_status(
-                        if ok {
-                            "Integrity check passed"
-                        } else {
-                            "Integrity check failed"
-                        },
-                        !ok,
-                    );
+                    let s = self.state.strings();
+                    let label = match self.state.config.language {
+                        AppLanguage::Tr => {
+                            if ok {
+                                "Bütünlük doğrulaması başarılı"
+                            } else {
+                                "Bütünlük doğrulaması başarısız"
+                            }
+                        }
+                        AppLanguage::En => {
+                            if ok {
+                                "Integrity check passed"
+                            } else {
+                                "Integrity check failed"
+                            }
+                        }
+                    };
+                    let _ = s;
+                    self.state.set_status(label, !ok);
                 }
                 WorkerUpdate::RekeyDone { status } => {
                     self.state.busy = false;
@@ -79,6 +91,40 @@ impl RpmApp {
             }
         }
     }
+
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        let mut digit_pressed: Option<u8> = None;
+        let mut esc_pressed = false;
+        ctx.input(|i| {
+            if i.modifiers.ctrl || i.modifiers.command {
+                for (key, digit) in [
+                    (egui::Key::Num1, 1),
+                    (egui::Key::Num2, 2),
+                    (egui::Key::Num3, 3),
+                    (egui::Key::Num4, 4),
+                    (egui::Key::Num5, 5),
+                    (egui::Key::Num6, 6),
+                ] {
+                    if i.key_pressed(key) {
+                        digit_pressed = Some(digit);
+                        break;
+                    }
+                }
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                esc_pressed = true;
+            }
+        });
+
+        if let Some(d) = digit_pressed {
+            self.state.handle_shortcut_tab(d);
+        }
+        if esc_pressed && !self.state.dismiss_modals() && self.state.busy {
+            self.cancel.store(true, Ordering::Relaxed);
+            let msg = self.state.strings().status_cancelling;
+            self.state.set_status(msg, false);
+        }
+    }
 }
 
 impl eframe::App for RpmApp {
@@ -89,15 +135,17 @@ impl eframe::App for RpmApp {
         }
 
         self.drain_updates();
+        self.handle_keyboard_shortcuts(ctx);
 
-        // Clipboard auto-clear timer check
-        if let Some(deadline) = self.state.pwgen.clipboard_deadline {
+        // Unified clipboard auto-clear timer check (Password Gen + Recovery Modal)
+        if let Some(deadline) = self.state.clipboard_deadline {
             if Instant::now() >= deadline {
                 ctx.copy_text(String::new());
-                self.state.pwgen.clipboard_deadline = None;
-                self.state.set_status("Clipboard cleared", false);
+                self.state.clipboard_deadline = None;
+                let msg = self.state.strings().status_clipboard_cleared;
+                self.state.set_status(msg, false);
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                ctx.request_repaint_after(Duration::from_millis(500));
             }
         }
 
@@ -118,61 +166,93 @@ impl eframe::App for RpmApp {
         }
         let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.state.is_error {
-                    ui.colored_label(egui::Color32::from_rgb(230, 80, 80), &self.state.status);
-                } else {
-                    ui.label(&self.state.status);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.state.busy && ui.button("Cancel").clicked() {
-                        self.cancel.store(true, Ordering::Relaxed);
-                        self.state.set_status("Cancelling...", false);
+        let s = self.state.strings();
+        let accent = theme::accent_color(&ctx.style().visuals);
+
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if self.state.is_error {
+                        ui.colored_label(egui::Color32::from_rgb(230, 80, 80), &self.state.status);
+                    } else {
+                        ui.label(&self.state.status);
                     }
-                    ui.add(
-                        egui::ProgressBar::new(self.state.progress)
-                            .desired_width(180.0)
-                            .show_percentage(),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.state.busy && ui.button(s.btn_cancel).clicked() {
+                            self.cancel.store(true, Ordering::Relaxed);
+                            self.state.set_status(s.status_cancelling, false);
+                        }
+                        ui.add(
+                            egui::ProgressBar::new(self.state.progress)
+                                .desired_width(190.0)
+                                .show_percentage(),
+                        );
+                    });
                 });
             });
-        });
 
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .default_width(160.0)
+            .default_width(200.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("RPM Encrypter");
-                ui.weak("v5 Chunked AEAD");
+                ui.add_space(10.0);
+                ui.heading(s.app_title);
+                ui.colored_label(accent, egui::RichText::new(s.app_badge).small().strong());
+                ui.add_space(6.0);
                 ui.separator();
-                for tab in Tab::ALL {
-                    if ui
-                        .selectable_label(self.state.active_tab == tab, tab.label())
-                        .clicked()
-                    {
+                ui.add_space(4.0);
+
+                for (idx, tab) in Tab::ALL.into_iter().enumerate() {
+                    let selected = self.state.active_tab == tab;
+                    let text = format!("{}  ({})", tab.localized_label(s), idx + 1);
+                    let resp = ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::Button::new(text)
+                            .selected(selected)
+                            .corner_radius(egui::CornerRadius::same(6)),
+                    );
+                    if resp.clicked() {
                         self.state.active_tab = tab;
                     }
                 }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.small_button(s.lbl_lang_short).clicked() {
+                            self.state.toggle_language();
+                            self.state.persist_config_best_effort();
+                        }
+                        let theme_lbl = match self.state.config.theme {
+                            ThemeMode::Dark => s.lbl_theme_toggle_light,
+                            ThemeMode::Light => s.lbl_theme_toggle_dark,
+                        };
+                        if ui.small_button(theme_lbl).clicked() {
+                            self.state.toggle_theme(ctx);
+                            self.state.persist_config_best_effort();
+                        }
+                    });
+                    ui.separator();
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if is_hovering_files {
                 egui::Frame::NONE
-                    .fill(egui::Color32::from_rgba_unmultiplied(40, 120, 220, 45))
-                    .stroke(egui::Stroke::new(
-                        2.0_f32,
-                        egui::Color32::from_rgb(80, 160, 255),
-                    ))
-                    .corner_radius(6.0)
-                    .inner_margin(10.0)
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 184, 166, 36))
+                    .stroke(egui::Stroke::new(2.0_f32, accent))
+                    .corner_radius(8.0)
+                    .inner_margin(12.0)
                     .show(ui, |ui| {
                         ui.centered_and_justified(|ui| {
-                            ui.strong("Drop files/folders to Encrypt or .vault files to Decrypt");
+                            ui.strong(s.drop_banner);
                         });
                     });
-                ui.add_space(6.0);
+                ui.add_space(8.0);
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -198,8 +278,12 @@ impl eframe::App for RpmApp {
                 }
 
                 if !self.state.logs.is_empty() {
-                    ui.add_space(10.0);
-                    ui.collapsing("Activity / Worker Log", |ui| {
+                    let s = self.state.strings();
+                    ui.add_space(12.0);
+                    ui.collapsing(s.activity_log, |ui| {
+                        if ui.small_button(s.btn_clear).clicked() {
+                            self.state.logs.clear();
+                        }
                         for line in self.state.logs.iter().rev().take(30) {
                             ui.small(line);
                         }

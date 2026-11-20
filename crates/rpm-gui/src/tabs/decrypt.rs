@@ -8,7 +8,7 @@ use eframe::egui;
 use zeroize::Zeroizing;
 
 use crate::state::{AppState, Tab, WorkerUpdate};
-use crate::worker;
+use crate::{theme, worker};
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -17,12 +17,13 @@ pub fn ui(
     tx: &mpsc::Sender<WorkerUpdate>,
     cancel: &Arc<AtomicBool>,
 ) {
-    ui.heading("Decrypt (.vault v5)");
-    ui.add_space(6.0);
+    let s = state.strings();
+    ui.heading(s.dec_heading);
+    ui.add_space(8.0);
 
-    ui.group(|ui| {
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            if ui.button("Add .vault Files...").clicked() {
+            if ui.button(s.btn_add_vaults).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
                     .add_filter("RPM Vault", &["vault"])
                     .pick_files()
@@ -30,7 +31,7 @@ pub fn ui(
                     state.add_dropped_paths(files, Some(Tab::Decrypt));
                 }
             }
-            if !state.decrypt.vaults.is_empty() && ui.button("Clear").clicked() {
+            if !state.decrypt.vaults.is_empty() && ui.button(s.btn_clear).clicked() {
                 state.decrypt.vaults.clear();
             }
         });
@@ -41,12 +42,12 @@ pub fn ui(
             .max_height(130.0)
             .show(ui, |ui| {
                 if state.decrypt.vaults.is_empty() {
-                    ui.weak("No .vault files selected (or drop .vault files onto window).");
+                    ui.weak(s.dec_no_vaults);
                 } else {
                     for (i, path) in state.decrypt.vaults.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(path.display().to_string());
-                            if ui.small_button("Remove").clicked() {
+                            if ui.small_button(s.btn_remove).clicked() {
                                 remove_idx = Some(i);
                             }
                         });
@@ -58,36 +59,42 @@ pub fn ui(
         }
     });
 
-    ui.add_space(8.0);
-    ui.group(|ui| {
-        ui.checkbox(
-            &mut state.decrypt.use_recovery,
-            "Use 24-word recovery phrase instead of password",
-        );
+    ui.add_space(10.0);
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        ui.checkbox(&mut state.decrypt.use_recovery, s.chk_use_recovery);
         if state.decrypt.use_recovery {
-            ui.label("Recovery phrase (24 words):");
+            ui.label(s.lbl_rec_phrase);
             ui.add(
                 egui::TextEdit::multiline(&mut state.decrypt.recovery_phrase)
-                    .desired_width(480.0)
-                    .desired_rows(3),
+                    .desired_width(500.0)
+                    .desired_rows(3)
+                    .font(egui::TextStyle::Monospace),
             );
         } else {
             ui.horizontal(|ui| {
-                ui.label("Password:");
+                ui.label(s.lbl_password);
                 ui.add(
                     egui::TextEdit::singleline(&mut state.decrypt.password)
-                        .password(true)
+                        .password(!state.decrypt.show_password)
                         .desired_width(280.0),
                 );
+                let toggle_lbl = if state.decrypt.show_password {
+                    s.btn_hide
+                } else {
+                    s.btn_show
+                };
+                if ui.small_button(toggle_lbl).clicked() {
+                    state.decrypt.show_password = !state.decrypt.show_password;
+                }
             });
             ui.horizontal(|ui| {
-                ui.label("Keyfile (if bound):");
+                ui.label(s.lbl_keyfile_if_bound);
                 if let Some(ref kf) = state.decrypt.keyfile {
                     ui.label(kf.display().to_string());
-                    if ui.small_button("Clear").clicked() {
+                    if ui.small_button(s.btn_clear).clicked() {
                         state.decrypt.keyfile = None;
                     }
-                } else if ui.button("Select Keyfile...").clicked() {
+                } else if ui.button(s.btn_select_keyfile).clicked() {
                     if let Some(kf) = rfd::FileDialog::new().pick_file() {
                         state.decrypt.keyfile = Some(kf);
                     }
@@ -96,9 +103,9 @@ pub fn ui(
         }
 
         ui.horizontal(|ui| {
-            ui.label("Output folder:");
+            ui.label(s.lbl_output_folder);
             ui.text_edit_singleline(&mut state.decrypt.output_dir);
-            if ui.button("Browse...").clicked() {
+            if ui.button(s.btn_browse).clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     state.decrypt.output_dir = dir.display().to_string();
                 }
@@ -106,11 +113,14 @@ pub fn ui(
         });
     });
 
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     ui.add_enabled_ui(!state.busy, |ui| {
-        if ui.button("Decrypt Now").clicked() {
+        if ui
+            .add(theme::primary_button(s.btn_decrypt_now, ui.visuals()))
+            .clicked()
+        {
             if state.decrypt.vaults.is_empty() {
-                state.set_status("Select one or more .vault files", true);
+                state.set_status(s.err_select_vaults, true);
                 return;
             }
             let secret_raw = if state.decrypt.use_recovery {
@@ -119,7 +129,7 @@ pub fn ui(
                 std::mem::take(&mut state.decrypt.password)
             };
             if secret_raw.trim().is_empty() {
-                state.set_status("Enter password or recovery phrase", true);
+                state.set_status(s.err_enter_pw_or_rec, true);
                 return;
             }
             let out_opt = {
@@ -129,7 +139,7 @@ pub fn ui(
                 } else {
                     let p = PathBuf::from(trimmed);
                     if !p.is_dir() {
-                        state.set_status("Output folder does not exist", true);
+                        state.set_status(s.err_invalid_out_dir, true);
                         return;
                     }
                     Some(p)
@@ -140,7 +150,7 @@ pub fn ui(
             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
             state.busy = true;
             state.progress = 0.0;
-            state.set_status("Authenticating chunks & streaming output...", false);
+            state.set_status(s.status_dec_running, false);
             worker::spawn_decrypt(
                 ctx.clone(),
                 tx.clone(),

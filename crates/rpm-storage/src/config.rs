@@ -15,9 +15,18 @@ pub enum ThemeMode {
     Light,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppLanguage {
+    #[default]
+    Tr,
+    En,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub theme: ThemeMode,
+    #[serde(default)]
+    pub language: AppLanguage,
     pub wipe_passes: u8,
     pub argon_memory_kib: u32,
     pub argon_iterations: u32,
@@ -30,6 +39,7 @@ impl Default for AppConfig {
         let kdf = KdfParams::owasp_default();
         Self {
             theme: ThemeMode::Dark,
+            language: AppLanguage::Tr,
             wipe_passes: 1,
             argon_memory_kib: kdf.memory_kib,
             argon_iterations: kdf.iterations,

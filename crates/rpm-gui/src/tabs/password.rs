@@ -1,54 +1,69 @@
 //! Password Generator tab UI with 30-second auto-clearing clipboard timer.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
+use rpm_storage::config::AppLanguage;
 
-use crate::state::{strength_label_and_color, AppState, Tab};
+use crate::state::{strength_label_and_color_for, AppState, Tab};
+use crate::theme;
 
 pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
-    ui.heading("Password Generator");
-    ui.add_space(6.0);
+    let s = state.strings();
+    ui.heading(s.pwg_heading);
+    ui.add_space(8.0);
 
-    ui.group(|ui| {
-        ui.add(egui::Slider::new(&mut state.pwgen.length, 12..=64).text("Length"));
-        ui.checkbox(
-            &mut state.pwgen.include_symbols,
-            "Include symbols (!@#$...)",
-        );
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        ui.add(egui::Slider::new(&mut state.pwgen.length, 12..=64).text(s.pwg_length));
+        ui.checkbox(&mut state.pwgen.include_symbols, s.chk_symbols);
 
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button("Generate").clicked() {
+            if ui
+                .add(theme::primary_button(s.btn_generate, ui.visuals()))
+                .clicked()
+            {
                 state.generate_password();
             }
-            if !state.pwgen.generated.is_empty() && ui.button("Copy (auto-clears in 30s)").clicked()
-            {
-                ctx.copy_text(state.pwgen.generated.clone());
-                state.pwgen.clipboard_deadline = Some(Instant::now() + Duration::from_secs(30));
-                state.set_status("Password copied (will clear in 30s)", false);
+            if !state.pwgen.generated.is_empty() && ui.button(s.btn_copy_30s).clicked() {
+                let text = state.pwgen.generated.clone();
+                state.copy_secret_with_autoclear(ctx, text, s.status_pw_copied);
             }
-            if !state.pwgen.generated.is_empty() && ui.button("Use in Encrypt Tab").clicked() {
+            if !state.pwgen.generated.is_empty() && ui.button(s.btn_use_in_encrypt).clicked() {
                 state.encrypt.password = state.pwgen.generated.clone();
                 state.encrypt.confirm_password = state.pwgen.generated.clone();
                 state.active_tab = Tab::Encrypt;
-                state.set_status("Password transferred to Encrypt tab", false);
+                state.set_status(s.status_pw_transferred, false);
             }
         });
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.add(
             egui::TextEdit::singleline(&mut state.pwgen.generated)
-                .desired_width(420.0)
+                .desired_width(460.0)
                 .font(egui::TextStyle::Monospace),
         );
-        let (label, color) = strength_label_and_color(&state.pwgen.generated);
-        ui.colored_label(color, format!("Strength: {label}"));
+        let (label, frac, color) =
+            strength_label_and_color_for(&state.pwgen.generated, state.config.language);
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_strength);
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(180.0)
+                    .fill(color),
+            );
+            ui.colored_label(color, label);
+        });
 
-        if let Some(deadline) = state.pwgen.clipboard_deadline {
+        if let Some(deadline) = state.clipboard_deadline {
             let now = Instant::now();
             if now < deadline {
                 let secs = (deadline - now).as_secs() + 1;
-                ui.weak(format!("Clipboard auto-clear in {secs}s"));
+                let msg = match state.config.language {
+                    AppLanguage::Tr => format!("Pano {secs} saniye içinde otomatik temizlenecek"),
+                    AppLanguage::En => format!("Clipboard auto-clear in {secs}s"),
+                };
+                ui.weak(msg);
             }
         }
     });
