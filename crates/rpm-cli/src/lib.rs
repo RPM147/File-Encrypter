@@ -1,5 +1,7 @@
 //! Headless Pure-Rust CLI for RPM Encrypter v5 (zero GUI dependencies).
 
+pub mod progress;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +22,9 @@ use rpm_storage::{
     SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
+
+use progress::CliProgressReporter;
+pub use progress::ProgressMode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +55,9 @@ pub enum Commands {
         recovery_out: Option<PathBuf>,
         #[arg(long)]
         password_stdin: bool,
+        /// Progress display on stderr: auto (TTY only), always, or never.
+        #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+        progress: ProgressMode,
     },
     /// Decrypt one or more .vault files using streaming Chunked AEAD authentication.
     Decrypt {
@@ -68,6 +76,9 @@ pub enum Commands {
         recovery: bool,
         #[arg(long, conflicts_with_all = ["password_stdin", "recovery"])]
         recovery_stdin: bool,
+        /// Progress display on stderr: auto (TTY only), always, or never.
+        #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+        progress: ProgressMode,
     },
     /// Inspect vault integrity (passwordless) or encrypted metadata (header-only).
     Inspect {
@@ -228,6 +239,24 @@ where
     W1: Write,
     W2: Write,
 {
+    run_cli_args_with_tty(args, stdin, stdout, stderr, kdf_override, false)
+}
+
+pub fn run_cli_args_with_tty<I, S, R, W1, W2>(
+    args: I,
+    stdin: &mut R,
+    stdout: &mut W1,
+    stderr: &mut W2,
+    kdf_override: Option<KdfParams>,
+    stderr_is_tty: bool,
+) -> i32
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString> + Clone,
+    R: BufRead,
+    W1: Write,
+    W2: Write,
+{
     let parsed = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(err) => {
@@ -254,6 +283,7 @@ where
             wipe,
             recovery_out,
             password_stdin,
+            progress,
         } => {
             for s in &sources {
                 if !s.exists() {
@@ -321,16 +351,19 @@ where
                 "Archive".into()
             };
             let out_vault = unique_path(&base_dir.join(format!("{base_name}.vault")));
+            let reporter = CliProgressReporter::new(progress, stderr_is_tty, "Encrypting");
 
-            if let Err(err) = encrypt_sources_v5(
+            let enc_res = encrypt_sources_v5(
                 &sources,
                 &out_vault,
                 password.as_bytes(),
                 &opts,
-                Arc::new(|_, _| {}),
+                reporter.callback(),
                 Arc::clone(&cancel),
                 |_| {},
-            ) {
+            );
+            reporter.finish(stderr);
+            if let Err(err) = enc_res {
                 let _ = writeln!(stderr, "Error encrypting: {err}");
                 return exit_code_for_storage_error(&err);
             }
@@ -374,6 +407,7 @@ where
             password_stdin,
             recovery,
             recovery_stdin,
+            progress,
         } => {
             if !only.is_empty() && vaults.len() > 1 {
                 let _ = writeln!(
@@ -448,7 +482,8 @@ where
                 }
             };
 
-            for v in &vaults {
+            let total_vaults = vaults.len();
+            for (idx, v) in vaults.iter().enumerate() {
                 let target_root = output_dir.as_deref().unwrap_or_else(|| {
                     v.parent()
                         .filter(|p| !p.as_os_str().is_empty())
@@ -464,12 +499,18 @@ where
                         keyfile_hash,
                     },
                 };
+                let label = if total_vaults > 1 {
+                    format!("[{}/{}] Decrypting", idx + 1, total_vaults)
+                } else {
+                    "Decrypting".to_string()
+                };
+                let reporter = CliProgressReporter::new(progress, stderr_is_tty, label);
                 let dec_res = if only.is_empty() {
                     decrypt_vault_v5(
                         v,
                         target_root,
                         auth_for_vault,
-                        Arc::new(|_, _| {}),
+                        reporter.callback(),
                         Arc::clone(&cancel),
                     )
                 } else {
@@ -478,10 +519,11 @@ where
                         target_root,
                         auth_for_vault,
                         &only,
-                        Arc::new(|_, _| {}),
+                        reporter.callback(),
                         Arc::clone(&cancel),
                     )
                 };
+                reporter.finish(stderr);
                 match dec_res {
                     Ok(summary) => {
                         let _ = writeln!(

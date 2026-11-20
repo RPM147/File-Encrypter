@@ -1,7 +1,11 @@
 use std::fs;
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
+use rpm_cli::progress::{
+    format_bytes, format_eta, format_progress_line, format_rate, CliProgressMeter,
+};
 use rpm_cli::{run_cli_args, Cli};
 use rpm_core::KdfParams;
 
@@ -356,4 +360,157 @@ fn cli_selective_decrypt_with_only_flag_and_errors() {
         ),
         1
     );
+}
+
+#[test]
+fn cli_progress_modes_and_meter_formatting() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    fs::write(&src, vec![0xABu8; 4096]).unwrap();
+    let vaults = dir.path().join("vaults");
+    fs::create_dir_all(&vaults).unwrap();
+
+    // 1. --progress always emits progress lines on stderr without polluting stdout
+    let mut enc_out = Vec::new();
+    let mut enc_err = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "-o",
+            vaults.to_str().unwrap(),
+            "--password-stdin",
+            "--progress",
+            "always",
+        ],
+        &mut Cursor::new(b"ProgPw!1\n".to_vec()),
+        &mut enc_out,
+        &mut enc_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&enc_err));
+    let enc_stdout = String::from_utf8(enc_out).unwrap();
+    let enc_stderr = String::from_utf8(enc_err).unwrap();
+    assert!(enc_stdout.starts_with("Encrypted: "));
+    assert!(
+        enc_stderr.contains("Encrypting:") && enc_stderr.contains('%'),
+        "expected progress lines in stderr, got: {enc_stderr:?}"
+    );
+    assert!(!enc_stdout.contains("Encrypting:"));
+
+    let vault = vaults.join("payload.bin.vault");
+
+    // 2. Default (--progress auto) with non-TTY stderr emits zero progress lines
+    let out_auto = dir.path().join("out_auto");
+    fs::create_dir_all(&out_auto).unwrap();
+    let mut auto_out = Vec::new();
+    let mut auto_err = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "decrypt",
+            vault.to_str().unwrap(),
+            "-o",
+            out_auto.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"ProgPw!1\n".to_vec()),
+        &mut auto_out,
+        &mut auto_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&auto_err));
+    assert!(
+        auto_err.is_empty(),
+        "expected empty stderr under non-TTY auto mode, got: {}",
+        String::from_utf8_lossy(&auto_err)
+    );
+
+    // 3. --progress never emits zero progress lines, while --progress always emits Decrypting
+    let out_never = dir.path().join("out_never");
+    fs::create_dir_all(&out_never).unwrap();
+    let mut never_err = Vec::new();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "decrypt",
+                vault.to_str().unwrap(),
+                "-o",
+                out_never.to_str().unwrap(),
+                "--password-stdin",
+                "--progress",
+                "never",
+            ],
+            &mut Cursor::new(b"ProgPw!1\n".to_vec()),
+            &mut Vec::new(),
+            &mut never_err,
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    assert!(never_err.is_empty());
+
+    let out_always = dir.path().join("out_always");
+    fs::create_dir_all(&out_always).unwrap();
+    let mut dec_err = Vec::new();
+    assert_eq!(
+        run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "decrypt",
+                vault.to_str().unwrap(),
+                "-o",
+                out_always.to_str().unwrap(),
+                "--password-stdin",
+                "--progress",
+                "always",
+            ],
+            &mut Cursor::new(b"ProgPw!1\n".to_vec()),
+            &mut Vec::new(),
+            &mut dec_err,
+            Some(KdfParams::fast_test()),
+        ),
+        0
+    );
+    let dec_stderr = String::from_utf8(dec_err).unwrap();
+    assert!(dec_stderr.contains("Decrypting:") && dec_stderr.contains('%'));
+
+    // 4. Deterministic CliProgressMeter clamping & formatting
+    let t0 = Instant::now();
+    let mut meter = CliProgressMeter::new(t0);
+    let snap1 = meter.update_at(
+        t0 + Duration::from_secs(1),
+        2 * 1024 * 1024,
+        8 * 1024 * 1024,
+    );
+    assert_eq!(snap1.percent, 25);
+    assert!(snap1.bytes_per_sec.is_some());
+    assert_eq!(snap1.eta, Some(Duration::from_secs(3)));
+    let formatted = format_progress_line("[1/2] Decrypting", &snap1);
+    assert!(formatted.contains("[1/2] Decrypting:  25%"));
+    assert!(formatted.contains("MiB/s"));
+    assert!(formatted.contains("ETA 3s"));
+
+    let clamped = meter.update_at(
+        t0 + Duration::from_secs(2),
+        9 * 1024 * 1024,
+        8 * 1024 * 1024,
+    );
+    assert_eq!(clamped.percent, 100);
+    assert_eq!(clamped.bytes_done, 8 * 1024 * 1024);
+    assert_eq!(clamped.eta, Some(Duration::ZERO));
+
+    let mut zero_meter = CliProgressMeter::new(t0);
+    let zero_snap = zero_meter.update_at(t0 + Duration::from_millis(80), 256, 0);
+    assert_eq!(zero_snap.percent, 100);
+    assert_eq!(zero_snap.eta, None);
+    let zero_line = format_progress_line("Encrypting", &zero_snap);
+    assert!(zero_line.contains("100% (256 B)"));
+
+    assert_eq!(format_bytes(1024), "1.0 KiB");
+    assert_eq!(format_rate(2.0 * 1024.0 * 1024.0), "2.0 MiB/s");
+    assert_eq!(format_eta(Duration::from_secs(125)), "2m 05s");
+    assert_eq!(format_eta(Duration::from_secs(3660)), "1h 01m");
 }

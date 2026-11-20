@@ -106,6 +106,7 @@ pub fn ui(
                         state.set_status(s.err_select_vault, true);
                     } else {
                         state.busy = true;
+                        state.transfer = None;
                         state.set_status(s.status_checking_integrity, false);
                         worker::spawn_integrity_check(
                             ctx.clone(),
@@ -136,6 +137,7 @@ pub fn ui(
                         return;
                     }
                     state.busy = true;
+                    state.transfer = None;
                     state.set_status(s.status_inspecting, false);
                     worker::spawn_inspect(
                         ctx.clone(),
@@ -275,9 +277,7 @@ pub fn ui(
                         state.inspect.selected_paths.iter().cloned().collect();
                     chosen.sort();
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                    state.busy = true;
-                    state.progress = 0.0;
-                    state.set_status(s.status_extracting_selected, false);
+                    state.begin_transfer(s.status_extracting_selected);
                     worker::spawn_selective_extract(
                         ctx.clone(),
                         tx.clone(),

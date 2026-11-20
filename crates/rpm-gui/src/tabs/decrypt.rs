@@ -148,9 +148,7 @@ pub fn ui(
 
             state.clear_decrypt_secrets();
             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-            state.busy = true;
-            state.progress = 0.0;
-            state.set_status(s.status_dec_running, false);
+            state.begin_transfer(s.status_dec_running);
             worker::spawn_decrypt(
                 ctx.clone(),
                 tx.clone(),

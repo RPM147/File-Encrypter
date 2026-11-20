@@ -16,6 +16,7 @@ use rpm_storage::{GuiLaunchIntent, LaunchTab};
 use zeroize::Zeroize;
 
 use crate::i18n::{self, Strings};
+use crate::progress::TransferSnapshot;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -55,7 +56,7 @@ impl Tab {
 
 #[derive(Debug)]
 pub enum WorkerUpdate {
-    Progress(f32),
+    Progress(TransferSnapshot),
     Log(String),
     EncryptDone {
         status: String,
@@ -231,6 +232,7 @@ pub struct AppState {
     pub active_tab: Tab,
     pub busy: bool,
     pub progress: f32,
+    pub transfer: Option<TransferSnapshot>,
     pub status: String,
     pub is_error: bool,
     pub logs: Vec<String>,
@@ -260,6 +262,7 @@ impl Default for AppState {
             active_tab: Tab::Encrypt,
             busy: false,
             progress: 0.0,
+            transfer: None,
             status: s.status_ready.into(),
             is_error: false,
             logs: Vec::new(),
@@ -330,6 +333,13 @@ impl AppState {
     pub fn set_status(&mut self, msg: impl Into<String>, error: bool) {
         self.status = msg.into();
         self.is_error = error;
+    }
+
+    pub fn begin_transfer(&mut self, status: impl Into<String>) {
+        self.busy = true;
+        self.progress = 0.0;
+        self.transfer = None;
+        self.set_status(status, false);
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {

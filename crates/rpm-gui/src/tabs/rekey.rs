@@ -144,6 +144,7 @@ pub fn ui(
             state.clear_rekey_secrets();
             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
             state.busy = true;
+            state.transfer = None;
             state.set_status(s.status_rekeying, false);
             worker::spawn_rekey(
                 ctx.clone(),

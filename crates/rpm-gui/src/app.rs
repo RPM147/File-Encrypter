@@ -9,6 +9,7 @@ use eframe::egui;
 use rpm_storage::config::{AppLanguage, ThemeMode};
 use rpm_storage::GuiLaunchIntent;
 
+use crate::progress::{format_transfer_summary, format_transfer_tooltip};
 use crate::state::{AppState, Tab, WorkerUpdate};
 use crate::{tabs, theme};
 
@@ -37,17 +38,22 @@ impl RpmApp {
     fn drain_updates(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerUpdate::Progress(p) => self.state.progress = p,
+                WorkerUpdate::Progress(snap) => {
+                    self.state.progress = snap.fraction;
+                    self.state.transfer = Some(snap);
+                }
                 WorkerUpdate::Log(line) => self.state.push_log(line),
                 WorkerUpdate::EncryptDone { status } => {
                     self.state.busy = false;
                     self.state.progress = 1.0;
+                    self.state.transfer = None;
                     self.state.encrypt.sources.clear();
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::DecryptDone { status } => {
                     self.state.busy = false;
                     self.state.progress = 1.0;
+                    self.state.transfer = None;
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::InspectDone {
@@ -57,12 +63,14 @@ impl RpmApp {
                     vault_path,
                 } => {
                     self.state.busy = false;
+                    self.state.transfer = None;
                     self.state.inspect.results = text;
                     self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::IntegrityDone { text, ok } => {
                     self.state.busy = false;
+                    self.state.transfer = None;
                     self.state.inspect.results = text;
                     self.state.inspect.reset_manifest();
                     let s = self.state.strings();
@@ -87,11 +95,13 @@ impl RpmApp {
                 }
                 WorkerUpdate::RekeyDone { status } => {
                     self.state.busy = false;
+                    self.state.transfer = None;
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::Error(err) => {
                     self.state.busy = false;
                     self.state.progress = 0.0;
+                    self.state.transfer = None;
                     self.state.set_status(err.clone(), true);
                     self.state.push_log(format!("ERROR: {err}"));
                 }
@@ -193,11 +203,23 @@ impl eframe::App for RpmApp {
                             self.cancel.store(true, Ordering::Relaxed);
                             self.state.set_status(s.status_cancelling, false);
                         }
-                        ui.add(
+                        let bar_resp = ui.add(
                             egui::ProgressBar::new(self.state.progress)
                                 .desired_width(190.0)
                                 .show_percentage(),
                         );
+                        if let Some(snap) = self.state.transfer {
+                            let tip = format_transfer_tooltip(&snap, self.state.config.language);
+                            bar_resp.on_hover_text(tip);
+                            if self.state.busy {
+                                if let Some(summary) =
+                                    format_transfer_summary(&snap, self.state.config.language)
+                                {
+                                    ui.add_space(6.0);
+                                    ui.small(summary);
+                                }
+                            }
+                        }
                     });
                 });
             });

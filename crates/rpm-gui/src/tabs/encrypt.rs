@@ -234,9 +234,7 @@ pub fn ui(
                 Some(PathBuf::from(state.encrypt.output_dir.trim()))
             };
             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-            state.busy = true;
-            state.progress = 0.0;
-            state.set_status(s.status_enc_running, false);
+            state.begin_transfer(s.status_enc_running);
             let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
             state.clear_encrypt_secrets();
             worker::spawn_encrypt(

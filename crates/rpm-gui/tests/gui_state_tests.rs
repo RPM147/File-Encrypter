@@ -1,8 +1,13 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{FileManifestEntry, IntegrityReport, SecretKey, VaultInfo, VaultMetadata};
+use rpm_gui::progress::{
+    format_bytes, format_eta, format_rate, format_transfer_summary, format_transfer_tooltip,
+    TransferMeter, TransferSnapshot,
+};
 use rpm_gui::state::{strength_label_and_color_for, AppState, RecoveryPrompt, Tab};
 use rpm_gui::{fonts, i18n, load_app_icon, worker};
 use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
@@ -218,4 +223,95 @@ fn worker_reports_format_cleanly_in_tr_and_en() {
     assert!(ins_tr.contains("Evet") && ins_tr.contains("Hayır"));
     assert!(ins_en.contains("VAULT METADATA"));
     assert!(ins_en.contains("Yes") && ins_en.contains("No"));
+}
+
+#[test]
+fn transfer_meter_and_bilingual_formatting_handle_edge_cases() {
+    let t0 = Instant::now();
+    let total = 10 * 1024 * 1024;
+
+    // 1. Sub-50ms initial buffer suppresses artificial spike; second sample initializes rate
+    let mut quick = TransferMeter::new(t0);
+    let s1 = quick.update_at(t0 + Duration::from_millis(10), 1024 * 1024, total);
+    assert!(s1.bytes_per_sec.is_none());
+    assert!(s1.eta.is_none());
+    assert!(format_transfer_summary(&s1, AppLanguage::Tr).is_none());
+
+    let s2 = quick.update_at(t0 + Duration::from_millis(260), 2 * 1024 * 1024, total);
+    let bps2 = s2
+        .bytes_per_sec
+        .expect("rate initialized after second sample");
+    assert!(bps2 > 3_500_000.0 && bps2 < 4_500_000.0, "bps2={bps2}");
+    assert!(s2.eta.is_some());
+
+    // 2. EMA smoothing across multi-second ticks + clamping when done > total
+    let mut meter = TransferMeter::with_item(t0, 2, 4);
+    let a = meter.update_at(t0 + Duration::from_secs(1), 1024 * 1024, total);
+    assert!((a.fraction - 0.1).abs() < 1e-4);
+    let bps_a = a.bytes_per_sec.unwrap();
+    assert!((bps_a - 1_048_576.0).abs() < 1024.0);
+    assert_eq!(a.eta, Some(Duration::from_secs(9)));
+
+    // Jump +2 MiB in 1s -> smoothed = 0.65 * 1 MiB/s + 0.35 * 2 MiB/s = 1.35 MiB/s
+    let b = meter.update_at(t0 + Duration::from_secs(2), 3 * 1024 * 1024, total);
+    let bps_b = b.bytes_per_sec.unwrap();
+    assert!((bps_b - 1.35 * 1_048_576.0).abs() < 4096.0, "bps_b={bps_b}");
+    let tr_sum = format_transfer_summary(&b, AppLanguage::Tr).unwrap();
+    let en_sum = format_transfer_summary(&b, AppLanguage::En).unwrap();
+    assert!(tr_sum.starts_with("[2/4] ") && tr_sum.contains("MiB/s") && tr_sum.contains("Kalan:"));
+    assert!(en_sum.starts_with("[2/4] ") && en_sum.contains("MiB/s") && en_sum.contains("ETA"));
+
+    // done > total clamps cleanly without underflow or overflow
+    let done_snap = meter.update_at(t0 + Duration::from_secs(5), total + 4096, total);
+    assert_eq!(done_snap.fraction, 1.0);
+    assert_eq!(done_snap.bytes_done, total);
+    assert_eq!(done_snap.eta, Some(Duration::ZERO));
+
+    // total == 0 does not divide by zero
+    let mut zero_meter = TransferMeter::new(t0);
+    let z = zero_meter.update_at(t0 + Duration::from_millis(100), 512, 0);
+    assert_eq!(z.fraction, 1.0);
+    assert_eq!(z.eta, None);
+
+    // 3. Unit & duration formatters
+    assert_eq!(format_bytes(512), "512 B");
+    assert_eq!(format_bytes(1536), "1.5 KiB");
+    assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.00 GiB");
+    assert_eq!(format_rate(f64::NAN), "0 B/s");
+    assert_eq!(format_rate(-10.0), "0 B/s");
+    assert_eq!(
+        format_eta(Duration::from_secs(45), AppLanguage::Tr),
+        "45 sn"
+    );
+    assert_eq!(format_eta(Duration::from_secs(45), AppLanguage::En), "45s");
+    assert_eq!(
+        format_eta(Duration::from_secs(125), AppLanguage::Tr),
+        "2 dk 05 sn"
+    );
+    assert_eq!(
+        format_eta(Duration::from_secs(3665), AppLanguage::En),
+        "1h 01m"
+    );
+
+    let tip = format_transfer_tooltip(&b, AppLanguage::En);
+    assert!(tip.contains("3.0 MiB / 10.0 MiB"));
+    assert!(tip.contains("MiB/s"));
+
+    // 4. AppState::begin_transfer clears stale snapshot
+    let mut st = AppState {
+        transfer: Some(TransferSnapshot {
+            fraction: 0.5,
+            bytes_done: 100,
+            bytes_total: 200,
+            bytes_per_sec: Some(1024.0),
+            eta: Some(Duration::from_secs(1)),
+            item_index: None,
+        }),
+        ..Default::default()
+    };
+    st.begin_transfer("Starting");
+    assert!(st.busy);
+    assert_eq!(st.progress, 0.0);
+    assert!(st.transfer.is_none());
+    assert_eq!(st.status, "Starting");
 }

@@ -4,8 +4,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
@@ -19,11 +20,44 @@ use rpm_storage::{
 };
 use zeroize::Zeroizing;
 
+use crate::progress::{TransferMeter, TransferSnapshot};
 use crate::state::WorkerUpdate;
+
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
 
 fn send(tx: &mpsc::Sender<WorkerUpdate>, ctx: &egui::Context, msg: WorkerUpdate) {
     let _ = tx.send(msg);
     ctx.request_repaint();
+}
+
+fn make_progress_cb(
+    tx: mpsc::Sender<WorkerUpdate>,
+    ctx: egui::Context,
+    item_index: Option<(usize, usize)>,
+) -> Arc<dyn Fn(u64, u64) + Send + Sync> {
+    let meter = match item_index {
+        Some((cur, tot)) => TransferMeter::with_item(Instant::now(), cur, tot),
+        None => TransferMeter::new(Instant::now()),
+    };
+    let shared = Mutex::new((meter, Option::<Instant>::None));
+    Arc::new(move |done: u64, total: u64| {
+        let now = Instant::now();
+        let Ok(mut guard) = shared.lock() else {
+            return;
+        };
+        let snap: TransferSnapshot = guard.0.update_at(now, done, total);
+        let is_final = total > 0 && done >= total;
+        let should_send = is_final
+            || match guard.1 {
+                None => true,
+                Some(last) => now.saturating_duration_since(last) >= PROGRESS_INTERVAL,
+            };
+        if should_send {
+            guard.1 = Some(now);
+            drop(guard);
+            send(&tx, &ctx, WorkerUpdate::Progress(snap));
+        }
+    })
 }
 
 fn load_optional_keyfile(path: Option<&Path>) -> Result<Option<SecretKey>, StorageError> {
@@ -192,16 +226,7 @@ pub fn spawn_encrypt(
         };
         send(&tx, &ctx, WorkerUpdate::Log(start_log));
 
-        let tx_p = tx.clone();
-        let ctx_p = ctx.clone();
-        let progress = Arc::new(move |done: u64, total: u64| {
-            let frac = if total > 0 {
-                (done as f32 / total as f32).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            send(&tx_p, &ctx_p, WorkerUpdate::Progress(frac));
-        });
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
 
         let tx_skip = tx.clone();
         let ctx_skip = ctx.clone();
@@ -293,7 +318,7 @@ pub fn spawn_decrypt(
         };
 
         let mut ok_count = 0usize;
-        for vault in &vaults {
+        for (idx, vault) in vaults.iter().enumerate() {
             let root_out = output_dir.clone().unwrap_or_else(|| {
                 vault
                     .parent()
@@ -311,16 +336,8 @@ pub fn spawn_decrypt(
                 }
             };
 
-            let tx_p = tx.clone();
-            let ctx_p = ctx.clone();
-            let progress = Arc::new(move |done: u64, total: u64| {
-                let frac = if total > 0 {
-                    (done as f32 / total as f32).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                send(&tx_p, &ctx_p, WorkerUpdate::Progress(frac));
-            });
+            let item = (vaults.len() > 1).then_some((idx + 1, vaults.len()));
+            let progress = make_progress_cb(tx.clone(), ctx.clone(), item);
 
             match decrypt_vault_v5(vault, &root_out, auth, progress, Arc::clone(&cancel)) {
                 Ok(summary) => {
@@ -490,16 +507,7 @@ pub fn spawn_selective_extract(
             }
         };
 
-        let tx_p = tx.clone();
-        let ctx_p = ctx.clone();
-        let progress = Arc::new(move |done: u64, total: u64| {
-            let frac = if total > 0 {
-                (done as f32 / total as f32).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            send(&tx_p, &ctx_p, WorkerUpdate::Progress(frac));
-        });
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
 
         match decrypt_vault_selected_v5(
             &vault,
