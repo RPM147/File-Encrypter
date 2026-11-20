@@ -1,8 +1,12 @@
 # RPM Encrypter
 
+[![CI](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
+
 RPM Encrypter is a **Pure-Rust, local-only** file encryption utility using **Chunked AES-256-GCM** (`Vault Format v5`), **Argon2id** key derivation, optional **keyfile two-factor binding**, and deterministic in-memory secret scrubbing (`zeroize` + `VirtualLock`/`mlock`).
 
 Everything runs locally with zero telemetry, cloud accounts, or network dependencies. The retired Python + Flet (Vault Format v4) codebase is archived in [legacy/](legacy/README.md).
+
+[User guide (Türkçe)](docs/USER_GUIDE.md) · [Changelog](CHANGELOG.md)
 
 ## Key Features
 
@@ -12,7 +16,8 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 - **Optional Keyfile Two-Factor Unlock:** Bind a vault to any non-empty keyfile (streamed through SHA-256 and mixed via HKDF with the Argon2id key).
 - **24-Word BIP-39 Recovery Phrases:** Emergency recovery key slot stored separately from the password slot.
 - **O(1) Re-Key:** Rotate passwords and/or keyfiles by re-wrapping only the 32-byte DEK envelope without decrypting gigabytes of payload chunks.
-- **Native Desktop GUI + OS Drag-and-Drop (`rpm-encrypter`):** Built with `eframe`/`egui` and `rfd`, supporting external file/folder drag-and-drop and a 30-second auto-clearing clipboard timer.
+- **Native Desktop GUI + OS Drag-and-Drop (`rpm-encrypter`):** Built with `eframe`/`egui` and `rfd`, featuring a bilingual Turkish/English UI (`TR`/`EN`), external file/folder drag-and-drop, and a 30-second auto-clearing clipboard timer.
+- **Selective File Extraction:** Restore individual files or subfolders using the GUI **Inspect** tab checklist or repeatable `decrypt --only <PATH>` flags in the CLI, guarded by the same stage-and-swap authentication boundary.
 - **Headless CLI (`rpm-encrypter-cli`):** Scriptable encryption, decryption, inspection, re-keying, password generation, and Windows shell integration without passing passwords on the command line.
 - **Windows Shell Integration (User-Scoped HKCU):** Optional right-click **"Encrypt with RPM Encrypter"** menu and `.vault` double-click opening (reversible, zero administrator rights required).
 
@@ -32,6 +37,14 @@ cargo run --release -p rpm-gui
 cargo build --release --workspace
 ```
 
+### Package a Windows release locally
+
+From the repository root, run the packaging script in PowerShell. It uses the workspace version and writes the portable ZIP and `SHA256SUMS.txt` to `dist/`.
+
+```powershell
+.\scripts\package-release.ps1
+```
+
 ### CLI Usage
 
 Passwords are never accepted as CLI flags; interactive secure prompts or `--password-stdin` / `--recovery-stdin` are used instead:
@@ -43,6 +56,14 @@ cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json
 cargo run -p rpm-cli -- rekey ./folder.vault --keyfile ./my.key
 cargo run -p rpm-cli -- password --length 24
 cargo run -p rpm-cli -- shell-integration install   # Windows HKCU only
+```
+
+To restore selected entries from a single vault, use the paths shown by `inspect`. Repeat `--only` for each file or folder. This example restores one file and the entire `photos` folder into a fresh output directory.
+
+```bash
+cargo run -p rpm-cli -- inspect ./folder.vault --keyfile ./my.key
+mkdir ./selected
+cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./selected --only folder/notes.txt --only folder/photos
 ```
 
 ## Architecture & Security
