@@ -12,6 +12,7 @@ from .constants import (
     zxcvbn,
 )
 from .events import AppEvent
+from .launch import LaunchRequest, parse_launch_argv
 from .recovery_copy import (
     DECRYPT_RECOVERY_LABEL,
     INSPECT_RECOVERY_LABEL,
@@ -31,6 +32,8 @@ __all__ = [
     "MSG_QUEUE_SIZE",
     "AppEvent",
     "AppServices",
+    "LaunchRequest",
+    "parse_launch_argv",
     "APP_NAME",
     "APP_VERSION",
     "CONTAINER_SIZE_CHOICES",

@@ -163,3 +163,17 @@ def test_repo_hygiene_gitattributes_python_floor_and_ruff_b():
     assert data["project"]["requires-python"] == ">=3.11"
     lint_select = data["tool"]["ruff"]["lint"]["select"]
     assert "B" in lint_select
+
+
+def test_pyproject_scripts_launcher_forwarding_and_docs():
+    data = _pyproject_data()
+    assert data["project"]["scripts"]["rpm-encrypter"] == "rpm_encrypter.cli:main"
+
+    launcher_c = (ROOT / "launcher" / "launcher.c").read_text(encoding="utf-8")
+    assert "CreateProcessW(launchExe, cmdLine," in launcher_c
+    assert "CreateProcessW(launchExe, NULL," not in launcher_c
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "## CLI Usage" in readme
+    assert "--password-stdin" in readme
+    assert "## Windows Shell Integration" in readme

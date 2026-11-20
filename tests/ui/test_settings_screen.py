@@ -719,3 +719,65 @@ def test_screen_source_avoids_old_ui_and_overlay():
     assert "views.settings_view" not in src
     assert "page.overlay" not in src
     assert ".overlay" not in src
+
+
+# ===================================================== 16. shell integration
+def test_settings_screen_shell_integration_confirm_and_remove(hermetic_cfg, monkeypatch):
+    pytest.importorskip("flet")
+    from rpm_encrypter.services.shell_integration import ShellIntegrationStatus
+
+    state = {"installed": False}
+
+    def fake_status(self):
+        return ShellIntegrationStatus(
+            supported=True,
+            installed=state["installed"],
+            context_menu_installed=state["installed"],
+            vault_association_installed=state["installed"],
+            command_preview="cmd",
+        )
+
+    def fake_install(self):
+        state["installed"] = True
+        return fake_status(self)
+
+    def fake_uninstall(self):
+        state["installed"] = False
+        return fake_status(self)
+
+    monkeypatch.setattr(SettingsController, "shell_integration_status", fake_status)
+    monkeypatch.setattr(SettingsController, "install_shell_integration", fake_install)
+    monkeypatch.setattr(SettingsController, "uninstall_shell_integration", fake_uninstall)
+
+    screen, page, shell = _make_screen()
+    screen.build()
+    assert "Not installed" in screen.shell_status_text.value
+
+    screen._confirm_install_shell_integration()
+    assert len(page.dialogs) == 1
+    assert state["installed"] is False
+
+    screen._install_shell_confirmed()
+    assert state["installed"] is True
+    assert page.dialogs == []
+    assert "Installed" in screen.shell_status_text.value
+
+    screen._uninstall_shell_integration()
+    assert state["installed"] is False
+    assert "Not installed" in screen.shell_status_text.value
+
+
+def test_settings_screen_shell_integration_disabled_when_unsupported(hermetic_cfg, monkeypatch):
+    pytest.importorskip("flet")
+    from rpm_encrypter.services.shell_integration import ShellIntegrationStatus
+
+    monkeypatch.setattr(
+        SettingsController,
+        "shell_integration_status",
+        lambda self: ShellIntegrationStatus(False, False, False, False, ""),
+    )
+    screen, _page, _shell = _make_screen()
+    screen.build()
+    assert screen.install_shell_button.disabled is True
+    assert screen.uninstall_shell_button.disabled is True
+    assert "Windows only" in screen.shell_status_text.value

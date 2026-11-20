@@ -137,6 +137,18 @@ class DecryptScreen:
             return "added"
         return "dup"
 
+    def add_paths(self, paths) -> tuple[int, int]:
+        """Append .vault paths launched from Explorer/CLI. Returns (added, invalid)."""
+        added = invalid = 0
+        for raw in paths:
+            res = self._append_source(str(raw))
+            if res == "added":
+                added += 1
+            elif res == "invalid":
+                invalid += 1
+        self._apply_default_output()
+        return added, invalid
+
     def _apply_default_output(self) -> None:
         if self.paths and not (self.output_field.value or "").strip():
             self.output_field.value = str(Path(self.paths[0]).parent)

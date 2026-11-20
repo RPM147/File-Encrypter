@@ -5,7 +5,7 @@ from datetime import datetime
 
 import flet as ft
 
-from rpm_encrypter.services import APP_NAME, APP_VERSION, AppServices
+from rpm_encrypter.services import APP_NAME, APP_VERSION, AppServices, LaunchRequest
 from rpm_encrypter.storage.config import get_setting
 from .shell import AppShell
 from .theme import build_theme
@@ -21,7 +21,7 @@ async def _clock_loop(shell: AppShell):
         await asyncio.sleep(1)
 
 
-def main(page: ft.Page):
+def main(page: ft.Page, launch_request: LaunchRequest | None = None):
     theme_choice = get_setting("theme", "Dark")
     scale_choice = get_setting("ui_scale", "100%")
     apply_ui_scale(scale_choice)
@@ -61,14 +61,19 @@ def main(page: ft.Page):
     page.on_keyboard_event = shell.on_keyboard_event
 
     page.add(shell.build())
+    if launch_request is not None:
+        shell.apply_launch_request(launch_request)
     shell.maybe_show_update_prompt()
     services.start_update_check(APP_VERSION)
     page.run_task(shell._poll_loop)
     page.run_task(_clock_loop, shell)
 
 
-def run():
-    ft.run(main)
+def run(launch_request: LaunchRequest | None = None):
+    if launch_request is None:
+        ft.run(main)
+    else:
+        ft.run(lambda page: main(page, launch_request))
 
 
 if __name__ == "__main__":

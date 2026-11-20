@@ -147,8 +147,11 @@ def test_cleanup_orphaned_temp_files_targets_rpm_temp_patterns(hermetic_home, tm
 
 def test_stage1_bridge_modules_are_flet_free():
     for rel in (
+        "src/rpm_encrypter/cli.py",
         "src/rpm_encrypter/services/app_services.py",
         "src/rpm_encrypter/services/events.py",
+        "src/rpm_encrypter/services/launch.py",
+        "src/rpm_encrypter/services/shell_integration.py",
         "src/rpm_encrypter/ui/events.py",
     ):
         src = (ROOT / rel).read_text(encoding="utf-8")
@@ -276,3 +279,27 @@ def test_shell_mount_screen_rejects_unknown_key(hermetic_home):
     assert shell._mount_screen("encrypt") is not None
     with pytest.raises(KeyError):
         shell._mount_screen("does_not_exist")
+
+
+def test_shell_apply_launch_request_prefills_encrypt_and_decrypt(hermetic_home, tmp_path):
+    pytest.importorskip("flet")
+    from rpm_encrypter.services.launch import LaunchRequest
+
+    shell, _ = _make_shell(hermetic_home)
+    sample = tmp_path / "doc.txt"
+    vault = tmp_path / "secret.vault"
+    sample.write_bytes(b"a")
+    vault.write_bytes(b"b")
+
+    shell.apply_launch_request(LaunchRequest(mode="gui", tab="encrypt", paths=(str(sample),)))
+    assert shell.active_key == "encrypt"
+    assert shell.encrypt_screen.sources == [str(sample)]
+    assert "1 item(s)" in shell.status_text.value
+
+    shell.apply_launch_request(LaunchRequest(mode="gui", tab="decrypt", paths=(str(vault),)))
+    assert shell.active_key == "decrypt"
+    assert shell.decrypt_screen.paths == [str(vault)]
+    assert shell.decrypt_screen.output_field.value == str(tmp_path)
+
+    shell.apply_launch_request(LaunchRequest(mode="gui", tab="decrypt", paths=(str(sample),)))
+    assert "Only .vault files" in shell.status_text.value

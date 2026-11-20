@@ -204,6 +204,13 @@ class EncryptScreen:
             self.sources.append(path)
             self._render_sources()
 
+    def add_paths(self, paths) -> int:
+        """Append paths launched from Explorer/CLI into the source queue."""
+        before = len(self.sources)
+        for p in paths:
+            self._append_source(str(p))
+        return len(self.sources) - before
+
     def _remove_source(self, path: str) -> None:
         self.sources = [p for p in self.sources if p != path]
         self._render_sources()

@@ -23,6 +23,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "ruff>=0.4.0"]
 
+[project.scripts]
+rpm-encrypter = "rpm_encrypter.cli:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

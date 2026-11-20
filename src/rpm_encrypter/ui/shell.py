@@ -6,7 +6,7 @@ import webbrowser
 
 import flet as ft
 
-from rpm_encrypter.services import APP_NAME, APP_VERSION, AppServices
+from rpm_encrypter.services import APP_NAME, APP_VERSION, AppServices, LaunchRequest
 from rpm_encrypter.services.events import (
     InspectResultEvent,
     IntegrityResultEvent,
@@ -204,6 +204,23 @@ class AppShell:
             c.bgcolor = COLORS["surface_card"] if active else None
             c.content.color = COLORS["accent"] if active else COLORS["text_primary"]
         self._content.content = self._mount_screen(key)
+        self.safe_update()
+
+    def apply_launch_request(self, request: LaunchRequest) -> None:
+        """Navigate and pre-populate sources when launched with Explorer/CLI targets."""
+        if not request.paths or request.tab not in ("encrypt", "decrypt"):
+            return
+        self.navigate(request.tab)
+        if request.tab == "encrypt" and self.encrypt_screen is not None:
+            added = self.encrypt_screen.add_paths(request.paths)
+            if added:
+                self.status_text.value = f"Loaded {added} item(s) for encryption"
+        elif request.tab == "decrypt" and self.decrypt_screen is not None:
+            added, invalid = self.decrypt_screen.add_paths(request.paths)
+            if added:
+                self.status_text.value = f"Loaded {added} vault(s) for decryption"
+            elif invalid:
+                self.status_text.value = "Only .vault files can be decrypted"
         self.safe_update()
 
     def on_keyboard_event(self, e) -> None:

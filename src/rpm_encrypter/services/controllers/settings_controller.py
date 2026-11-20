@@ -21,6 +21,7 @@ from typing import Any
 from rpm_encrypter.storage import config as app_config
 from rpm_encrypter.storage import scanner as vault_scanner
 from rpm_encrypter.storage import versioning
+from rpm_encrypter.services import shell_integration
 from rpm_encrypter.services.constants import APP_NAME, APP_VERSION
 from rpm_encrypter.core import ARGON2_MEMORY_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM
 from rpm_encrypter.storage.wiper import SecureWiper
@@ -477,3 +478,13 @@ class SettingsController(BaseController):
             errors.append(f"config: {exc}")
 
         return ClearTracesResult(errors=errors)
+
+    # --- Windows shell integration --------------------------------------------
+    def shell_integration_status(self) -> shell_integration.ShellIntegrationStatus:
+        return shell_integration.get_status()
+
+    def install_shell_integration(self) -> shell_integration.ShellIntegrationStatus:
+        return shell_integration.install_shell_integration()
+
+    def uninstall_shell_integration(self) -> shell_integration.ShellIntegrationStatus:
+        return shell_integration.uninstall_shell_integration()

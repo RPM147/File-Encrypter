@@ -188,7 +188,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         wsprintfW(launchExe, L"%s\\rpm-encrypter.exe", safeDir);
     }
 
-    /* ---- Launch the real exe ---- */
+    /* ---- Launch the real exe (forwarding lpCmdLine for context menu / .vault open) ---- */
+    while (lpCmdLine && (*lpCmdLine == L' ' || *lpCmdLine == L'\t'))
+        ++lpCmdLine;
+
+    SIZE_T exeLen = (SIZE_T)lstrlenW(launchExe);
+    SIZE_T argLen = (lpCmdLine && *lpCmdLine) ? (SIZE_T)lstrlenW(lpCmdLine) : 0;
+    SIZE_T cmdChars = 1 + exeLen + 1 + (argLen > 0 ? 1 + argLen : 0) + 1;
+    WCHAR *cmdLine = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, cmdChars * sizeof(WCHAR));
+    if (!cmdLine)
+        return 1;
+
+    lstrcpyW(cmdLine, L"\"");
+    lstrcatW(cmdLine, launchExe);
+    lstrcatW(cmdLine, L"\"");
+    if (argLen > 0)
+    {
+        lstrcatW(cmdLine, L" ");
+        lstrcatW(cmdLine, lpCmdLine);
+    }
+
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -196,13 +215,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessW(launchExe, NULL, NULL, NULL, FALSE,
-                        0, NULL, launchDir, &si, &pi))
+    BOOL launched = CreateProcessW(launchExe, cmdLine, NULL, NULL, FALSE,
+                                   0, NULL, launchDir, &si, &pi);
+    DWORD launchErr = launched ? 0 : GetLastError();
+    HeapFree(GetProcessHeap(), 0, cmdLine);
+
+    if (!launched)
     {
         WCHAR msg[512];
         wsprintfW(msg,
             L"rpm-encrypter.exe ba\x015Flat\x0131lamad\x0131.\nHata kodu: %lu",
-            GetLastError());
+            launchErr);
         MessageBoxW(NULL, msg, L"RPM Encrypter", MB_ICONERROR);
         return 1;
     }

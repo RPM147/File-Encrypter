@@ -37,7 +37,7 @@ Known limitation: for very large items the current v4 format writes decrypted ou
    ```
 
 2. **Install the dependencies:**
-   Ensure you have Python 3.9+ installed, then run:
+   Ensure you have Python 3.11+ installed, then run:
    ```bash
    pip install -r requirements.txt
    ```
@@ -50,6 +50,32 @@ Known limitation: for very large items the current v4 format writes decrypted ou
    ```bash
    flet run
    ```
+
+## CLI Usage
+
+`src/main.py` (or the `rpm-encrypter` console script after `pip install -e .`) also supports headless CLI commands without initializing Flet:
+
+```bash
+python src/main.py --version
+python src/main.py encrypt ./notes.txt --recovery-out recovery.txt
+python src/main.py decrypt ./notes.txt.vault -o ./restored
+python src/main.py inspect ./notes.txt.vault --integrity-only --json
+python src/main.py rekey ./notes.txt.vault
+```
+
+Passwords are never accepted as CLI flags; use interactive secure prompts or `--password-stdin` / `--recovery-stdin` for automation.
+
+## Windows Shell Integration
+
+On Windows, you can optionally register user-scoped (`HKCU\Software\Classes`, no Administrator rights required) Explorer integration from **Settings → Windows Shell Integration** or via the CLI:
+
+```powershell
+python src/main.py shell-integration status
+python src/main.py shell-integration install
+python src/main.py shell-integration uninstall
+```
+
+This adds an **Encrypt with RPM Encrypter** right-click entry for files/folders and associates `.vault` double-click opening with the Decrypt tab. Uninstalling removes all RPM Encrypter entries and leaves unrelated `.vault` associations untouched.
 
 ## Building a Desktop Executable
 

@@ -184,6 +184,20 @@ class SettingsScreen:
         self.clear_traces_button = ft.Button(
             "Clear All Local Traces", on_click=self._confirm_clear_traces
         )
+        self.shell_status_text = ft.Text(
+            "",
+            size=TYPE["caption"]["size"],
+            color=COLORS["text_secondary"],
+        )
+        self.install_shell_button = ft.Button(
+            "Install Context Menu & .vault Association",
+            on_click=self._confirm_install_shell_integration,
+        )
+        self.uninstall_shell_button = ft.Button(
+            "Remove Shell Integration",
+            on_click=self._uninstall_shell_integration,
+        )
+        self._refresh_shell_integration_status()
         self.health_button = ft.Button("Run Security Health Check", on_click=self._run_health_check)
 
     def _on_theme_change(self, _event=None) -> None:
@@ -379,6 +393,60 @@ class SettingsScreen:
         else:
             set_screen_status(self.shell, "All local traces cleared")
 
+    def _refresh_shell_integration_status(self) -> None:
+        status = self.controller.shell_integration_status()
+        if not status.supported:
+            self.shell_status_text.value = "Status: Available on Windows only"
+            self.install_shell_button.disabled = True
+            self.uninstall_shell_button.disabled = True
+            return
+        self.install_shell_button.disabled = False
+        self.uninstall_shell_button.disabled = False
+        if status.installed:
+            self.shell_status_text.value = (
+                "Status: Installed (Explorer context menu & .vault double-click)"
+            )
+        elif status.context_menu_installed or status.vault_association_installed:
+            self.shell_status_text.value = "Status: Partially installed"
+        else:
+            self.shell_status_text.value = "Status: Not installed"
+
+    def _confirm_install_shell_integration(self, _event=None) -> None:
+        show_confirm_dialog(
+            self.page,
+            self.shell,
+            title="Install Windows Shell Integration?",
+            body=(
+                "Register user-scoped (HKCU\\Software\\Classes) entries for the "
+                "Explorer right-click 'Encrypt with RPM Encrypter' action and "
+                ".vault double-click association? No administrator rights needed; "
+                "you can remove them anytime here."
+            ),
+            action_label="Install",
+            on_confirm=self._install_shell_confirmed,
+            on_cancel=self._close_dialog,
+            pop_on_confirm=False,
+        )
+
+    def _install_shell_confirmed(self, _event=None) -> None:
+        self.page.pop_dialog()
+        try:
+            self.controller.install_shell_integration()
+        except Exception as exc:
+            set_screen_status(self.shell, f"Shell integration failed: {exc}", is_error=True)
+            return
+        self._refresh_shell_integration_status()
+        set_screen_status(self.shell, "Windows shell integration installed")
+
+    def _uninstall_shell_integration(self, _event=None) -> None:
+        try:
+            self.controller.uninstall_shell_integration()
+        except Exception as exc:
+            set_screen_status(self.shell, f"Shell removal failed: {exc}", is_error=True)
+            return
+        self._refresh_shell_integration_status()
+        set_screen_status(self.shell, "Windows shell integration removed")
+
     def build(self) -> ft.Control:
         register_page_services(self.page, self.version_dir_picker)
         self._refresh_profiles()
@@ -472,6 +540,21 @@ class SettingsScreen:
                             hint_text(PRIVACY_HINT),
                             self.clear_traces_button,
                             hint_text(CLEAR_TRACES_HINT),
+                        ],
+                        stretch=False,
+                    ),
+                    card_panel(
+                        "Windows Shell Integration",
+                        [
+                            self.shell_status_text,
+                            ft.Row(
+                                [self.install_shell_button, self.uninstall_shell_button],
+                                spacing=10,
+                                wrap=True,
+                            ),
+                            hint_text(
+                                "Registers under HKEY_CURRENT_USER only (reversible, no admin rights)."
+                            ),
                         ],
                         stretch=False,
                     ),
