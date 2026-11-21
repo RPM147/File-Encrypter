@@ -57,7 +57,7 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
             if !state.pwgen.generated.is_empty() && ui.button(s.btn_use_in_encrypt).clicked() {
                 state.encrypt.password = state.pwgen.generated.clone();
                 state.encrypt.confirm_password = state.pwgen.generated.clone();
-                state.active_tab = Tab::Encrypt;
+                state.select_tab(Tab::Encrypt);
                 state.set_status(s.status_pw_transferred, false);
             }
         });

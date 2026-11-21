@@ -35,9 +35,51 @@ impl RpmApp {
         }
     }
 
-    fn drain_updates(&mut self) {
+    fn drain_updates(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                WorkerUpdate::PreviewDone {
+                    gen,
+                    path,
+                    bytes,
+                    status,
+                } => {
+                    if self
+                        .state
+                        .inspect
+                        .preview_pending
+                        .as_ref()
+                        .is_some_and(|(g, c)| *g == gen && !c.load(Ordering::Relaxed))
+                    {
+                        self.state.inspect.preview_pending = None;
+                        self.state.busy = false;
+                        self.state.transfer = None;
+                        self.state.inspect.preview =
+                            Some(crate::preview::PreviewState::new(ctx, path, bytes));
+                        self.state.set_status(status, false);
+                    }
+                }
+                WorkerUpdate::PreviewError {
+                    gen,
+                    message,
+                    cancelled,
+                } => {
+                    if self
+                        .state
+                        .inspect
+                        .preview_pending
+                        .as_ref()
+                        .is_some_and(|(g, _)| *g == gen)
+                    {
+                        self.state.inspect.preview_pending = None;
+                        self.state.busy = false;
+                        self.state.transfer = None;
+                        self.state.set_status(message.clone(), !cancelled);
+                        if !cancelled {
+                            self.state.push_log(format!("ERROR: {message}"));
+                        }
+                    }
+                }
                 WorkerUpdate::Progress(snap) => {
                     self.state.progress = snap.fraction;
                     self.state.transfer = Some(snap);
@@ -65,6 +107,9 @@ impl RpmApp {
                 } => {
                     self.state.busy = false;
                     self.state.transfer = None;
+                    if vault_path != std::path::Path::new(self.state.inspect.vault_path.trim()) {
+                        continue;
+                    }
                     self.state.inspect.results = text;
                     self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
@@ -160,7 +205,7 @@ impl eframe::App for RpmApp {
             self.theme_initialized = true;
         }
 
-        self.drain_updates();
+        self.drain_updates(ctx);
         self.handle_keyboard_shortcuts(ctx);
 
         // Unified clipboard auto-clear timer check (Password Gen + Recovery Modal)
@@ -210,6 +255,11 @@ impl eframe::App for RpmApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.state.busy && ui.button(s.btn_cancel).clicked() {
                             self.cancel.store(true, Ordering::Relaxed);
+                            if let Some((_, ref preview_cancel)) =
+                                self.state.inspect.preview_pending
+                            {
+                                preview_cancel.store(true, Ordering::Relaxed);
+                            }
                             self.state.set_status(s.status_cancelling, false);
                         }
                         let bar_resp = ui.add(
@@ -254,7 +304,7 @@ impl eframe::App for RpmApp {
                             .corner_radius(egui::CornerRadius::same(6)),
                     );
                     if resp.clicked() {
-                        self.state.active_tab = tab;
+                        self.state.select_tab(tab);
                     }
                 }
 
@@ -329,5 +379,72 @@ impl eframe::App for RpmApp {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn late_preview_after_escape_is_discarded() {
+        let mut app = RpmApp::new(GuiLaunchIntent {
+            tab: None,
+            paths: vec![],
+        });
+        app.state.select_tab(Tab::Inspect);
+        app.state.busy = true;
+        let (gen, cancel) = app.state.inspect.begin_preview();
+        assert!(app.state.dismiss_modals());
+        assert!(cancel.load(Ordering::Relaxed));
+        app.tx
+            .send(WorkerUpdate::PreviewDone {
+                gen,
+                path: "note".into(),
+                bytes: Zeroizing::new(b"private".to_vec()),
+                status: "ready".into(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(app.state.inspect.preview.is_none());
+    }
+
+    #[test]
+    fn stale_preview_generation_does_not_overwrite_newer_request() {
+        let mut app = RpmApp::new(GuiLaunchIntent {
+            tab: None,
+            paths: vec![],
+        });
+        app.state.select_tab(Tab::Inspect);
+        let (gen1, cancel1) = app.state.inspect.begin_preview();
+        let (gen2, cancel2) = app.state.inspect.begin_preview();
+        assert!(cancel1.load(Ordering::Relaxed));
+        assert!(!cancel2.load(Ordering::Relaxed));
+        app.state.busy = true;
+
+        app.tx
+            .send(WorkerUpdate::PreviewDone {
+                gen: gen1,
+                path: "old".into(),
+                bytes: Zeroizing::new(b"stale".to_vec()),
+                status: "stale".into(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(app.state.busy);
+        assert!(app.state.inspect.preview.is_none());
+
+        app.tx
+            .send(WorkerUpdate::PreviewDone {
+                gen: gen2,
+                path: "new".into(),
+                bytes: Zeroizing::new(b"fresh".to_vec()),
+                status: "fresh".into(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(!app.state.busy);
+        assert!(app.state.inspect.preview.is_some());
     }
 }

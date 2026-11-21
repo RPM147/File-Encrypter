@@ -1,21 +1,21 @@
-# v4.1.0 Release Checklist
+# v4.2.0 Release Checklist
 
 > Türkçe: [RELEASE_CHECKLIST.tr.md](RELEASE_CHECKLIST.tr.md)
 
 ## Before tagging
 
 - [ ] **CI.** On the candidate commit, Windows and Ubuntu CI jobs plus the `dependency-audit` job (`cargo-deny` RustSec, license, and source checks) are green. [CI workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
-- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.1.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.1.0` in Properties → Details.
-- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.1.0` heading with non-empty English release notes underneath.
+- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.2.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.2.0` in Properties → Details.
+- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.2.0` heading with non-empty English release notes underneath.
 - [ ] **Turkish glyphs & i18n.** Open `rpm-encrypter.exe` from the ZIP; verify it starts in Turkish and `TR / EN` switching updates tabs and buttons cleanly (`Şifrele`, `Çöz`, `İncele`). Confirm `Iğdır-ölçü.txt` renders without missing-glyph boxes.
 - [ ] **Drag-and-drop round-trip.** Drop a folder with two test files onto the window to encrypt, then drop the resulting `.vault` onto the window, verify **Decrypt** opens, and confirm extracted file bytes match originals.
-- [ ] **Selective extraction.** Unlock the same vault on **Inspect**, check one of the two files, and click **Extract Selected** into an empty folder; confirm only that file is written with exact contents.
+- [ ] **Selective extraction & RAM-only preview.** Unlock the same vault on **Inspect**, click **Preview** on a UTF-8 text file and an image (verify no temp files are written and closing/`Esc` dismisses cleanly), then check one of the two files and click **Extract Selected** into an empty folder; confirm only that file is written with exact contents.
 - [ ] **Windows right-click (HKCU).** Enable Explorer integration in **Settings** under a standard user account, launch encryption from a test file’s right-click menu, then uninstall integration and verify the menu entry disappears.
 - [ ] **Vault Diff.** Create Vault A and Vault B from test folders (one added, one removed, one modified, one untouched file) and verify the four groups in **Inspect → Vault Comparison** match `rpm-encrypter-cli diff A.vault B.vault --json`.
 - [ ] **Settings & Password Gen.** Set Argon2id to 4 iterations and 2 parallelism with 120% UI scale and click **Save Preferences**; restart and confirm persistence. Enable only Digits + Exclude Ambiguous in **Password Gen** and verify output contains only `2–9`.
-- [ ] **Container Padding & Hidden Vault.** From the GUI **Encrypt** tab, choose `10 MiB`, enable **Hidden Vault (Plausible Deniability)** with separate decoy/hidden sources and passwords, encrypt, and verify exact file size (`10485760` bytes). Verify **Decrypt**, **Inspect**, selective extract, and **Vault Diff** transparently open each compartment when given its credentials, and verify `rekey` is rejected on padded containers (both GUI/CLI: `rpm-encrypter-cli encrypt ... --container-mb 10 --hidden ...`).
+- [ ] **Container Padding & Hidden Vault.** From the GUI **Encrypt** tab, choose `10 MiB`, enable **Hidden Vault (Plausible Deniability)** with separate decoy/hidden sources and passwords, encrypt, and verify exact file size (`10485760` bytes). Verify **Decrypt**, **Inspect**, RAM preview, selective extract, and **Vault Diff** transparently open each compartment when given its credentials, and verify `rekey` returns the neutral unsupported error on padded containers (both GUI/CLI: `rpm-encrypter-cli encrypt ... --container-mb 10 --hidden ...`).
 
 ## After publishing
 
-- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.1.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
-- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.1.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)
+- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.2.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
+- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.2.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)

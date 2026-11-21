@@ -264,6 +264,7 @@ pub fn ui(
                 ));
             });
 
+            let mut requested = None;
             let indices = state.inspect.filtered_indices();
             egui::ScrollArea::vertical()
                 .id_salt("inspect_manifest_list")
@@ -280,6 +281,15 @@ pub fn ui(
                                         state.inspect.selected_paths.remove(&entry.path);
                                     }
                                 }
+                                if ui
+                                    .add_enabled(
+                                        !state.busy,
+                                        egui::Button::new(s.btn_preview).small(),
+                                    )
+                                    .clicked()
+                                {
+                                    requested = Some(entry.path.clone());
+                                }
                                 ui.label(&entry.path);
                                 ui.weak(format!("({})", format_size(entry.size)));
                             });
@@ -288,6 +298,42 @@ pub fn ui(
                 });
 
             ui.add_space(6.0);
+            if let Some(path) = requested {
+                state.inspect.clear_preview();
+                let secret = Zeroizing::new(std::mem::take(if state.inspect.use_recovery {
+                    &mut state.inspect.recovery_phrase
+                } else {
+                    &mut state.inspect.password
+                }));
+                state.inspect.password.zeroize();
+                state.inspect.recovery_phrase.zeroize();
+                if secret.trim().is_empty() {
+                    state.set_status(s.err_enter_pw_or_rec, true);
+                } else {
+                    let vault_path = state
+                        .inspect
+                        .manifest_vault
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(state.inspect.vault_path.trim()));
+                    let target = VaultDiffTarget {
+                        path: vault_path,
+                        use_recovery: state.inspect.use_recovery,
+                        secret,
+                        keyfile: state.inspect.keyfile.clone(),
+                    };
+                    let (gen, preview_cancel) = state.inspect.begin_preview();
+                    state.begin_transfer(s.preview_loading);
+                    worker::spawn_preview(
+                        ctx.clone(),
+                        tx.clone(),
+                        preview_cancel,
+                        gen,
+                        target,
+                        path,
+                        state.config.language,
+                    );
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label(s.lbl_output_folder);
                 ui.text_edit_singleline(&mut state.inspect.extract_output_dir);
@@ -478,4 +524,9 @@ pub fn ui(
                 );
             });
     });
+    if let Some(preview) = &mut state.inspect.preview {
+        if preview.show(ctx, s) {
+            state.inspect.clear_preview();
+        }
+    }
 }

@@ -29,6 +29,7 @@ While Pure Rust avoids Python/Dart garbage-collector string retention and scrubs
 
 - OS page-locking limits (`RLIMIT_MEMLOCK` / working-set quotas) can cause locking to fall back to unlocked memory under pressure.
 - Windows hibernation (`hiberfil.sys`), crash dumps, GPU/OS text-rendering caches (`egui`), or IME history may still retain transient UI input outside the application's control.
+- RAM-only preview (`Inspect → Preview`) streams entries strictly into zeroized memory buffers and clears decrypted buffers/textures on window close, `Esc`, tab change, or vault change, though OS swap/hibernation and GPU driver texture allocations remain outside application control.
 - Use OS full-disk encryption and disable hibernation if your threat model includes physical memory forensics after suspend.
 
 ### Other limitations

@@ -266,7 +266,10 @@ pub fn pack_sources<W: Write>(
     Ok(())
 }
 
-fn sanitize_archive_path(entry_path: &Path, max_depth: usize) -> Result<PathBuf, StorageError> {
+pub(crate) fn sanitize_archive_path(
+    entry_path: &Path,
+    max_depth: usize,
+) -> Result<PathBuf, StorageError> {
     let raw = entry_path.to_string_lossy();
     if raw.contains('\0') {
         return Err(StorageError::InvalidPath(
@@ -362,11 +365,49 @@ fn unpack_tar_stream<R: Read>(
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
     fs::create_dir_all(dest_dir)?;
-    let mut archive = Archive::new(reader);
     let mut file_count = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    visit_tar_entries(reader, limits, cancel, |rel, entry| {
+        if let Some(selected) = filter {
+            let rel_unix = rel.to_string_lossy().replace('\\', "/");
+            if !matches_selector(&rel_unix, selected) {
+                return Ok(());
+            }
+        }
+        let out_path = dest_dir.join(rel);
+
+        if entry.header().entry_type() == EntryType::Directory {
+            fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out_file = File::create(&out_path)?;
+            loop {
+                check_cancelled(cancel)?;
+                let n = entry.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                out_file.write_all(&buf[..n])?;
+            }
+            out_file.flush()?;
+            file_count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(file_count)
+}
+
+pub(crate) fn visit_tar_entries<R: Read>(
+    reader: R,
+    limits: UnpackLimits,
+    cancel: Option<&AtomicBool>,
+    mut visit: impl FnMut(&Path, &mut tar::Entry<'_, R>) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let mut archive = Archive::new(reader);
     let mut entries_seen = 0u64;
     let mut total_bytes = 0u64;
-    let mut buf = [0u8; 64 * 1024];
 
     for entry_res in archive.entries()? {
         check_cancelled(cancel)?;
@@ -399,34 +440,9 @@ fn unpack_tar_stream<R: Read>(
                 limits.max_total_bytes
             )));
         }
-        if let Some(selected) = filter {
-            let rel_unix = rel.to_string_lossy().replace('\\', "/");
-            if !matches_selector(&rel_unix, selected) {
-                continue;
-            }
-        }
-        let out_path = dest_dir.join(&rel);
-
-        if etype == EntryType::Directory {
-            fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out_file = File::create(&out_path)?;
-            loop {
-                check_cancelled(cancel)?;
-                let n = entry.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                out_file.write_all(&buf[..n])?;
-            }
-            out_file.flush()?;
-            file_count += 1;
-        }
+        visit(&rel, &mut entry)?;
     }
-    Ok(file_count)
+    Ok(())
 }
 
 /// Safely unpack only the entries matching `selected_paths` (exact file or folder prefix)

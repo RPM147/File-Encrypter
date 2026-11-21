@@ -3,6 +3,19 @@
 use rpm_storage::config::AppLanguage;
 
 pub struct Strings {
+    pub btn_preview: &'static str,
+    pub preview_title: &'static str,
+    pub preview_ram: &'static str,
+    pub preview_binary: &'static str,
+    pub preview_image_error: &'static str,
+    pub preview_loading: &'static str,
+    pub preview_ready: &'static str,
+    pub preview_cancelled: &'static str,
+    pub preview_failed: &'static str,
+    pub preview_limit: &'static str,
+    pub preview_close: &'static str,
+    pub preview_prev: &'static str,
+    pub preview_next: &'static str,
     pub app_title: &'static str,
     pub app_badge: &'static str,
     pub drop_banner: &'static str,
@@ -205,6 +218,19 @@ pub struct Strings {
 }
 
 pub const TR: Strings = Strings {
+    btn_preview: "Önizle",
+    preview_title: "Dosya önizlemesi",
+    preview_ram: "Yalnızca RAM (Diske yazılmadı)",
+    preview_binary: "Bu ikili dosya türü desteklenmiyor.",
+    preview_image_error: "Görsel okunamadı veya boyut sınırını aşıyor.",
+    preview_loading: "Önizleme doğrulanıyor…",
+    preview_ready: "Önizleme hazır",
+    preview_cancelled: "Önizleme iptal edildi",
+    preview_failed: "Önizleme açılamadı.",
+    preview_limit: "Önizleme boyut sınırı aşıldı.",
+    preview_close: "Kapat",
+    preview_prev: "Önceki sayfa",
+    preview_next: "Sonraki sayfa",
     app_title: "RPM Encrypter",
     app_badge: "Vault v5 • Saf Rust",
     drop_banner: "Şifrelemek için dosya/klasör, çözmek için .vault dosyasını pencereye bırakın",
@@ -396,6 +422,19 @@ pub const TR: Strings = Strings {
 };
 
 pub const EN: Strings = Strings {
+    btn_preview: "Preview",
+    preview_title: "File preview",
+    preview_ram: "RAM-Only (Zero-Disk)",
+    preview_binary: "Unsupported binary file.",
+    preview_image_error: "Invalid image or image size limit exceeded.",
+    preview_loading: "Verifying preview…",
+    preview_ready: "Preview ready",
+    preview_cancelled: "Preview cancelled",
+    preview_failed: "Preview failed.",
+    preview_limit: "Preview size limit exceeded.",
+    preview_close: "Close",
+    preview_prev: "Previous page",
+    preview_next: "Next page",
     app_title: "RPM Encrypter",
     app_badge: "Vault v5 • Pure Rust",
     drop_banner: "Drop files/folders to Encrypt or .vault files to Decrypt",

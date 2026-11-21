@@ -10,6 +10,7 @@ name = "rpm-encrypter"
 path = "src/main.rs"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 eframe.workspace = true
 rand.workspace = true
 rfd.workspace = true

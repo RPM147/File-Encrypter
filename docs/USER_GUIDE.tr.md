@@ -50,7 +50,7 @@ Gizli bölmeyi çözmek veya incelemek için `decrypt`, `inspect` veya `diff` ko
 Tüm kasayı açmadan içeriği kontrol etmek veya yalnızca belirli dosyaları çıkarmak için **İncele** sekmesini kullanın:
 
 - **Bütünlük Kontrolü (Parolasız):** Kasa başlığını, tüm veri parçalarının (chunk) çerçeve yapısını, sonda bozuk/artık bayt bulunmadığını (veya konteyner boyutunu) ve dosyanın SHA-256 özetini parola girmeden doğrular.
-- **Meta Veriyi İncele ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra arama kutusu ve onay kutularıyla yalnızca istediğiniz dosya/klasörleri seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda seçilen bölmenin tüm şifreli parçaları yine doğrulanır; yalnızca seçtiğiniz öğeler diske yazılır.)*
+- **Meta Veriyi İncele, RAM-İçi Önizleme ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra herhangi bir dosyanın yanındaki **Önizle** düğmesiyle (`16 MiB` sınırına kadar) UTF-8 metin veya görselleri (`PNG/JPEG/WebP/GIF/BMP`) diske tek bayt geçici dosya yazmadan yalnızca RAM içinde görüntüleyebilirsiniz (önizleme yalnızca tüm bölme AEAD doğrulamasından geçtikten sonra açılır; pencere kapatma, `Esc`, sekme veya kasa değişiminde bellek sıfırlanır). Dilerseniz onay kutularıyla seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda seçilen bölmenin tüm şifreli parçaları yine doğrulanır.)*
 
 ## İki kasayı karşılaştırma
 
@@ -112,11 +112,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.1.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.2.0/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.1.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.1.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.2.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.2.0
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)

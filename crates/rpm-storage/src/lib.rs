@@ -6,6 +6,8 @@ pub mod error;
 pub mod launch;
 pub mod packager;
 pub mod pipe;
+mod preview;
+pub use preview::{extract_entry_to_memory_v5, DEFAULT_PREVIEW_MAX_BYTES};
 pub mod shell_integration;
 pub mod wiper;
 pub mod workflow;

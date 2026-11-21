@@ -52,6 +52,31 @@ fn hidden_storage_end_to_end_full_and_selective_extract_with_tamper_rollback() {
     assert_eq!(decoy_meta.file_count, 2);
     assert_eq!(hidden_meta.file_count, 3);
 
+    let entries_before = fs::read_dir(dir.path()).unwrap().count();
+    let preview = |password: &[u8], path| {
+        rpm_storage::extract_entry_to_memory_v5(
+            &vault,
+            Auth::Password {
+                password,
+                keyfile_hash: None,
+            },
+            path,
+            rpm_storage::DEFAULT_PREVIEW_MAX_BYTES,
+            Arc::new(|_, _| {}),
+            cancel.clone(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        &preview(b"DecoyPw!1", "./decoy/note.txt")[..],
+        b"public decoy memo"
+    );
+    assert_eq!(
+        *preview(b"SecretPw!2", "secret/sub/beta.bin"),
+        vec![0x5a; 40 * 1024]
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries_before);
+
     // 1. Decrypting with decoy password extracts ONLY decoy folder.
     let decoy_out = dir.path().join("decoy_out");
     let dec_d = decrypt_vault_v5(

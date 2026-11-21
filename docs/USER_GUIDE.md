@@ -50,7 +50,7 @@ Drag and drop `.vault` files onto the window. On the **Decrypt** tab, enter the 
 Use the **Inspect** tab to verify integrity or restore specific files without writing the whole archive to disk:
 
 - **Integrity Check (No Password):** Verifies the vault header, chunk framing, exact EOF/container-size boundary, and full-file SHA-256 digest without needing credentials.
-- **Inspect Metadata & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase, filter or check the files/folders you want, and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before promoted files are written atomically.)*
+- **Inspect Metadata, RAM-Only Preview & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase, click **Preview** beside any file (up to `16 MiB`) to view UTF-8 text or images (`PNG/JPEG/WebP/GIF/BMP`) purely in RAM after full AEAD authentication completes with zero temporary files on disk (closing, `Esc`, switching tabs, or changing vaults scrubs the preview buffer), or check files/folders and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before anything is returned or written to disk.)*
 
 ## Comparing two vaults (Vault Diff)
 
@@ -111,11 +111,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.1.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.2.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.1.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.1.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.2.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.2.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.

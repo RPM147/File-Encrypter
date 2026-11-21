@@ -1006,3 +1006,71 @@ pub fn spawn_rekey(
         }
     });
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_preview(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    gen: u64,
+    target: VaultDiffTarget,
+    path: String,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let s = crate::i18n::strings(lang);
+        let result = (|| {
+            let recovery = target
+                .use_recovery
+                .then(|| mnemonic_to_entropy(&target.secret))
+                .transpose()
+                .map_err(StorageError::from)?;
+            let key = if recovery.is_none() {
+                load_optional_keyfile(target.keyfile.as_deref())?
+            } else {
+                None
+            };
+            let auth = match recovery.as_ref() {
+                Some(key) => Auth::RecoveryKey(key),
+                None => Auth::Password {
+                    password: target.secret.as_bytes(),
+                    keyfile_hash: key.as_ref(),
+                },
+            };
+            rpm_storage::extract_entry_to_memory_v5(
+                &target.path,
+                auth,
+                &path,
+                rpm_storage::DEFAULT_PREVIEW_MAX_BYTES,
+                make_progress_cb(tx.clone(), ctx.clone(), None),
+                cancel,
+            )
+        })();
+        let msg = match result {
+            Ok(bytes) => WorkerUpdate::PreviewDone {
+                gen,
+                path,
+                bytes,
+                status: s.preview_ready.into(),
+            },
+            Err(StorageError::Cancelled | StorageError::Crypto(CryptoError::Cancelled)) => {
+                WorkerUpdate::PreviewError {
+                    gen,
+                    message: s.preview_cancelled.into(),
+                    cancelled: true,
+                }
+            }
+            Err(StorageError::LimitExceeded(_)) => WorkerUpdate::PreviewError {
+                gen,
+                message: s.preview_limit.into(),
+                cancelled: false,
+            },
+            Err(err) => WorkerUpdate::PreviewError {
+                gen,
+                message: format!("{} ({err})", s.preview_failed),
+                cancelled: false,
+            },
+        };
+        send(&tx, &ctx, msg);
+    });
+}

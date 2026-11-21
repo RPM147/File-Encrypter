@@ -13,3 +13,5 @@ use eframe::egui;
 pub fn load_app_icon() -> Option<egui::IconData> {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok()
 }
+
+pub mod preview;

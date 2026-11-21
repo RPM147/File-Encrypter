@@ -148,6 +148,17 @@ impl Tab {
 
 #[derive(Debug)]
 pub enum WorkerUpdate {
+    PreviewDone {
+        gen: u64,
+        path: String,
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+        status: String,
+    },
+    PreviewError {
+        gen: u64,
+        message: String,
+        cancelled: bool,
+    },
     Progress(TransferSnapshot),
     Log(String),
     EncryptDone {
@@ -267,6 +278,9 @@ impl Drop for DecryptFields {
 }
 
 pub struct InspectFields {
+    pub preview: Option<crate::preview::PreviewState>,
+    pub(crate) preview_gen: u64,
+    pub(crate) preview_pending: Option<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     pub vault_path: String,
     pub keyfile: Option<PathBuf>,
     pub use_recovery: bool,
@@ -282,7 +296,23 @@ pub struct InspectFields {
 }
 
 impl InspectFields {
+    pub fn clear_preview(&mut self) {
+        self.preview = None;
+        if let Some((_, cancel)) = self.preview_pending.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn begin_preview(&mut self) -> (u64, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.clear_preview();
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        let gen = self.preview_gen;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.preview_pending = Some((gen, std::sync::Arc::clone(&cancel)));
+        (gen, cancel)
+    }
     pub fn set_manifest(&mut self, vault: PathBuf, entries: Vec<FileManifestEntry>) {
+        self.clear_preview();
         if self.extract_output_dir.trim().is_empty() {
             if let Some(parent) = vault.parent().filter(|p| !p.as_os_str().is_empty()) {
                 self.extract_output_dir = parent.display().to_string();
@@ -295,6 +325,7 @@ impl InspectFields {
     }
 
     pub fn reset_manifest(&mut self) {
+        self.clear_preview();
         self.manifest.clear();
         self.manifest_vault = None;
         self.selected_paths.clear();
@@ -329,6 +360,7 @@ impl InspectFields {
 
 impl Drop for InspectFields {
     fn drop(&mut self) {
+        self.clear_preview();
         self.password.zeroize();
         self.recovery_phrase.zeroize();
     }
@@ -524,6 +556,9 @@ impl Default for AppState {
                 output_dir: String::new(),
             },
             inspect: InspectFields {
+                preview: None,
+                preview_gen: 0,
+                preview_pending: None,
                 vault_path: String::new(),
                 keyfile: None,
                 use_recovery: false,
@@ -685,12 +720,19 @@ impl AppState {
         self.rekey.confirm_password.zeroize();
     }
 
+    pub fn select_tab(&mut self, tab: Tab) {
+        if tab != Tab::Inspect {
+            self.inspect.clear_preview();
+        }
+        self.active_tab = tab;
+    }
+
     pub fn handle_shortcut_tab(&mut self, digit: u8) -> bool {
         if let Some(&tab) = digit
             .checked_sub(1)
             .and_then(|idx| Tab::ALL.get(idx as usize))
         {
-            self.active_tab = tab;
+            self.select_tab(tab);
             true
         } else {
             false
@@ -698,7 +740,8 @@ impl AppState {
     }
 
     pub fn dismiss_modals(&mut self) -> bool {
-        let mut closed = false;
+        let mut closed = self.inspect.preview.is_some() || self.inspect.preview_pending.is_some();
+        self.inspect.clear_preview();
         if self.show_shell_install_modal {
             self.show_shell_install_modal = false;
             closed = true;
@@ -730,7 +773,7 @@ impl AppState {
 
         match target {
             Tab::Decrypt => {
-                self.active_tab = Tab::Decrypt;
+                self.select_tab(Tab::Decrypt);
                 let mut added = 0usize;
                 let mut skipped = 0usize;
                 for p in paths {
@@ -767,19 +810,19 @@ impl AppState {
             }
             Tab::Inspect => {
                 if let Some(first) = paths.into_iter().next() {
-                    self.active_tab = Tab::Inspect;
+                    self.select_tab(Tab::Inspect);
                     self.inspect.vault_path = first.display().to_string();
                     self.inspect.reset_manifest();
                 }
             }
             Tab::Rekey => {
                 if let Some(first) = paths.into_iter().next() {
-                    self.active_tab = Tab::Rekey;
+                    self.select_tab(Tab::Rekey);
                     self.rekey.vault_path = first.display().to_string();
                 }
             }
             _ => {
-                self.active_tab = Tab::Encrypt;
+                self.select_tab(Tab::Encrypt);
                 let mut added = 0usize;
                 for p in paths {
                     if !self.encrypt.sources.contains(&p) {
@@ -807,7 +850,7 @@ impl AppState {
         if !paths.is_empty() {
             self.add_dropped_paths(paths, tab);
         } else if let Some(t) = tab {
-            self.active_tab = t;
+            self.select_tab(t);
         }
     }
 

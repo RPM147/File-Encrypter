@@ -1111,3 +1111,69 @@ fn rekey_unsupported_error_is_neutral_and_localized() {
         );
     }
 }
+
+#[test]
+fn preview_types_cleanup_and_localization() {
+    use rpm_gui::preview::{classify_preview, ClassifiedPreview, PreviewState};
+    use zeroize::Zeroizing;
+    assert!(
+        matches!(classify_preview("notes","Türkçe".as_bytes()),ClassifiedPreview::Text(t) if *t=="Türkçe")
+    );
+    assert!(matches!(
+        classify_preview("data", &[65, 0]),
+        ClassifiedPreview::Binary
+    ));
+    assert!(matches!(
+        classify_preview("data", &[255]),
+        ClassifiedPreview::Binary
+    ));
+    assert!(matches!(
+        classify_preview("broken.jpg", b"hello"),
+        ClassifiedPreview::InvalidImage
+    ));
+    let png = include_bytes!("../assets/icon.png");
+    assert!(matches!(classify_preview("icon.PNG",png),ClassifiedPreview::Image(i) if i.width()>0));
+    let ctx = egui::Context::default();
+    let preview = || {
+        Some(PreviewState::new(
+            &ctx,
+            "notes.txt".into(),
+            Zeroizing::new(b"secret".to_vec()),
+        ))
+    };
+    let mut st = AppState::default();
+    st.inspect.preview = preview();
+    st.inspect.clear_preview();
+    assert!(st.inspect.preview.is_none());
+    st.inspect.preview = preview();
+    assert!(st.dismiss_modals());
+    assert!(st.inspect.preview.is_none());
+    st.inspect.preview = preview();
+    st.inspect.reset_manifest();
+    assert!(st.inspect.preview.is_none());
+    st.select_tab(Tab::Inspect);
+    st.inspect.preview = preview();
+    st.select_tab(Tab::Settings);
+    assert!(st.inspect.preview.is_none());
+    let labels = |s: &i18n::Strings| {
+        [
+            s.btn_preview,
+            s.preview_title,
+            s.preview_ram,
+            s.preview_binary,
+            s.preview_image_error,
+            s.preview_loading,
+            s.preview_ready,
+            s.preview_cancelled,
+            s.preview_failed,
+            s.preview_limit,
+            s.preview_close,
+            s.preview_prev,
+            s.preview_next,
+        ]
+    };
+    for (tr, en) in labels(&i18n::TR).into_iter().zip(labels(&i18n::EN)) {
+        assert!(!tr.is_empty() && !en.is_empty());
+        assert_ne!(tr, en);
+    }
+}

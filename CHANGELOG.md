@@ -1,5 +1,10 @@
 # Changelog
 
+## v4.2.0
+
+- **RAM-Only Zero-Disk Preview:** Added in-memory file inspection (`extract_entry_to_memory_v5` in `rpm-storage` and the **Inspect → Preview** window in `rpm-gui`) across standard, padded, and hidden compartments. Previewed entries up to `16 MiB` are held in zeroized buffers without writing temporary plaintext files to disk, wait until full compartment AEAD authentication completes before display, support paginated UTF-8 text and bounded `PNG/JPEG/WebP/GIF/BMP` image rendering, and clear immediately on close, `Esc`, tab switch, or vault change.
+- **Neutral Re-Key Error Reporting:** Unavailable in-place `rekey` on fixed-size containers now returns `CryptoError::UnsupportedOperation` with neutral, localized wording instead of disclosing container padding details.
+
 ## v4.1.0
 
 - **Container Padding:** Padded `.vault` containers (`--container-mb` in CLI and **Container Size (Padding)** presets or custom MiB in GUI Encrypt) conceal true archive size with `OsRng` random padding while using the same public `VaultHeader` layout (`container_size` + `container_salt`) and enforcing exact-size integrity checks.
