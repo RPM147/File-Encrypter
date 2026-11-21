@@ -1,5 +1,12 @@
 # Changelog
 
+## v4.0.2
+
+- Vault Diff compares authenticated file lists from two vault headers. The core API, CLI `diff` command and desktop Inspect tab report added, removed, changed and unchanged paths using file sizes and modification times.
+- Upgraded the desktop GUI from eframe 0.31 to 0.37 and removed the obsolete RustSec exceptions for `quick-xml 0.30.0`.
+- Settings now expose Argon2id iterations and parallelism and save the interface scale (`ui_scale_percent`, 80–150%).
+- The desktop password generator lets you select uppercase letters, lowercase letters, digits and symbols, and exclude visually ambiguous characters.
+
 ## v4.0.1
 
 - The desktop app and CLI show live throughput and an estimated time remaining during encryption and decryption. The CLI adds `--progress auto|always|never`.

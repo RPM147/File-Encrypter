@@ -28,6 +28,22 @@ Tüm kasayı açmadan içeriği kontrol etmek veya yalnızca belirli dosyaları 
 - **Bütünlük Kontrolü (Parolasız):** Kasa başlığını, tüm veri parçalarının (chunk) çerçeve yapısını, sonda bozuk/artık bayt bulunmadığını ve dosyanın SHA-256 özetini parola girmeden doğrular.
 - **Meta Veriyi İncele ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra arama kutusu ve onay kutularıyla yalnızca istediğiniz dosya/klasörleri seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda kasanın tüm şifreli parçaları yine doğrulanır; yalnızca seçtiğiniz öğeler diske yazılır.)*
 
+## İki kasayı karşılaştırma
+
+**İncele → Kasa Karşılaştırma (Vault Diff)** bölümünde önceki kasayı **Kasa A**, sonraki kasayı **Kasa B** olarak seçin. Her biri için parolayı ve varsa bağlı anahtar dosyasını girin veya kurtarma cümlesini kullanın. **Kasaları Karşılaştır** düğmesi yalnızca başlıklardaki dosya listelerini okur. Eklenen ve silinen yollar A’dan B’ye göre gösterilir. “Değişmedi” sonucu yol, boyut ve değişiklik zamanının eşleştiği anlamına gelir. Dosya içeriklerinin birebir aynı olduğunu kanıtlamaz.
+
+Terminalde aynı karşılaştırmayı yapmak için aşağıdaki komutu kullanın. JSON çıktı için `--json`, anahtar dosyaları için `--keyfile-a` veya `--keyfile-b`, kurtarma cümlesiyle açacağınız taraf için `--recovery-a` veya `--recovery-b` ekleyebilirsiniz.
+
+```sh
+./rpm-encrypter-cli diff ./onceki.vault ./sonraki.vault
+```
+
+## Ayarlar ve Parola Üretici
+
+**Ayarlar** sekmesinde Argon2id yineleme sayısı (1–10), paroladan anahtar türetirken yapılan iş miktarını belirler. Paralellik (1–16), bu işin kaç şeride bölüneceğini ayarlar. Arayüzü büyütmek veya küçültmek için %80–150 arasındaki hazır ölçeklerden birini seçin. Tercihlerin sonraki açılışta da kullanılması için **Tercihleri Kaydet** düğmesine basın.
+
+**Parola Üretici** sekmesinde büyük harf, küçük harf, rakam ve sembol sınıflarından en az birini seçin. Parolayı elle yazacaksanız karıştırılabilir karakterleri hariç tutarak `0`, `O`, `1`, `l` ve `I` karakterlerini elemeniz mümkün.
+
 ## Parolayı değiştirme
 
 **Anahtar Değiştir** sekmesinde kasayı seçin. Mevcut parolayı, varsa bağlı anahtar dosyasını ve yeni parolayı girin. Yeni parolayı doğrulayıp **Anahtarı Güncelle** düğmesine basın.
@@ -66,11 +82,11 @@ Bu işlem yalnızca kasa anahtarını yeni parolayla yeniden şifreler. Bu adım
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.0.1/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.0.2/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.0.1
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.0.1
+.\packaging\winget\generate-manifests.ps1 -Version 4.0.2
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.0.2
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)
