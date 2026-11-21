@@ -96,12 +96,12 @@ pub fn hash_keyfile_reader(reader: &mut impl Read) -> Result<SecretKey, CryptoEr
     Ok(key)
 }
 
-/// Derive a 32-byte KEK from `password`, `salt`, and optional `keyfile_hash`.
-pub fn derive_kek(
+fn derive_kek_with_domain(
     password: &[u8],
     salt: &[u8; SALT_SIZE],
     params: &KdfParams,
     keyfile_hash: Option<&SecretKey>,
+    hkdf_info: &[u8],
 ) -> Result<SecretKey, CryptoError> {
     params.validate()?;
     if password.is_empty() {
@@ -128,9 +128,42 @@ pub fn derive_kek(
     let hk_salt = keyfile_hash.map(|k| k.as_bytes().as_slice()).unwrap_or(&[]);
     let hk = Hkdf::<Sha256>::new(Some(hk_salt), raw_key.as_bytes());
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(b"rpm-v5-kek", out.as_mut())
+    hk.expand(hkdf_info, out.as_mut())
         .map_err(|_| CryptoError::CryptoFailure)?;
     Ok(SecretKey::new(*out))
+}
+
+/// Derive a 32-byte KEK from `password`, `salt`, and optional `keyfile_hash`.
+pub fn derive_kek(
+    password: &[u8],
+    salt: &[u8; SALT_SIZE],
+    params: &KdfParams,
+    keyfile_hash: Option<&SecretKey>,
+) -> Result<SecretKey, CryptoError> {
+    derive_kek_with_domain(password, salt, params, keyfile_hash, b"rpm-v5-kek")
+}
+
+/// Derive a domain-separated 32-byte KEK for opening a hidden compartment
+/// using the outer container's `container_salt`.
+pub fn derive_hidden_kek(
+    password: &[u8],
+    container_salt: &[u8; SALT_SIZE],
+    params: &KdfParams,
+    keyfile_hash: Option<&SecretKey>,
+) -> Result<SecretKey, CryptoError> {
+    let mut h = Sha256::new();
+    h.update(b"RPMV5-HIDDEN-ARGON-SALT");
+    h.update(container_salt);
+    let mut derived_salt: [u8; SALT_SIZE] = h.finalize().into();
+    let res = derive_kek_with_domain(
+        password,
+        &derived_salt,
+        params,
+        keyfile_hash,
+        b"rpm-v5-hidden-kek",
+    );
+    derived_salt.zeroize();
+    res
 }
 
 /// Derive a 32-byte recovery KEK from 32-byte BIP-39 entropy.
@@ -155,4 +188,21 @@ pub fn derive_stream_nonce_prefix(
     hk.expand(b"rpm-v5-stream-nonce", &mut prefix)
         .map_err(|_| CryptoError::CryptoFailure)?;
     Ok(prefix)
+}
+
+/// Derive a 5-byte XOR mask for hidden chunk frame headers (`plain_len || final_flag`)
+/// so hidden payload chunks remain indistinguishable from random container padding.
+pub fn derive_hidden_frame_mask(
+    dek: &SecretKey,
+    hidden_ctx: &[u8; 32],
+    chunk_idx: u32,
+) -> Result<[u8; 5], CryptoError> {
+    let hk = Hkdf::<Sha256>::new(Some(hidden_ctx), dek.as_bytes());
+    let mut info = [0u8; 28];
+    info[..24].copy_from_slice(b"rpm-v5-hidden-frame-mask");
+    info[24..28].copy_from_slice(&chunk_idx.to_be_bytes());
+    let mut mask = [0u8; 5];
+    hk.expand(&info, &mut mask)
+        .map_err(|_| CryptoError::CryptoFailure)?;
+    Ok(mask)
 }

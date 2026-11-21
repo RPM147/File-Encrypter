@@ -353,6 +353,7 @@ pub fn spawn_encrypt(
             recovery_key: Some(recovery_entropy),
             keyfile_hash,
             compressed: compress,
+            container_size_bytes: None,
         };
 
         let base_dir = output_dir.unwrap_or_else(|| {

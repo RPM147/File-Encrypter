@@ -211,6 +211,8 @@ fn worker_reports_format_cleanly_in_tr_and_en() {
         argon_memory_kib: 65_536,
         argon_iterations: 3,
         argon_parallelism: 4,
+        container_size: None,
+        is_hidden_compartment: false,
         metadata: VaultMetadata {
             filename: "belgeler".into(),
             source_type: "folder".into(),

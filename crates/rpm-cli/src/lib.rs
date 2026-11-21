@@ -344,6 +344,7 @@ where
                 recovery_key: Some(rec_entropy),
                 keyfile_hash,
                 compressed: !no_compress,
+                container_size_bytes: None,
             };
 
             let base_dir = output_dir.as_deref().unwrap_or_else(|| {

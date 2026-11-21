@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::constants::{
     AES_KEY_SIZE, AES_NONCE_SIZE, ALL_KNOWN_FLAGS, CHUNKED_CIPHER_NAME, FLAG_COMPRESSED,
-    FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY, KDF_NAME, MAX_CHUNK_SIZE, MAX_HEADER_SIZE, MIN_CHUNK_SIZE,
-    SALT_SIZE, VAULT_MAGIC, VAULT_VERSION,
+    FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY, KDF_NAME, MAX_CHUNK_SIZE, MAX_CONTAINER_SIZE,
+    MAX_HEADER_SIZE, MIN_CHUNK_SIZE, MIN_CONTAINER_SIZE, SALT_SIZE, VAULT_MAGIC, VAULT_VERSION,
 };
 use crate::error::CryptoError;
 use crate::kdf::{derive_kek, derive_recovery_kek, KdfParams};
@@ -76,6 +76,10 @@ pub struct VaultHeader {
     pub recovery_slot: Option<RecoverySlot>,
     pub meta_nonce: String,
     pub encrypted_meta_len: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_salt: Option<String>,
 }
 
 impl VaultHeader {
@@ -103,13 +107,29 @@ impl VaultHeader {
         decode_fixed::<SALT_SIZE>(&self.kdf.salt, "kdf.salt")
     }
 
+    pub fn container_salt_bytes(&self) -> Result<Option<[u8; SALT_SIZE]>, CryptoError> {
+        match (&self.container_size, &self.container_salt) {
+            (Some(_), Some(b64)) => Ok(Some(decode_fixed::<SALT_SIZE>(b64, "container_salt")?)),
+            (None, None) => Ok(None),
+            _ => Err(CryptoError::InvalidFormat(
+                "header container_size inconsistent with container_salt".into(),
+            )),
+        }
+    }
+
     pub fn payload_context(&self) -> [u8; 32] {
-        payload_context(
+        let container_salt = self
+            .container_salt
+            .as_deref()
+            .and_then(|s| decode_fixed::<SALT_SIZE>(s, "container_salt").ok());
+        payload_context_with_container(
             self.version,
             &self.cipher,
             self.chunk_size,
             self.is_compressed(),
             &self.vault_id,
+            self.container_size,
+            container_salt.as_ref(),
         )
     }
 }
@@ -132,6 +152,22 @@ pub fn payload_context(
     compressed: bool,
     vault_id: &str,
 ) -> [u8; 32] {
+    payload_context_with_container(
+        version, cipher, chunk_size, compressed, vault_id, None, None,
+    )
+}
+
+/// Container-aware domain context. Identical to [`payload_context`] when
+/// `container_size` / `container_salt` are `None` for backwards compatibility.
+pub fn payload_context_with_container(
+    version: u8,
+    cipher: &str,
+    chunk_size: u32,
+    compressed: bool,
+    vault_id: &str,
+    container_size: Option<u64>,
+    container_salt: Option<&[u8; SALT_SIZE]>,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"RPMV5-CTX");
     h.update([version]);
@@ -140,6 +176,11 @@ pub fn payload_context(
     h.update(chunk_size.to_be_bytes());
     h.update([u8::from(compressed)]);
     h.update(vault_id.as_bytes());
+    if let (Some(sz), Some(csalt)) = (container_size, container_salt) {
+        h.update(b"RPMV5-CONTAINER");
+        h.update(sz.to_be_bytes());
+        h.update(csalt);
+    }
     h.finalize().into()
 }
 
@@ -406,6 +447,14 @@ pub fn validate_header(header: &VaultHeader) -> Result<(), CryptoError> {
     {
         return Err(CryptoError::InvalidFormat("invalid vault_id".into()));
     }
+    if let Some(sz) = header.container_size {
+        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&sz) {
+            return Err(CryptoError::InvalidFormat(format!(
+                "container_size {sz} outside [{MIN_CONTAINER_SIZE}, {MAX_CONTAINER_SIZE}]"
+            )));
+        }
+    }
+    let _ = header.container_salt_bytes()?;
     Ok(())
 }
 
@@ -425,6 +474,7 @@ pub fn random_vault_id() -> String {
     s
 }
 
+#[derive(Clone, Copy)]
 pub enum Auth<'a> {
     Password {
         password: &'a [u8],

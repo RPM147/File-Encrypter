@@ -38,6 +38,12 @@ While Pure Rust avoids Python/Dart garbage-collector string retention and scrubs
 - **No v4 backward compatibility.** Vault Format v5 intentionally supersedes legacy Python v4 archives (the retired v4 codebase is preserved under `legacy/`).
 - **Host trust.** RPM Encrypter cannot defend against malware, keyloggers, compromised OS kernels, or physical hardware implants running on your machine.
 
+## Container Padding & Hidden Vault (Plausible Deniability)
+
+The design targets an observer who has one offline copy of a padded container and lacks the hidden vault credentials. Ordinary padded containers and containers holding a hidden vault use the exact same public header layout (`container_size` and `container_salt`), with zero hidden-vault flags. For containers of equal size, inspecting the bytes cannot distinguish encrypted hidden metadata, masked frame prefixes, or hidden chunks from `OsRng` random padding.
+
+Padded containers disallow `rekey` on both forms so command behavior never reveals whether a hidden compartment exists. As inherent operational limits outside `.vault` byte authentication, multiple container snapshots over time can reveal deltas, and OS recent-file lists, thumbnails, backups, swap/hibernation files, or residual SSD blocks can independently reveal activity.
+
 ## Reporting a vulnerability
 
 If you find a security issue, please open an issue without posting sensitive exploit details in public, or contact the maintainer.

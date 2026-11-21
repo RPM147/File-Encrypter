@@ -9,18 +9,21 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::{
     AES_NONCE_SIZE, AES_TAG_SIZE, CHUNKED_CIPHER_NAME, DEFAULT_CHUNK_SIZE, FLAG_COMPRESSED,
-    FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, VAULT_VERSION,
+    FLAG_HAS_KEYFILE, FLAG_HAS_RECOVERY, MAX_CHUNK_SIZE, MAX_CONTAINER_SIZE, MIN_CHUNK_SIZE,
+    MIN_CONTAINER_SIZE, SALT_SIZE, VAULT_VERSION,
 };
 use crate::error::CryptoError;
 use crate::header::{
     build_password_slot_and_kdf, build_recovery_slot, decrypt_metadata, encrypt_metadata,
-    random_dek, random_vault_id, read_header_and_meta, validate_header, write_header_and_meta,
-    Auth, VaultHeader, VaultMetadata,
+    payload_context_with_container, random_dek, random_vault_id, read_header_and_meta,
+    validate_header, write_header_and_meta, Auth, VaultHeader, VaultMetadata,
 };
 use crate::kdf::{derive_stream_nonce_prefix, KdfParams};
 use crate::mem::SecretKey;
@@ -32,6 +35,7 @@ pub struct EncryptOptions {
     pub recovery_key: Option<SecretKey>,
     pub keyfile_hash: Option<SecretKey>,
     pub compressed: bool,
+    pub container_size_bytes: Option<u64>,
 }
 
 impl Default for EncryptOptions {
@@ -42,6 +46,7 @@ impl Default for EncryptOptions {
             recovery_key: None,
             keyfile_hash: None,
             compressed: true,
+            container_size_bytes: None,
         }
     }
 }
@@ -65,6 +70,8 @@ pub struct VaultInfo {
     pub argon_memory_kib: u32,
     pub argon_iterations: u32,
     pub argon_parallelism: u32,
+    pub container_size: Option<u64>,
+    pub is_hidden_compartment: bool,
     pub metadata: VaultMetadata,
 }
 
@@ -80,7 +87,34 @@ pub struct IntegrityReport {
     pub chunk_count: u32,
 }
 
-fn chunk_nonce(prefix: &[u8; 7], chunk_idx: u32, final_flag: u8) -> [u8; AES_NONCE_SIZE] {
+pub(crate) struct CountingWriter<W> {
+    pub inner: W,
+    pub written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub(crate) fn chunk_nonce(
+    prefix: &[u8; 7],
+    chunk_idx: u32,
+    final_flag: u8,
+) -> [u8; AES_NONCE_SIZE] {
     let mut nonce = [0u8; AES_NONCE_SIZE];
     nonce[..7].copy_from_slice(prefix);
     nonce[7..11].copy_from_slice(&chunk_idx.to_be_bytes());
@@ -88,7 +122,12 @@ fn chunk_nonce(prefix: &[u8; 7], chunk_idx: u32, final_flag: u8) -> [u8; AES_NON
     nonce
 }
 
-fn chunk_aad(payload_ctx: &[u8; 32], chunk_idx: u32, final_flag: u8, plain_len: u32) -> [u8; 52] {
+pub(crate) fn chunk_aad(
+    payload_ctx: &[u8; 32],
+    chunk_idx: u32,
+    final_flag: u8,
+    plain_len: u32,
+) -> [u8; 52] {
     let mut aad = [0u8; 52];
     aad[..11].copy_from_slice(b"RPMV5-CHUNK");
     aad[11..43].copy_from_slice(payload_ctx);
@@ -98,11 +137,29 @@ fn chunk_aad(payload_ctx: &[u8; 32], chunk_idx: u32, final_flag: u8, plain_len: 
     aad
 }
 
-fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+pub(crate) fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
-fn read_chunk_with_eof(
+pub(crate) fn write_random_padding(
+    writer: &mut impl Write,
+    mut remaining: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), CryptoError> {
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        if is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
+        let want = (buf.len() as u64).min(remaining) as usize;
+        OsRng.fill_bytes(&mut buf[..want]);
+        writer.write_all(&buf[..want])?;
+        remaining -= want as u64;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_chunk_with_eof(
     reader: &mut impl Read,
     buf: &mut [u8],
     pending: &mut Option<u8>,
@@ -131,8 +188,7 @@ fn read_chunk_with_eof(
     }
 }
 
-/// Encrypt a plaintext byte stream into Vault Format v5 (`Chunked AEAD`).
-pub fn encrypt_stream(
+pub(crate) fn encrypt_outer_stream_raw(
     reader: &mut impl Read,
     writer: &mut impl Write,
     metadata: &VaultMetadata,
@@ -140,23 +196,40 @@ pub fn encrypt_stream(
     opts: &EncryptOptions,
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
-) -> Result<EncryptSummary, CryptoError> {
+) -> Result<(EncryptSummary, Option<[u8; SALT_SIZE]>), CryptoError> {
     if opts.chunk_size < MIN_CHUNK_SIZE || opts.chunk_size > MAX_CHUNK_SIZE {
         return Err(CryptoError::InvalidFormat(format!(
             "chunk_size {} outside [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]",
             opts.chunk_size
         )));
     }
+    if let Some(sz) = opts.container_size_bytes {
+        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&sz) {
+            return Err(CryptoError::InvalidFormat(format!(
+                "container_size {sz} outside [{MIN_CONTAINER_SIZE}, {MAX_CONTAINER_SIZE}]"
+            )));
+        }
+    }
     opts.kdf.validate()?;
+
+    let container_salt_raw = if opts.container_size_bytes.is_some() {
+        let mut s = [0u8; SALT_SIZE];
+        OsRng.fill_bytes(&mut s);
+        Some(s)
+    } else {
+        None
+    };
 
     let vault_id = random_vault_id();
     let dek = random_dek();
-    let payload_ctx = crate::header::payload_context(
+    let payload_ctx = payload_context_with_container(
         VAULT_VERSION,
         CHUNKED_CIPHER_NAME,
         opts.chunk_size,
         opts.compressed,
         &vault_id,
+        opts.container_size_bytes,
+        container_salt_raw.as_ref(),
     );
 
     let (hdr_kdf, password_slot) = build_password_slot_and_kdf(
@@ -196,6 +269,8 @@ pub fn encrypt_stream(
         recovery_slot,
         meta_nonce: B64.encode(meta_nonce),
         encrypted_meta_len: enc_meta.len() as u32,
+        container_size: opts.container_size_bytes,
+        container_salt: container_salt_raw.map(|s| B64.encode(s)),
     };
     write_header_and_meta(writer, &header, &enc_meta)?;
 
@@ -245,12 +320,51 @@ pub fn encrypt_stream(
         }
     }
 
-    writer.flush()?;
-    Ok(EncryptSummary {
-        vault_id,
-        bytes_encrypted: total_bytes,
-        chunks_written: chunk_idx,
-    })
+    Ok((
+        EncryptSummary {
+            vault_id,
+            bytes_encrypted: total_bytes,
+            chunks_written: chunk_idx,
+        },
+        container_salt_raw,
+    ))
+}
+
+/// Encrypt a plaintext byte stream into Vault Format v5 (`Chunked AEAD`),
+/// optionally padding the output with cryptographically random bytes to `container_size_bytes`.
+pub fn encrypt_stream(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    metadata: &VaultMetadata,
+    password: &[u8],
+    opts: &EncryptOptions,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<EncryptSummary, CryptoError> {
+    let mut cw = CountingWriter::new(writer);
+    let (summary, _csalt) = encrypt_outer_stream_raw(
+        reader,
+        &mut cw,
+        metadata,
+        password,
+        opts,
+        progress_cb,
+        cancel,
+    )?;
+
+    if let Some(target_size) = opts.container_size_bytes {
+        if cw.written > target_size {
+            return Err(CryptoError::InvalidFormat(format!(
+                "encrypted vault ({} bytes) exceeds target container size ({target_size} bytes)",
+                cw.written
+            )));
+        }
+        let pad = target_size - cw.written;
+        write_random_padding(&mut cw, pad, cancel)?;
+    }
+
+    cw.flush()?;
+    Ok(summary)
 }
 
 /// Decrypt a Vault Format v5 stream. Each chunk is authenticated in RAM before
@@ -262,18 +376,38 @@ pub fn decrypt_stream(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
-    let (header, enc_meta, _hdr_len) = read_header_and_meta(reader)?;
+    let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
     let dek = crate::header::unlock_dek(&header, auth)?;
     let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
-    decrypt_chunks_with_key(reader, writer, &header, &dek, progress_cb, cancel)?;
+    decrypt_chunks_with_key_at(reader, writer, &header, hdr_len, &dek, progress_cb, cancel)?;
     Ok(metadata)
 }
 
-/// Decrypt the chunked payload stream once the header and DEK have already been unlocked.
+/// Decrypt the chunked payload stream once the header and DEK have already been unlocked
+/// (for unpadded vaults where the caller didn't preserve `hdr_bytes_read`).
 pub fn decrypt_chunks_with_key(
     reader: &mut impl Read,
     writer: &mut impl Write,
     header: &VaultHeader,
+    dek: &SecretKey,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, CryptoError> {
+    if header.container_size.is_some() {
+        return Err(CryptoError::InvalidFormat(
+            "padded container decryption requires header offset".into(),
+        ));
+    }
+    decrypt_chunks_with_key_at(reader, writer, header, 0, dek, progress_cb, cancel)
+}
+
+/// Decrypt the chunked payload stream starting immediately after `hdr_bytes_read`,
+/// validating exact container size if `header.container_size` is present.
+pub fn decrypt_chunks_with_key_at(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    header: &VaultHeader,
+    hdr_bytes_read: u64,
     dek: &SecretKey,
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
@@ -285,6 +419,7 @@ pub fn decrypt_chunks_with_key(
 
     let mut chunk_idx: u32 = 0;
     let mut total_bytes: u64 = 0;
+    let mut payload_bytes_read: u64 = 0;
     let mut ct_buf: Vec<u8> = Vec::new();
 
     loop {
@@ -337,6 +472,9 @@ pub fn decrypt_chunks_with_key(
                 CryptoError::Io(e)
             }
         })?;
+        payload_bytes_read = payload_bytes_read
+            .checked_add(5 + ct_len as u64)
+            .ok_or(CryptoError::AuthenticationFailed)?;
 
         let nonce_bytes = chunk_nonce(&prefix, chunk_idx, final_flag);
         let aad = chunk_aad(&payload_ctx, chunk_idx, final_flag, plain_len);
@@ -361,6 +499,15 @@ pub fn decrypt_chunks_with_key(
         progress_cb(total_bytes);
 
         if final_flag == 1 {
+            if let Some(target_size) = header.container_size {
+                let total_consumed = hdr_bytes_read
+                    .checked_add(payload_bytes_read)
+                    .ok_or(CryptoError::AuthenticationFailed)?;
+                if total_consumed > target_size {
+                    return Err(CryptoError::AuthenticationFailed);
+                }
+                skip_exact(reader, target_size - total_consumed, cancel)?;
+            }
             let mut trailing = [0u8; 1];
             if reader.read(&mut trailing)? != 0 {
                 return Err(CryptoError::AuthenticationFailed);
@@ -389,10 +536,12 @@ pub fn inspect_header(reader: &mut impl Read, auth: Auth<'_>) -> Result<VaultInf
         chunk_size: header.chunk_size,
         has_recovery: header.has_recovery(),
         has_keyfile: header.has_keyfile(),
-        compressed: (header.flags & FLAG_COMPRESSED) != 0,
+        compressed: header.is_compressed(),
         argon_memory_kib: header.kdf.memory_kib,
         argon_iterations: header.kdf.iterations,
         argon_parallelism: header.kdf.parallelism,
+        container_size: header.container_size,
+        is_hidden_compartment: false,
         metadata,
     })
 }
@@ -438,21 +587,34 @@ impl<R: Read> Read for HashingReader<R> {
     }
 }
 
-fn skip_exact(reader: &mut impl Read, mut remaining: usize) -> Result<(), CryptoError> {
+fn skip_exact(
+    reader: &mut impl Read,
+    mut remaining: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), CryptoError> {
     let mut scratch = [0u8; 64 * 1024];
     while remaining > 0 {
-        let want = scratch.len().min(remaining);
+        if is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
+        let want = (scratch.len() as u64).min(remaining) as usize;
         let n = reader.read(&mut scratch[..want])?;
         if n == 0 {
             return Err(CryptoError::AuthenticationFailed);
         }
-        remaining -= n;
+        remaining -= n as u64;
     }
     Ok(())
 }
 
-fn scan_chunk_frames(reader: &mut impl Read, max_chunk_size: u32) -> Result<u32, String> {
+fn scan_chunk_frames(
+    reader: &mut impl Read,
+    max_chunk_size: u32,
+    hdr_bytes_read: u64,
+    container_size: Option<u64>,
+) -> Result<u32, String> {
     let mut chunk_count: u32 = 0;
+    let mut payload_bytes_read: u64 = 0;
     loop {
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf) {
@@ -486,8 +648,11 @@ fn scan_chunk_frames(reader: &mut impl Read, max_chunk_size: u32) -> Result<u32,
             return Err("Invalid empty non-final chunk frame".into());
         }
 
-        let payload_len = (plain_len as usize) + AES_TAG_SIZE;
-        if let Err(err) = skip_exact(reader, payload_len) {
+        let payload_len = (plain_len as u64) + (AES_TAG_SIZE as u64);
+        payload_bytes_read = payload_bytes_read
+            .checked_add(5 + payload_len)
+            .ok_or_else(|| "Payload byte offset overflow".to_string())?;
+        if let Err(err) = skip_exact(reader, payload_len, None) {
             return Err(match err {
                 CryptoError::AuthenticationFailed => "Truncated chunk ciphertext/tag bytes".into(),
                 other => other.to_string(),
@@ -499,11 +664,31 @@ fn scan_chunk_frames(reader: &mut impl Read, max_chunk_size: u32) -> Result<u32,
             .ok_or_else(|| "Chunk counter overflow".to_string())?;
 
         if final_flag == 1 {
+            if let Some(target_size) = container_size {
+                let total_consumed = hdr_bytes_read
+                    .checked_add(payload_bytes_read)
+                    .ok_or_else(|| "Container byte offset overflow".to_string())?;
+                if total_consumed > target_size {
+                    return Err("Payload exceeds declared container_size".into());
+                }
+                if let Err(err) = skip_exact(reader, target_size - total_consumed, None) {
+                    return Err(match err {
+                        CryptoError::AuthenticationFailed => {
+                            "Truncated padded container (file shorter than container_size)".into()
+                        }
+                        other => other.to_string(),
+                    });
+                }
+            }
             let mut trailing = [0u8; 1];
             match reader.read(&mut trailing) {
                 Ok(0) => return Ok(chunk_count),
                 Ok(_) => {
-                    return Err("Trailing unauthenticated bytes after final chunk".into());
+                    return Err(if container_size.is_some() {
+                        "Trailing bytes past container_size".into()
+                    } else {
+                        "Trailing unauthenticated bytes after final chunk".into()
+                    });
                 }
                 Err(e) => return Err(format!("I/O error checking EOF: {e}")),
             }
@@ -519,29 +704,37 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
 
     let (ok, version, summary_msg, has_keyfile, has_recovery, chunk_count) =
         match read_header_and_meta(&mut hr) {
-            Ok((hdr, _, _)) => match scan_chunk_frames(&mut hr, hdr.chunk_size) {
-                Ok(chunks) => (
-                    true,
-                    hdr.version,
-                    format!(
-                        "Structure valid (v{}, {}, {} KiB chunk, {chunks} chunk(s))",
+            Ok((hdr, _, hdr_len)) => {
+                match scan_chunk_frames(&mut hr, hdr.chunk_size, hdr_len, hdr.container_size) {
+                    Ok(chunks) => {
+                        let container_note = match hdr.container_size {
+                            Some(sz) => format!(", {} B container", sz),
+                            None => String::new(),
+                        };
+                        (
+                            true,
+                            hdr.version,
+                            format!(
+                                "Structure valid (v{}, {}, {} KiB chunk, {chunks} chunk(s){container_note})",
+                                hdr.version,
+                                hdr.cipher,
+                                hdr.chunk_size / 1024
+                            ),
+                            hdr.has_keyfile(),
+                            hdr.has_recovery(),
+                            chunks,
+                        )
+                    }
+                    Err(msg) => (
+                        false,
                         hdr.version,
-                        hdr.cipher,
-                        hdr.chunk_size / 1024
+                        msg,
+                        hdr.has_keyfile(),
+                        hdr.has_recovery(),
+                        0,
                     ),
-                    hdr.has_keyfile(),
-                    hdr.has_recovery(),
-                    chunks,
-                ),
-                Err(msg) => (
-                    false,
-                    hdr.version,
-                    msg,
-                    hdr.has_keyfile(),
-                    hdr.has_recovery(),
-                    0,
-                ),
-            },
+                }
+            }
             Err(CryptoError::UnsupportedVersion(v)) => (
                 false,
                 v,
@@ -589,6 +782,11 @@ pub fn rekey_stream(
     }
 
     let (mut header, enc_meta, _hdr_len) = read_header_and_meta(reader)?;
+    if header.container_size.is_some() {
+        return Err(CryptoError::InvalidFormat(
+            "re-key is not supported on padded containers".into(),
+        ));
+    }
     let dek = crate::header::unlock_dek(
         &header,
         Auth::Password {

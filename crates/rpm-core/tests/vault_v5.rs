@@ -32,6 +32,7 @@ fn fast_opts() -> EncryptOptions {
         recovery_key: None,
         keyfile_hash: None,
         compressed: true,
+        container_size_bytes: None,
     }
 }
 
@@ -532,6 +533,7 @@ fn kdf_and_recovery_validation_bounds() {
             recovery_key: None,
             keyfile_hash: None,
             compressed: false,
+            container_size_bytes: None,
         };
         assert!(matches!(
             encrypt_stream(

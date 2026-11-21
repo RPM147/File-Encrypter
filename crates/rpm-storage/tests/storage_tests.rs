@@ -35,6 +35,7 @@ fn streaming_pack_encrypt_decrypt_unpack_round_trip_with_zero_temp_files() {
         recovery_key: None,
         keyfile_hash: Some(keyfile_hash.clone()),
         compressed: true,
+        container_size_bytes: None,
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -281,6 +282,7 @@ fn single_file_unicode_empty_items_and_batch_extract_cleanly() {
         recovery_key: None,
         keyfile_hash: None,
         compressed: true,
+        container_size_bytes: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     encrypt_sources_v5(
@@ -410,6 +412,7 @@ fn atomic_stage_and_swap_rolls_back_on_final_chunk_tamper() {
         recovery_key: None,
         keyfile_hash: None,
         compressed: false,
+        container_size_bytes: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     encrypt_sources_v5(
@@ -557,6 +560,7 @@ fn streaming_16mib_multichunk_and_cancellation_and_config_wiper() {
         recovery_key: None,
         keyfile_hash: None,
         compressed: false,
+        container_size_bytes: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let (sum, _) = encrypt_sources_v5(
@@ -673,6 +677,7 @@ fn selective_extraction_files_folder_prefix_and_missing_error() {
         recovery_key: None,
         keyfile_hash: None,
         compressed: true,
+        container_size_bytes: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     encrypt_sources_v5(
@@ -762,6 +767,7 @@ fn selective_extraction_authenticates_final_chunk_and_rolls_back_on_tamper() {
         recovery_key: None,
         keyfile_hash: None,
         compressed: false,
+        container_size_bytes: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     encrypt_sources_v5(

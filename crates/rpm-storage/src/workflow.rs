@@ -3,16 +3,16 @@
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use rand::rngs::OsRng;
 use rand::RngCore;
-use rpm_core::header::read_header_and_meta;
 use rpm_core::{
-    decrypt_chunks_with_key, encrypt_stream, rekey_stream, Auth, EncryptOptions, EncryptSummary,
-    KdfParams, RekeyOptions, SecretKey, VaultMetadata,
+    decrypt_unlocked_stream, encrypt_hidden_stream, encrypt_stream, rekey_stream, unlock_seekable,
+    Auth, EncryptOptions, EncryptSummary, HiddenEncryptOptions, HiddenEncryptSummary, KdfParams,
+    RekeyOptions, SecretKey, VaultMetadata,
 };
 
 use crate::atomic::atomic_write;
@@ -128,6 +128,153 @@ pub fn encrypt_sources_v5(
     Ok((summary_out.expect("summary set on Ok"), metadata))
 }
 
+/// Stream-pack decoy and hidden sources directly into a single fixed-size padded
+/// Vault v5 container with plausible deniability (zero temporary plaintext files).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_sources_v5(
+    decoy_sources: &[PathBuf],
+    hidden_sources: &[PathBuf],
+    out_vault: &Path,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError> {
+    let decoy_meta = collect_manifest(decoy_sources, opts.decoy_compressed, Some(&cancel))?;
+    let hidden_meta = collect_manifest(hidden_sources, opts.hidden_compressed, Some(&cancel))?;
+    let total_expected = decoy_meta
+        .original_size
+        .saturating_add(hidden_meta.original_size);
+
+    let on_skip = Arc::new(Mutex::new(on_skip));
+    let (decoy_writer, decoy_reader) = bounded_pipe(8);
+    let (hidden_writer, hidden_reader) = bounded_pipe(8);
+
+    let decoy_owned = decoy_sources.to_vec();
+    let decoy_compress = opts.decoy_compressed;
+    let cancel_decoy = Arc::clone(&cancel);
+    let skip_decoy = Arc::clone(&on_skip);
+    let decoy_handle = thread::spawn(move || -> Result<(), StorageError> {
+        pack_sources(
+            &decoy_owned,
+            decoy_writer,
+            decoy_compress,
+            Some(&cancel_decoy),
+            |msg| {
+                if let Ok(mut cb) = skip_decoy.lock() {
+                    cb(msg);
+                }
+            },
+        )
+    });
+
+    let hidden_owned = hidden_sources.to_vec();
+    let hidden_compress = opts.hidden_compressed;
+    let cancel_hidden = Arc::clone(&cancel);
+    let skip_hidden = Arc::clone(&on_skip);
+    let hidden_handle = thread::spawn(move || -> Result<(), StorageError> {
+        pack_sources(
+            &hidden_owned,
+            hidden_writer,
+            hidden_compress,
+            Some(&cancel_hidden),
+            |msg| {
+                if let Ok(mut cb) = skip_hidden.lock() {
+                    cb(msg);
+                }
+            },
+        )
+    });
+
+    let mut decoy_reader_opt = Some(decoy_reader);
+    let mut hidden_reader_opt = Some(hidden_reader);
+    let mut decoy_handle_opt = Some(decoy_handle);
+    let mut hidden_handle_opt = Some(hidden_handle);
+    let mut summary_out: Option<HiddenEncryptSummary> = None;
+
+    let decoy_done = Arc::new(AtomicU64::new(0));
+    let hidden_done = Arc::new(AtomicU64::new(0));
+
+    let enc_res = atomic_write(out_vault, |vault_writer| {
+        let mut d_reader = decoy_reader_opt.take().expect("decoy reader taken once");
+        let mut h_reader = hidden_reader_opt.take().expect("hidden reader taken once");
+
+        let d1 = Arc::clone(&decoy_done);
+        let h1 = Arc::clone(&hidden_done);
+        let p1 = Arc::clone(&progress);
+        let decoy_cb = move |done: u64| {
+            d1.store(done, Ordering::Relaxed);
+            p1(
+                done.saturating_add(h1.load(Ordering::Relaxed)),
+                total_expected,
+            );
+        };
+
+        let d2 = Arc::clone(&decoy_done);
+        let h2 = Arc::clone(&hidden_done);
+        let p2 = Arc::clone(&progress);
+        let hidden_cb = move |done: u64| {
+            h2.store(done, Ordering::Relaxed);
+            p2(
+                d2.load(Ordering::Relaxed).saturating_add(done),
+                total_expected,
+            );
+        };
+
+        let enc_attempt = encrypt_hidden_stream(
+            &mut d_reader,
+            &mut h_reader,
+            vault_writer,
+            &decoy_meta,
+            &hidden_meta,
+            decoy_password,
+            hidden_password,
+            opts,
+            decoy_cb,
+            hidden_cb,
+            Some(&cancel),
+        );
+        // Drop both readers BEFORE joining so early errors unblock either packer cleanly.
+        drop(d_reader);
+        drop(h_reader);
+
+        let decoy_pack = decoy_handle_opt
+            .take()
+            .expect("decoy packer taken once")
+            .join()
+            .map_err(|_| StorageError::Io(std::io::Error::other("decoy packer panicked")))?;
+        let hidden_pack = hidden_handle_opt
+            .take()
+            .expect("hidden packer taken once")
+            .join()
+            .map_err(|_| StorageError::Io(std::io::Error::other("hidden packer panicked")))?;
+
+        let summary = enc_attempt?;
+        decoy_pack?;
+        hidden_pack?;
+        summary_out = Some(summary);
+        Ok(())
+    });
+
+    drop(decoy_reader_opt.take());
+    drop(hidden_reader_opt.take());
+    if let Some(h) = decoy_handle_opt.take() {
+        let _ = h.join();
+    }
+    if let Some(h) = hidden_handle_opt.take() {
+        let _ = h.join();
+    }
+
+    enc_res?;
+    Ok((
+        summary_out.expect("summary set on Ok"),
+        decoy_meta,
+        hidden_meta,
+    ))
+}
+
 /// Stream-decrypt a Vault v5 file directly through AEAD chunk verification into an
 /// isolated staging directory inside `output_root`, then atomically promote the
 /// verified payload only after all chunks succeed.
@@ -187,12 +334,11 @@ fn decrypt_vault_v5_inner(
     };
 
     let mut reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
-    let (header, enc_meta, _hdr_len) = read_header_and_meta(&mut reader)?;
-    let dek = rpm_core::header::unlock_dek(&header, auth)?;
-    let metadata = rpm_core::header::decrypt_metadata(&dek, &header, &enc_meta)?;
+    let unlocked = unlock_seekable(&mut reader, auth)?;
+    let metadata = unlocked.metadata().clone();
 
     let total_expected = metadata.original_size;
-    let compressed = header.is_compressed();
+    let compressed = unlocked.is_compressed();
 
     let created_root = !output_root.exists();
     fs::create_dir_all(output_root)?;
@@ -219,11 +365,10 @@ fn decrypt_vault_v5_inner(
         }
     });
 
-    let dec_res = decrypt_chunks_with_key(
+    let dec_res = decrypt_unlocked_stream(
         &mut reader,
         &mut pipe_tx,
-        &header,
-        &dek,
+        &unlocked,
         |done| progress(done, total_expected),
         Some(&cancel),
     );
