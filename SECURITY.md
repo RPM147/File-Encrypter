@@ -35,7 +35,7 @@ While Pure Rust avoids Python/Dart garbage-collector string retention and scrubs
 
 - **Lost credentials = lost data.** If you lose your password, required keyfile, or 24-word recovery phrase, the vault cannot be opened.
 - **Offline brute force.** Anyone with a copy of your `.vault` file can test password guesses offline at hardware speed bounded by your Argon2id settings. Choose a strong passphrase (or bind a high-entropy keyfile).
-- **No v4 backward compatibility.** Vault Format v5 intentionally supersedes legacy Python v4 archives (the retired v4 codebase is preserved under `legacy/`).
+- **No v4 backward compatibility.** Vault Format v5 intentionally supersedes legacy Python v4 archives (the retired v4 codebase is preserved in earlier Git history).
 - **Host trust.** RPM Encrypter cannot defend against malware, keyloggers, compromised OS kernels, or physical hardware implants running on your machine.
 
 ## Container Padding & Hidden Vault (Plausible Deniability)

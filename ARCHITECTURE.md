@@ -9,7 +9,6 @@ crates/
   rpm-storage/              # Zero-temp-plaintext bounded pipe, tar+gzip packager, atomic I/O, wiper, HKCU shell integration
   rpm-cli/                  # Headless CLI binary (rpm-encrypter-cli)
   rpm-gui/                  # Native eframe/egui desktop GUI binary (rpm-encrypter) with OS drag-and-drop
-legacy/                     # Archived Python + Flet implementation (Vault Format v4, retired)
 ```
 
 ## Dependency Rules (Acyclic)
@@ -47,5 +46,5 @@ Vault Format **v5** is frozen at `VAULT_VERSION = 5`:
 
 RPM Encrypter has migrated from Python + Flet to **Pure Rust** with **Vault Format v5**:
 
-- Legacy Python + Flet code (`Vault Format v4`) is archived untouched under [legacy/](legacy/README.md) solely as historical reference and is no longer maintained or built.
+- Legacy Python + Flet code (`Vault Format v4`) is preserved in earlier Git history and is no longer tracked or built.
 - Vault Format **v5 (`Chunked AES-256-GCM`)** breaks compatibility with v4 archives on purpose to eliminate the v4 32 GiB payload cap and unverified-plaintext temporary archive limits, while adding second-factor keyfiles and deterministic secret zeroization.

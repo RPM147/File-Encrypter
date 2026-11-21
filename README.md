@@ -4,7 +4,7 @@
 
 RPM Encrypter is a **Pure-Rust, local-only** file encryption utility using **Chunked AES-256-GCM** (`Vault Format v5`), **Argon2id** key derivation, optional **keyfile two-factor binding**, and deterministic in-memory secret scrubbing (`zeroize` + `VirtualLock`/`mlock`).
 
-Everything runs locally with zero telemetry, cloud accounts, or network dependencies. The retired Python + Flet (Vault Format v4) codebase is archived in [legacy/](legacy/README.md).
+Everything runs locally with zero telemetry, cloud accounts, or network dependencies. The retired Python + Flet (Vault Format v4) codebase is preserved in earlier Git history.
 
 [User guide (Türkçe)](docs/USER_GUIDE.md) · [Changelog](CHANGELOG.md)
 
