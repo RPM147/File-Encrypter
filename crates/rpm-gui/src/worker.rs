@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use rpm_core::{
     check_integrity, diff_metadata, hash_keyfile_reader, inspect_header_seekable,
-    mnemonic_to_entropy, Auth, EncryptOptions, HiddenEncryptOptions, IntegrityReport, KdfParams,
-    SecretKey, VaultDiff, VaultInfo,
+    mnemonic_to_entropy, Auth, CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport,
+    KdfParams, SecretKey, VaultDiff, VaultInfo,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
@@ -75,6 +75,20 @@ fn keyfile_error_msg(err: &StorageError, lang: AppLanguage) -> String {
         AppLanguage::Tr => format!("Anahtar dosyası hatası: {err}"),
         AppLanguage::En => format!("Keyfile error: {err}"),
     }
+}
+
+/// Format a re-key failure cleanly without exposing padded/hidden container structure.
+pub fn format_rekey_error(err: &StorageError, lang: AppLanguage) -> String {
+    if matches!(
+        err,
+        StorageError::Crypto(CryptoError::UnsupportedOperation(_))
+    ) {
+        return match lang {
+            AppLanguage::Tr => "Bu kasa için yerinde anahtar değiştirme kullanılamıyor; kimlik bilgilerini değiştirmek için kasayı çözüp yeniden şifreleyin.".to_string(),
+            AppLanguage::En => "In-place re-key is not available for this vault; decrypt and re-encrypt to change credentials.".to_string(),
+        };
+    }
+    err.to_string()
 }
 
 fn yes_no(flag: bool, lang: AppLanguage) -> &'static str {
@@ -988,7 +1002,7 @@ pub fn spawn_rekey(
                 };
                 send(&tx, &ctx, WorkerUpdate::RekeyDone { status });
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(format_rekey_error(&e, lang))),
         }
     });
 }

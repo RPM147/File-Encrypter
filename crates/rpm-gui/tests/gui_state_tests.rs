@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use rpm_core::constants::MIN_CHUNK_SIZE;
 use rpm_core::{
-    diff_metadata, inspect_header_seekable, Auth, ChangedEntry, FileManifestEntry,
+    diff_metadata, inspect_header_seekable, Auth, ChangedEntry, CryptoError, FileManifestEntry,
     HiddenEncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultDiff, VaultInfo,
     VaultMetadata,
 };
@@ -1086,4 +1086,28 @@ fn seekable_inspect_and_diff_support_hidden_vault_end_to_end() {
     assert!(diff_report.contains("+1 added, -1 removed"));
     assert!(diff_report.contains("private_keys.txt"));
     assert!(diff_report.contains("public_readme.txt"));
+}
+
+#[test]
+fn rekey_unsupported_error_is_neutral_and_localized() {
+    let err = rpm_storage::StorageError::Crypto(CryptoError::UnsupportedOperation(
+        "in-place re-key is not available".into(),
+    ));
+    let tr = worker::format_rekey_error(&err, AppLanguage::Tr);
+    let en = worker::format_rekey_error(&err, AppLanguage::En);
+
+    assert!(!tr.trim().is_empty());
+    assert!(!en.trim().is_empty());
+    assert_ne!(tr, en);
+
+    for bad in ["padded", "padding", "dolgu", "hidden", "gizli", "container"] {
+        assert!(
+            !tr.to_ascii_lowercase().contains(bad),
+            "TR message leaked '{bad}': {tr}"
+        );
+        assert!(
+            !en.to_ascii_lowercase().contains(bad),
+            "EN message leaked '{bad}': {en}"
+        );
+    }
 }

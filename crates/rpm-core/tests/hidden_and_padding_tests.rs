@@ -122,7 +122,7 @@ fn padded_container_enforces_exact_size_integrity_and_rejects_rekey() {
     std::fs::write(tmp.path(), &appended).unwrap();
     assert!(!check_integrity(tmp.path()).unwrap().ok);
 
-    // Re-key is disallowed on padded containers.
+    // Re-key is disallowed on padded containers with a neutral, non-disclosing error.
     let rekey_res = rekey_stream(
         &mut Cursor::new(&vault),
         &mut Vec::new(),
@@ -135,7 +135,16 @@ fn padded_container_enforces_exact_size_integrity_and_rejects_rekey() {
         },
         None,
     );
-    assert!(matches!(rekey_res, Err(CryptoError::InvalidFormat(_))));
+    match rekey_res {
+        Err(CryptoError::UnsupportedOperation(msg)) => {
+            let lower = msg.to_ascii_lowercase();
+            assert!(!lower.contains("padded"));
+            assert!(!lower.contains("padding"));
+            assert!(!lower.contains("hidden"));
+            assert!(!lower.contains("container"));
+        }
+        other => panic!("expected UnsupportedOperation, got {other:?}"),
+    }
 }
 
 #[test]
@@ -205,6 +214,29 @@ fn normal_padded_and_hidden_vault_share_indistinguishable_public_header() {
     let raw_hdr_str = std::str::from_utf8(&hidden_vault[9..9 + len_b]).unwrap();
     assert!(!raw_hdr_str.contains("hidden"));
     assert!(!raw_hdr_str.contains("RPMH"));
+
+    let rekey_err = |data: &[u8], pw: &[u8]| -> String {
+        match rekey_stream(
+            &mut Cursor::new(data),
+            &mut Vec::new(),
+            &RekeyOptions {
+                old_password: pw,
+                new_password: b"AnotherPw!9",
+                old_keyfile_hash: None,
+                new_keyfile_hash: None,
+                new_kdf: None,
+            },
+            None,
+        ) {
+            Err(CryptoError::UnsupportedOperation(msg)) => msg,
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+    };
+    let err_normal = rekey_err(&normal_padded, b"OuterPw!1");
+    let err_hidden_outer = rekey_err(&hidden_vault, b"OuterPw!1");
+    let err_hidden_inner = rekey_err(&hidden_vault, b"HiddenPw!2");
+    assert_eq!(err_normal, err_hidden_outer);
+    assert_eq!(err_normal, err_hidden_inner);
 }
 
 #[test]

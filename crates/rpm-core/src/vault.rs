@@ -783,8 +783,8 @@ pub fn rekey_stream(
 
     let (mut header, enc_meta, _hdr_len) = read_header_and_meta(reader)?;
     if header.container_size.is_some() {
-        return Err(CryptoError::InvalidFormat(
-            "re-key is not supported on padded containers".into(),
+        return Err(CryptoError::UnsupportedOperation(
+            "in-place re-key is not available for this vault; decrypt and re-encrypt to change credentials".into(),
         ));
     }
     let dek = crate::header::unlock_dek(

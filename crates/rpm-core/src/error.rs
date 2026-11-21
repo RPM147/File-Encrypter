@@ -13,6 +13,9 @@ pub enum CryptoError {
     #[error("unsupported vault version {0} (expected v5)")]
     UnsupportedVersion(u8),
 
+    #[error("operation not supported: {0}")]
+    UnsupportedOperation(String),
+
     #[error("keyfile is required to unlock this vault")]
     KeyfileRequired,
 
