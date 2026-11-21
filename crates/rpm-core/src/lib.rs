@@ -1,6 +1,7 @@
 //! Pure-Rust Vault Format v5 cryptographic engine.
 
 pub mod constants;
+pub mod diff;
 pub mod error;
 pub mod header;
 pub mod kdf;
@@ -9,6 +10,7 @@ pub mod recovery;
 pub mod vault;
 
 pub use constants::{VAULT_MAGIC, VAULT_VERSION};
+pub use diff::{diff_metadata, ChangedEntry, VaultDiff};
 pub use error::CryptoError;
 pub use header::{Auth, FileManifestEntry, VaultHeader, VaultMetadata};
 pub use kdf::{hash_keyfile_reader, KdfParams};

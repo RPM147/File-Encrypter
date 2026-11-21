@@ -1,5 +1,6 @@
 //! Headless Pure-Rust CLI for RPM Encrypter v5 (zero GUI dependencies).
 
+mod diff;
 pub mod progress;
 
 use std::fs::{self, File};
@@ -39,6 +40,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Compare authenticated file lists by path, size and modification time (headers only).
+    Diff(diff::DiffArgs),
     /// Encrypt files or directories into a Vault Format v5 (.vault) archive.
     Encrypt {
         #[arg(required = true)]
@@ -275,6 +278,13 @@ where
     let kdf = kdf_override.unwrap_or_default();
 
     match parsed.command {
+        Commands::Diff(args) => match args.run(stdin, stdout) {
+            Ok(()) => 0,
+            Err(err) => {
+                let _ = writeln!(stderr, "Error comparing vaults: {err}");
+                exit_code_for_storage_error(&err)
+            }
+        },
         Commands::Encrypt {
             sources,
             output_dir,
