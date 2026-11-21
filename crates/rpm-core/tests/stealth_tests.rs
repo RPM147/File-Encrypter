@@ -60,6 +60,7 @@ fn encrypted_slots_and_frames_round_trip_without_public_structure() {
     let payload = vec![0x31; MIN_CHUNK_SIZE as usize * 2 + 17];
     for size in [None, Some(CONTAINER)] {
         let opts = EncryptOptions {
+            reed_solomon: false,
             stealth: true,
             kdf: KdfParams::fast_test(),
             chunk_size: MIN_CHUNK_SIZE,

@@ -25,3 +25,5 @@ pub use workflow::{
     decrypt_vault_selected_v5, decrypt_vault_v5, decrypt_vault_v5_with_stealth_kdf,
     encrypt_hidden_sources_v5, encrypt_sources_v5, rekey_vault_v5, unique_path, DecryptSummary,
 };
+
+pub use workflow::repair_vault_v5;

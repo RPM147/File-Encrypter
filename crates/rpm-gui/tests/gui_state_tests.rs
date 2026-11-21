@@ -201,6 +201,8 @@ fn inspect_manifest_selection_filtering_and_vault_change_reset() {
 #[test]
 fn worker_reports_format_cleanly_in_tr_and_en() {
     let rep = IntegrityReport {
+        has_reed_solomon: true,
+        rs_repaired_bytes: 13,
         sha256_only: false,
         ok: true,
         version: 5,
@@ -218,7 +220,30 @@ fn worker_reports_format_cleanly_in_tr_and_en() {
     assert!(rep_en.contains("INTEGRITY CHECK"));
     assert!(rep_en.contains("Yes") && rep_en.contains("No"));
 
+    for (lang, report) in [(AppLanguage::Tr, &rep_tr), (AppLanguage::En, &rep_en)] {
+        assert!(report
+            .lines()
+            .any(|l| l.starts_with(i18n::strings(lang).rs_bytes) && l.ends_with(": 13")));
+        let cols: Vec<usize> = report
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| l.chars().position(|c| c == ':').unwrap())
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{report}");
+    }
+    let mut non_rs_rep = rep.clone();
+    non_rs_rep.has_reed_solomon = false;
+    non_rs_rep.rs_repaired_bytes = 0;
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        let non_rs_txt = worker::format_integrity_report(&non_rs_rep, lang);
+        assert!(!non_rs_txt.contains(i18n::strings(lang).rs_bytes));
+    }
     let info = VaultInfo {
+        has_reed_solomon: true,
+        rs_repaired_bytes: 17,
         is_stealth: false,
         version: 5,
         vault_id: "0123456789abcdef".into(),
@@ -246,6 +271,28 @@ fn worker_reports_format_cleanly_in_tr_and_en() {
             }],
         },
     };
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        let txt = worker::format_inspect_report(&info, lang);
+        assert!(txt
+            .lines()
+            .any(|l| l.starts_with(i18n::strings(lang).rs_seen) && l.ends_with(": 17")));
+        let cols: Vec<usize> = txt
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| l.chars().position(|c| c == ':').unwrap())
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{txt}");
+    }
+    let mut non_rs_info = info.clone();
+    non_rs_info.has_reed_solomon = false;
+    non_rs_info.rs_repaired_bytes = 0;
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        let non_rs_txt = worker::format_inspect_report(&non_rs_info, lang);
+        assert!(!non_rs_txt.contains(i18n::strings(lang).rs_seen));
+    }
     let ins_tr = worker::format_inspect_report(&info, AppLanguage::Tr);
     let ins_en = worker::format_inspect_report(&info, AppLanguage::En);
     assert!(ins_tr.contains("KASA META VERİSİ"));
@@ -947,6 +994,8 @@ fn clear_encrypt_secrets_wipes_outer_and_hidden_passwords() {
 #[test]
 fn format_inspect_report_shows_container_size_and_hidden_compartment() {
     let info = VaultInfo {
+        has_reed_solomon: true,
+        rs_repaired_bytes: 17,
         is_stealth: false,
         version: 5,
         vault_id: "0123456789abcdef".into(),
@@ -1062,6 +1111,7 @@ fn seekable_inspect_and_diff_support_hidden_vault_end_to_end() {
                 container_size,
                 true,
                 false,
+                false,
                 1,
                 KdfParams::fast_test(),
                 AppLanguage::En,
@@ -1076,6 +1126,7 @@ fn seekable_inspect_and_diff_support_hidden_vault_end_to_end() {
             fs::rename(dir.path().join("public_readme.txt.vault"), &vault).unwrap();
         } else {
             let opts = HiddenEncryptOptions {
+                reed_solomon: false,
                 stealth: false,
                 kdf: KdfParams::fast_test(),
                 chunk_size: MIN_CHUNK_SIZE,
@@ -1270,6 +1321,38 @@ fn stealth_preferences_and_digest_only_reports_are_bilingual_and_neutral() {
         (i18n::TR.stealth_help, i18n::EN.stealth_help),
         (i18n::TR.digest_computed, i18n::EN.digest_computed),
     ] {
+        assert!(!tr.is_empty() && !en.is_empty() && tr != en);
+    }
+}
+
+#[test]
+fn rs_and_stealth_are_mutually_exclusive_and_localized() {
+    let mut state = AppState::default();
+    let fields = &mut state.encrypt;
+    assert!(!fields.reed_solomon);
+    fields.set_stealth(true);
+    fields.set_reed_solomon(true);
+    assert!(fields.reed_solomon && !fields.stealth);
+    fields.set_stealth(true);
+    assert!(fields.stealth && !fields.reed_solomon);
+    fields.set_reed_solomon(false);
+    assert!(fields.stealth);
+    let labels = |s: &'static i18n::Strings| {
+        [
+            s.rs_mode,
+            s.rs_help,
+            s.rs_bytes,
+            s.rs_seen,
+            s.btn_repair,
+            s.repair_done,
+            s.repair_error,
+            s.repair_running,
+            s.repair_requires_rs,
+            s.repair_invalid,
+            s.repair_cancelled,
+        ]
+    };
+    for (tr, en) in labels(&i18n::TR).into_iter().zip(labels(&i18n::EN)) {
         assert!(!tr.is_empty() && !en.is_empty() && tr != en);
     }
 }

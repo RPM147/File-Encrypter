@@ -114,6 +114,13 @@ impl RpmApp {
                     self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
                 }
+                WorkerUpdate::RepairDone(text) => {
+                    self.state.busy = false;
+                    self.state.transfer = None;
+                    self.state.inspect.reset_manifest();
+                    self.state.inspect.results = text.clone();
+                    self.state.set_status(text, false);
+                }
                 WorkerUpdate::IntegrityDone {
                     text,
                     ok,

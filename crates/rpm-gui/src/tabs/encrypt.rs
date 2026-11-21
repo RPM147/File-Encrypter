@@ -192,10 +192,18 @@ pub fn ui(
             ui.checkbox(&mut state.encrypt.secure_wipe, s.chk_secure_wipe);
         });
 
-        ui.checkbox(&mut state.encrypt.stealth, s.stealth_mode);
+        let mut stealth = state.encrypt.stealth;
+        if ui.checkbox(&mut stealth, s.stealth_mode).changed() {
+            state.encrypt.set_stealth(stealth);
+        }
         if state.encrypt.stealth {
             ui.weak(s.stealth_help);
         }
+        let mut rs = state.encrypt.reed_solomon;
+        if ui.checkbox(&mut rs, s.rs_mode).changed() {
+            state.encrypt.set_reed_solomon(rs);
+        }
+        ui.weak(s.rs_help);
 
         ui.horizontal(|ui| {
             ui.label(s.lbl_container_size);
@@ -466,6 +474,7 @@ pub fn ui(
                     state.encrypt.hidden_compress,
                     container_size_bytes,
                     state.encrypt.stealth,
+                    state.encrypt.reed_solomon,
                     state.encrypt.secure_wipe,
                     state.config.wipe_passes,
                     state.config.kdf_params(),
@@ -487,6 +496,7 @@ pub fn ui(
                     state.encrypt.compress,
                     container_size,
                     state.encrypt.stealth,
+                    state.encrypt.reed_solomon,
                     state.encrypt.secure_wipe,
                     state.config.wipe_passes,
                     state.config.kdf_params(),

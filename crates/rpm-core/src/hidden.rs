@@ -43,6 +43,7 @@ use crate::vault::{
 
 #[derive(Clone, Debug)]
 pub struct HiddenEncryptOptions {
+    pub reed_solomon: bool,
     pub stealth: bool,
     pub kdf: KdfParams,
     pub chunk_size: u32,
@@ -57,6 +58,7 @@ pub struct HiddenEncryptOptions {
 impl Default for HiddenEncryptOptions {
     fn default() -> Self {
         Self {
+            reed_solomon: false,
             stealth: false,
             kdf: KdfParams::default(),
             chunk_size: crate::constants::DEFAULT_CHUNK_SIZE,
@@ -80,6 +82,10 @@ pub struct HiddenEncryptSummary {
 
 /// Authenticated outer or hidden vault handle produced by [`unlock_seekable`].
 pub enum UnlockedVault {
+    ReedSolomon {
+        inner: Box<UnlockedVault>,
+        repaired: u64,
+    },
     Outer {
         header: VaultHeader,
         dek: SecretKey,
@@ -106,6 +112,7 @@ pub enum UnlockedVault {
 impl UnlockedVault {
     pub fn metadata(&self) -> &VaultMetadata {
         match self {
+            Self::ReedSolomon { inner, .. } => inner.metadata(),
             Self::Outer { metadata, .. } => metadata,
             Self::Stealth { info, .. } | Self::Hidden { info, .. } => &info.metadata,
         }
@@ -113,20 +120,33 @@ impl UnlockedVault {
 
     pub fn is_compressed(&self) -> bool {
         match self {
+            Self::ReedSolomon { inner, .. } => inner.is_compressed(),
             UnlockedVault::Outer { header, .. } => header.is_compressed(),
             Self::Stealth { info, .. } | Self::Hidden { info, .. } => info.compressed,
         }
     }
 
     pub fn is_hidden(&self) -> bool {
-        matches!(self, UnlockedVault::Hidden { .. })
+        match self {
+            Self::ReedSolomon { inner, .. } => inner.is_hidden(),
+            Self::Hidden { .. } => true,
+            _ => false,
+        }
     }
 
     pub fn vault_info(&self) -> VaultInfo {
         match self {
+            Self::ReedSolomon { inner, repaired } => {
+                let mut info = inner.vault_info();
+                info.has_reed_solomon = true;
+                info.rs_repaired_bytes = *repaired;
+                info
+            }
             UnlockedVault::Outer {
                 header, metadata, ..
             } => VaultInfo {
+                has_reed_solomon: false,
+                rs_repaired_bytes: 0,
                 is_stealth: false,
                 version: header.version,
                 vault_id: header.vault_id.clone(),
@@ -302,6 +322,55 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
     hidden_password: &[u8],
     opts: &HiddenEncryptOptions,
     decoy_progress: impl FnMut(u64),
+    hidden_progress: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<HiddenEncryptSummary, CryptoError> {
+    if opts.reed_solomon {
+        crate::rs::validate_mode(opts.stealth)?;
+        let mut rs = crate::RsEncoderWriter::new(writer)?;
+        let summary = encrypt_hidden_inner(
+            decoy_reader,
+            hidden_reader,
+            &mut rs,
+            decoy_metadata,
+            hidden_metadata,
+            decoy_password,
+            hidden_password,
+            opts,
+            decoy_progress,
+            hidden_progress,
+            cancel,
+        )?;
+        rs.finish()?;
+        Ok(summary)
+    } else {
+        encrypt_hidden_inner(
+            decoy_reader,
+            hidden_reader,
+            writer,
+            decoy_metadata,
+            hidden_metadata,
+            decoy_password,
+            hidden_password,
+            opts,
+            decoy_progress,
+            hidden_progress,
+            cancel,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypt_hidden_inner<R1: Read, R2: Read, W: Write>(
+    decoy_reader: &mut R1,
+    hidden_reader: &mut R2,
+    writer: &mut W,
+    decoy_metadata: &VaultMetadata,
+    hidden_metadata: &VaultMetadata,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    decoy_progress: impl FnMut(u64),
     mut hidden_progress: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<HiddenEncryptSummary, CryptoError> {
@@ -330,6 +399,7 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
     opts.kdf.validate()?;
 
     let outer_opts = EncryptOptions {
+        reed_solomon: false,
         stealth: opts.stealth,
         kdf: opts.kdf,
         chunk_size: opts.chunk_size,
@@ -632,6 +702,8 @@ pub(crate) fn try_unlock_hidden<R: Read + Seek>(
 
     Ok(UnlockedVault::Hidden {
         info: VaultInfo {
+            has_reed_solomon: false,
+            rs_repaired_bytes: 0,
             is_stealth: container.public_id.is_none(),
             version: VAULT_VERSION,
             vault_id: container.public_id.map_or_else(
@@ -674,6 +746,24 @@ pub fn unlock_seekable_with_kdf<R: Read + Seek>(
     auth: Auth<'_>,
     stealth_kdf: &KdfParams,
 ) -> Result<UnlockedVault, CryptoError> {
+    if crate::rs::probe(reader)? {
+        let mut rs = crate::RsSeekableReader::new(reader)?;
+        let inner = unlock_inner(&mut rs, auth, stealth_kdf, true)?;
+        Ok(UnlockedVault::ReedSolomon {
+            inner: Box::new(inner),
+            repaired: rs.repaired_bytes(),
+        })
+    } else {
+        unlock_inner(reader, auth, stealth_kdf, false)
+    }
+}
+
+fn unlock_inner<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    rs: bool,
+) -> Result<UnlockedVault, CryptoError> {
     reader.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 4];
     reader
@@ -681,6 +771,11 @@ pub fn unlock_seekable_with_kdf<R: Read + Seek>(
         .map_err(crate::stealth::map_eof)?;
     reader.seek(SeekFrom::Start(0))?;
     if magic != crate::VAULT_MAGIC {
+        if rs {
+            return Err(CryptoError::InvalidFormat(
+                "expected RPMV inside Reed-Solomon envelope".into(),
+            ));
+        }
         return crate::stealth::unlock(reader, auth, stealth_kdf);
     }
     let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
@@ -755,10 +850,27 @@ pub fn decrypt_unlocked_stream<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
     unlocked: &UnlockedVault,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, CryptoError> {
+    if let UnlockedVault::ReedSolomon { inner, .. } = unlocked {
+        let mut rs = crate::RsSeekableReader::new(reader)?;
+        decrypt_inner(&mut rs, writer, inner, progress_cb, cancel)
+    } else {
+        decrypt_inner(reader, writer, unlocked, progress_cb, cancel)
+    }
+}
+fn decrypt_inner<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    unlocked: &UnlockedVault,
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
     match unlocked {
+        UnlockedVault::ReedSolomon { .. } => Err(CryptoError::InvalidFormat(
+            "nested Reed-Solomon envelope".into(),
+        )),
         UnlockedVault::Outer {
             header,
             dek,

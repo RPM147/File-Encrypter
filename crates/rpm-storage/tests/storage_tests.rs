@@ -30,6 +30,7 @@ fn streaming_pack_encrypt_decrypt_unpack_round_trip_with_zero_temp_files() {
     let keyfile_hash = hash_keyfile_reader(&mut Cursor::new(b"kf-bytes")).unwrap();
     let vault_path = dir.path().join("docs.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024,
@@ -278,6 +279,7 @@ fn single_file_unicode_empty_items_and_batch_extract_cleanly() {
     fs::write(&uni, "Gizli Türkçe metin 🚀".as_bytes()).unwrap();
     let vault_uni = dir.path().join("uni.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024,
@@ -409,6 +411,7 @@ fn atomic_stage_and_swap_rolls_back_on_final_chunk_tamper() {
 
     let vault = dir.path().join("secret_docs.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024,
@@ -558,6 +561,7 @@ fn streaming_16mib_multichunk_and_cancellation_and_config_wiper() {
 
     let vault = dir.path().join("large_16m.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: rpm_core::constants::DEFAULT_CHUNK_SIZE,
@@ -676,6 +680,7 @@ fn selective_extraction_files_folder_prefix_and_missing_error() {
 
     let vault = dir.path().join("workspace.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024,
@@ -767,6 +772,7 @@ fn selective_extraction_authenticates_final_chunk_and_rolls_back_on_tamper() {
 
     let vault = dir.path().join("pack.vault");
     let opts = EncryptOptions {
+        reed_solomon: false,
         stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024,

@@ -30,6 +30,7 @@ use crate::mem::SecretKey;
 
 #[derive(Clone, Debug)]
 pub struct EncryptOptions {
+    pub reed_solomon: bool,
     pub stealth: bool,
     pub kdf: KdfParams,
     pub chunk_size: u32,
@@ -42,6 +43,7 @@ pub struct EncryptOptions {
 impl Default for EncryptOptions {
     fn default() -> Self {
         Self {
+            reed_solomon: false,
             stealth: false,
             kdf: KdfParams::default(),
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -62,6 +64,8 @@ pub struct EncryptSummary {
 
 #[derive(Clone, Debug)]
 pub struct VaultInfo {
+    pub has_reed_solomon: bool,
+    pub rs_repaired_bytes: u64,
     pub is_stealth: bool,
     pub version: u8,
     pub vault_id: String,
@@ -80,6 +84,8 @@ pub struct VaultInfo {
 
 #[derive(Clone, Debug)]
 pub struct IntegrityReport {
+    pub has_reed_solomon: bool,
+    pub rs_repaired_bytes: u64,
     pub sha256_only: bool,
     pub ok: bool,
     pub version: u8,
@@ -368,6 +374,42 @@ pub fn encrypt_stream(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<EncryptSummary, CryptoError> {
+    if opts.reed_solomon {
+        crate::rs::validate_mode(opts.stealth)?;
+        let mut rs = crate::RsEncoderWriter::new(writer)?;
+        let summary = encrypt_inner(
+            reader,
+            &mut rs,
+            metadata,
+            password,
+            opts,
+            progress_cb,
+            cancel,
+        )?;
+        rs.finish()?;
+        Ok(summary)
+    } else {
+        encrypt_inner(
+            reader,
+            writer,
+            metadata,
+            password,
+            opts,
+            progress_cb,
+            cancel,
+        )
+    }
+}
+
+fn encrypt_inner(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    metadata: &VaultMetadata,
+    password: &[u8],
+    opts: &EncryptOptions,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<EncryptSummary, CryptoError> {
     let mut cw = CountingWriter::new(writer);
     let (summary, _csalt) = encrypt_outer_stream_raw(
         reader,
@@ -573,6 +615,8 @@ pub fn inspect_header(reader: &mut impl Read, auth: Auth<'_>) -> Result<VaultInf
     let dek = crate::header::unlock_dek(&header, auth)?;
     let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
     Ok(VaultInfo {
+        has_reed_solomon: false,
+        rs_repaired_bytes: 0,
         is_stealth: false,
         version: header.version,
         vault_id: header.vault_id.clone(),
@@ -742,9 +786,51 @@ fn scan_chunk_frames(
 
 /// Passwordless single-pass structural check (header + chunk frames) + SHA-256 hash.
 pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
-    let f = File::open(path)?;
+    let mut f = File::open(path)?;
     let file_size = f.metadata()?.len();
+    use std::io::Seek;
+    let rs = crate::rs::probe(&mut f)?;
+    f.rewind()?;
     let mut hr = HashingReader::new(f);
+    if rs {
+        let mut repaired = 0;
+        let fields = match crate::rs::Scan::new(&mut hr, file_size) {
+            Ok(mut scan) => {
+                let mut fields = scan_structure(&mut scan);
+                loop {
+                    match scan.next_block() {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            fields.0 = false;
+                            fields.2 = e.to_string();
+                            if e.kind() != io::ErrorKind::InvalidData {
+                                break;
+                            }
+                        }
+                    }
+                }
+                repaired = scan.report.repaired_bytes;
+                fields
+            }
+            Err(e) => (false, 0, e.to_string(), false, false, 0),
+        };
+        let (ok, version, msg, has_keyfile, has_recovery, chunk_count) = fields;
+        let sha256_hex = hr.drain_and_finalize()?;
+        return Ok(IntegrityReport {
+            ok,
+            version,
+            file_size,
+            message: format!("{msg}\nSHA-256: {sha256_hex}"),
+            sha256_hex,
+            sha256_only: false,
+            has_reed_solomon: true,
+            rs_repaired_bytes: repaired,
+            has_keyfile,
+            has_recovery,
+            chunk_count,
+        });
+    }
 
     let mut magic = [0; 4];
     let sha256_only = match hr.read_exact(&mut magic) {
@@ -756,6 +842,8 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
         let sha256_hex = hr.drain_and_finalize()?;
         return Ok(IntegrityReport {
             ok: true,
+            has_reed_solomon: false,
+            rs_repaired_bytes: 0,
             sha256_only: true,
             version: 0,
             file_size,
@@ -768,15 +856,36 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
     }
 
     let (ok, version, summary_msg, has_keyfile, has_recovery, chunk_count) =
-        match read_header_and_meta(&mut magic.as_slice().chain(&mut hr)) {
-            Ok((hdr, _, hdr_len)) => {
-                match scan_chunk_frames(&mut hr, hdr.chunk_size, hdr_len, hdr.container_size) {
-                    Ok(chunks) => {
-                        let container_note = match hdr.container_size {
-                            Some(sz) => format!(", {} B container", sz),
-                            None => String::new(),
-                        };
-                        (
+        scan_structure(&mut magic.as_slice().chain(&mut hr));
+
+    let sha256_hex = hr.drain_and_finalize()?;
+    let full_message = format!("{summary_msg}\nSHA-256: {sha256_hex}");
+
+    Ok(IntegrityReport {
+        has_reed_solomon: false,
+        rs_repaired_bytes: 0,
+        sha256_only: false,
+        ok,
+        version,
+        file_size,
+        sha256_hex,
+        message: full_message,
+        has_keyfile,
+        has_recovery,
+        chunk_count,
+    })
+}
+
+pub(crate) fn scan_structure(reader: &mut impl Read) -> (bool, u8, String, bool, bool, u32) {
+    match read_header_and_meta(reader) {
+        Ok((hdr, _, hdr_len)) => {
+            match scan_chunk_frames(reader, hdr.chunk_size, hdr_len, hdr.container_size) {
+                Ok(chunks) => {
+                    let container_note = match hdr.container_size {
+                        Some(sz) => format!(", {} B container", sz),
+                        None => String::new(),
+                    };
+                    (
                             true,
                             hdr.version,
                             format!(
@@ -789,42 +898,27 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
                             hdr.has_recovery(),
                             chunks,
                         )
-                    }
-                    Err(msg) => (
-                        false,
-                        hdr.version,
-                        msg,
-                        hdr.has_keyfile(),
-                        hdr.has_recovery(),
-                        0,
-                    ),
                 }
+                Err(msg) => (
+                    false,
+                    hdr.version,
+                    msg,
+                    hdr.has_keyfile(),
+                    hdr.has_recovery(),
+                    0,
+                ),
             }
-            Err(CryptoError::UnsupportedVersion(v)) => (
-                false,
-                v,
-                format!("Unsupported vault version: {v} (expected v{VAULT_VERSION})"),
-                false,
-                false,
-                0,
-            ),
-            Err(err) => (false, 0, err.to_string(), false, false, 0),
-        };
-
-    let sha256_hex = hr.drain_and_finalize()?;
-    let full_message = format!("{summary_msg}\nSHA-256: {sha256_hex}");
-
-    Ok(IntegrityReport {
-        sha256_only: false,
-        ok,
-        version,
-        file_size,
-        sha256_hex,
-        message: full_message,
-        has_keyfile,
-        has_recovery,
-        chunk_count,
-    })
+        }
+        Err(CryptoError::UnsupportedVersion(v)) => (
+            false,
+            v,
+            format!("Unsupported vault version: {v} (expected v{VAULT_VERSION})"),
+            false,
+            false,
+            0,
+        ),
+        Err(err) => (false, 0, err.to_string(), false, false, 0),
+    }
 }
 
 /// Parameters for O(1) header key rotation via [`rekey_stream`].

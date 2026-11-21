@@ -49,6 +49,14 @@ Padded containers disallow `rekey` on both forms so command behavior never revea
 
 Stealth Mode omits plaintext `RPMV` magic bytes and JSON headers altogether: bytes `[0..32]` hold a random salt, followed by fixed 108-byte AES-GCM password and recovery slots (or uniform random noise when recovery entropy is omitted), encrypted metadata, HKDF-masked 5-byte frame prefixes, and encrypted chunk payloads. Unpadded, padded, and hidden Stealth files use a fixed OWASP Argon2id baseline (`64 MiB`, `3` iterations, `4` lanes), uniformly return `AuthenticationFailed` when either a password or a required keyfile is wrong/missing, refuse `rekey` with `UnsupportedOperation`, and report only file size + SHA-256 on passwordless integrity checks so non-vault files and Stealth containers look identical without credentials. To avoid `.rpm_tmp_` sibling temp-file traces on disk during Stealth creation, Stealth writes directly to an exclusive new destination file (`create_new`), deleting partial output on returned errors — as an explicit trade-off, sudden power loss or `SIGKILL` mid-write may leave a partial encrypted file at the destination path.
 
+## Reed-Solomon Bit-Rot Protection
+
+Optional Reed-Solomon wrapping uses pure-Rust, `#![forbid(unsafe_code)]` GF(2⁸) `RS(255, 239)` with 64-way interleaving (`15,292` inner bytes per `16,320`-byte block) and a triplicated CRC32-protected `RPMR` outer header:
+
+- **Physical recovery limit:** Repairs up to `512` contiguous corrupted bytes (one disk sector) per `16,320`-byte block and tolerates complete sector-0 wipes via the triplicated outer header and block-0 structural corroboration. Damage exceeding `8` corrupted symbols in any 255-byte interleaved codeword cannot be guaranteed-repaired and may decode to another codeword (which AES-256-GCM rejects).
+- **Authentication remains purely cryptographic:** Reed-Solomon parity repairs accidental media corruption *prior* to decryption and never authenticates ciphertext. An attacker who modifies ciphertext and recomputes valid RS parity bytes is rejected by AES-256-GCM with zero promoted plaintext.
+- **Incompatibility with Stealth Mode:** Reed-Solomon is strictly mutually exclusive with Stealth Mode (`--stealth` + `--reed-solomon` is rejected) because zero syndromes in unencrypted parity blocks make RS containers distinguishable from uniform random bytes. Padded/RS envelopes also refuse in-place `rekey` (`UnsupportedOperation`).
+
 ## Reporting a vulnerability
 
 If you find a security issue, please open an issue without posting sensitive exploit details in public, or contact the maintainer.

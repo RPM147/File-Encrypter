@@ -3,6 +3,17 @@
 use rpm_storage::config::AppLanguage;
 
 pub struct Strings {
+    pub repair_cancelled: &'static str,
+    pub repair_invalid: &'static str,
+    pub repair_requires_rs: &'static str,
+    pub repair_error: &'static str,
+    pub repair_done: &'static str,
+    pub repair_running: &'static str,
+    pub btn_repair: &'static str,
+    pub rs_seen: &'static str,
+    pub rs_bytes: &'static str,
+    pub rs_help: &'static str,
+    pub rs_mode: &'static str,
     pub stealth_mode: &'static str,
     pub stealth_help: &'static str,
     pub digest_computed: &'static str,
@@ -221,6 +232,17 @@ pub struct Strings {
 }
 
 pub const TR: Strings = Strings {
+    repair_cancelled: "Onarım iptal edildi.",
+    repair_invalid: "Dosya yapısı veya hasarlı bloklar onarılamadı.",
+    repair_requires_rs: "Bu dosya Reed-Solomon korumalı değil.",
+    repair_error: "Onarım başarısız",
+    repair_done: "Onarılan bayt",
+    repair_running: "Kasa onarılıyor…",
+    btn_repair: "Onar (Reed-Solomon)",
+    rs_seen: "Düzeltilen Bayt",
+    rs_bytes: "Onarılabilir Bayt",
+    rs_help: "Disk hatalarını onarmak için parite ekler. Stealth ile birlikte kullanılamaz.",
+    rs_mode: "Reed-Solomon Bit-Rot Koruması (~%7 parite)",
     stealth_mode: "Stealth Modu (Şifreli Başlık)",
     stealth_help: "Sabit Argon2id profili: 64 MiB / 3 yineleme / 4 paralellik. Düz metin başlık yoktur. Parolasız kontrol yalnızca SHA-256 özetini hesaplar.",
     digest_computed: "SHA-256 özeti hesaplandı",
@@ -428,6 +450,17 @@ pub const TR: Strings = Strings {
 };
 
 pub const EN: Strings = Strings {
+    repair_cancelled: "Repair cancelled.",
+    repair_invalid: "The file structure or damaged blocks could not be repaired.",
+    repair_requires_rs: "This file has no Reed-Solomon protection.",
+    repair_error: "Repair failed",
+    repair_done: "Bytes repaired",
+    repair_running: "Repairing vault…",
+    btn_repair: "Repair (Reed-Solomon)",
+    rs_seen: "Repaired Bytes",
+    rs_bytes: "Repairable Bytes",
+    rs_help: "Adds parity for repairing disk damage. Mutually exclusive with Stealth.",
+    rs_mode: "Reed-Solomon Bit-Rot Protection (~7% parity)",
     stealth_mode: "Stealth Mode (Encrypted Header)",
     stealth_help: "Fixed Argon2id profile: 64 MiB / 3 iterations / 4 lanes. The header is encrypted. A passwordless check only computes SHA-256.",
     digest_computed: "SHA-256 digest computed",

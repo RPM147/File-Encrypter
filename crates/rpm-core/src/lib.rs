@@ -8,7 +8,9 @@ pub mod hidden;
 pub mod kdf;
 pub mod mem;
 pub mod recovery;
+pub mod rs;
 mod stealth;
+pub use rs::{repair_vault_stream, RepairReport, RsEncoderWriter, RsSeekableReader};
 pub mod vault;
 
 pub use constants::{

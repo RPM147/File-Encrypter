@@ -496,3 +496,22 @@ pub fn rekey_vault_v5(
         Ok(())
     })
 }
+
+/// Repair ciphertext into a sibling staging file, promoting it only after the entire envelope succeeds.
+pub fn repair_vault_v5(
+    vault_path: &Path,
+    output_path: Option<&Path>,
+    cancel: Arc<AtomicBool>,
+) -> Result<rpm_core::RepairReport, StorageError> {
+    let mut report = None;
+    atomic_write(output_path.unwrap_or(vault_path), |writer| {
+        let mut input = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
+        report = Some(rpm_core::repair_vault_stream(
+            &mut input,
+            writer,
+            Some(&cancel),
+        )?);
+        Ok(())
+    })?;
+    Ok(report.expect("atomic write completed"))
+}

@@ -1,5 +1,11 @@
 # Changelog
 
+## v4.4.0
+
+- **Optional Reed-Solomon Bit-Rot Protection (`RS(255, 239)`):** Added `--reed-solomon` in CLI and **Reed-Solomon Bit-Rot Protection (~7% parity)** in GUI Encrypt across standard, padded, and hidden Vault Format v5 containers. Implemented in pure Rust (`#![forbid(unsafe_code)]`, zero new crates) with 64-way byte interleaving (`15,292 B` inner → `16,320 B` wire blocks), repairing up to `512` contiguous corrupted bytes per block (one disk sector), plus a triplicated CRC32-protected `RPMR` outer header.
+- **Transparent Recovery & Passwordless Atomic Repair:** `decrypt`, selective extraction, RAM-only preview, `inspect`, `diff`, and `integrity` checks transparently decode and count repaired bytes without double-counting the final seek block. Added passwordless atomic repair via `rpm-encrypter-cli repair` (in place or `-o <PATH>`) and GUI **Inspect → Repair (Reed-Solomon)** (`repair_vault_v5`).
+- **Cryptographic Boundaries & UX Polish:** Reed-Solomon parity is strictly mutually exclusive with Stealth Mode (unencrypted parity syndromes distinguish encoded data from random noise), repairs accidental storage corruption strictly *before* AES-256-GCM verification (valid parity never authenticates tampered ciphertext), preserves intact hidden-compartment recovery when unrelated outer decoy blocks are damaged beyond repair, and rejects in-place `rekey` with neutral `CryptoError::UnsupportedOperation`.
+
 ## v4.3.0
 
 - **Optional Stealth Mode (Encrypted Outer Header):** Added `--stealth` in CLI and **Stealth Mode (Encrypted Header)** in GUI Encrypt across unpadded, padded, and hidden-vault containers. Stealth containers omit plaintext `RPMV` magic bytes and JSON headers cleanly, encrypting fixed-size outer password and 24-word recovery slots plus HKDF XOR-masked chunk frame headers with a fixed OWASP Argon2id profile (`64 MiB / 3 iterations / 4 lanes`).

@@ -114,17 +114,33 @@ pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> Stri
             crate::i18n::strings(lang).digest_computed
         );
     }
+    let s = crate::i18n::strings(lang);
+    let rs = yes_no(rep.has_reed_solomon, lang);
     let kf = yes_no(rep.has_keyfile, lang);
     let rec = yes_no(rep.has_recovery, lang);
     match lang {
-        AppLanguage::Tr => format!(
-            "BÜTÜNLÜK KONTROLÜ\nDosya Boyutu : {} bayt\nSürüm        : v{}\nParça Sayısı : {}\nAnahtar Dosyası : {kf}\nKurtarma Slotu  : {rec}\n\n{}",
-            rep.file_size, rep.version, rep.chunk_count, rep.message
-        ),
-        AppLanguage::En => format!(
-            "INTEGRITY CHECK\nFile Size     : {} bytes\nVersion       : v{}\nChunks        : {}\nKeyfile Slot  : {kf}\nRecovery Slot : {rec}\n\n{}",
-            rep.file_size, rep.version, rep.chunk_count, rep.message
-        ),
+        AppLanguage::Tr => {
+            let extra = if rep.has_reed_solomon {
+                format!("\n{:<17} : {}", s.rs_bytes, rep.rs_repaired_bytes)
+            } else {
+                String::new()
+            };
+            format!(
+                "BÜTÜNLÜK KONTROLÜ\nDosya Boyutu      : {} bayt\nSürüm             : v{}\nParça Sayısı      : {}\nAnahtar Dosyası   : {kf}\nKurtarma Slotu    : {rec}\nReed-Solomon      : {rs}{extra}\n\n{}",
+                rep.file_size, rep.version, rep.chunk_count, rep.message
+            )
+        }
+        AppLanguage::En => {
+            let extra = if rep.has_reed_solomon {
+                format!("\n{:<16} : {}", s.rs_bytes, rep.rs_repaired_bytes)
+            } else {
+                String::new()
+            };
+            format!(
+                "INTEGRITY CHECK\nFile Size        : {} bytes\nVersion          : v{}\nChunks           : {}\nKeyfile Slot     : {kf}\nRecovery Slot    : {rec}\nReed-Solomon     : {rs}{extra}\n\n{}",
+                rep.file_size, rep.version, rep.chunk_count, rep.message
+            )
+        }
     }
 }
 
@@ -173,6 +189,34 @@ pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
         ],
     };
 
+    match lang {
+        AppLanguage::Tr => {
+            lines.push(format!(
+                "Reed-Solomon    : {}",
+                yes_no(info.has_reed_solomon, lang)
+            ));
+            if info.has_reed_solomon {
+                lines.push(format!(
+                    "{:<15} : {}",
+                    crate::i18n::strings(lang).rs_seen,
+                    info.rs_repaired_bytes
+                ));
+            }
+        }
+        AppLanguage::En => {
+            lines.push(format!(
+                "Reed-Solomon   : {}",
+                yes_no(info.has_reed_solomon, lang)
+            ));
+            if info.has_reed_solomon {
+                lines.push(format!(
+                    "{:<14} : {}",
+                    crate::i18n::strings(lang).rs_seen,
+                    info.rs_repaired_bytes
+                ));
+            }
+        }
+    }
     if info.is_stealth {
         lines.push(match lang {
             AppLanguage::Tr => {
@@ -442,6 +486,7 @@ pub fn spawn_encrypt(
     compress: bool,
     container_size_bytes: Option<u64>,
     stealth: bool,
+    reed_solomon: bool,
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
@@ -458,6 +503,7 @@ pub fn spawn_encrypt(
 
         let opts = EncryptOptions {
             stealth,
+            reed_solomon,
             kdf: if stealth {
                 rpm_core::STEALTH_KDF_PARAMS
             } else {
@@ -538,6 +584,7 @@ pub fn spawn_encrypt_hidden(
     hidden_compressed: bool,
     container_size_bytes: u64,
     stealth: bool,
+    reed_solomon: bool,
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
@@ -565,6 +612,7 @@ pub fn spawn_encrypt_hidden(
 
         let opts = HiddenEncryptOptions {
             stealth,
+            reed_solomon,
             kdf: if stealth {
                 rpm_core::STEALTH_KDF_PARAMS
             } else {
@@ -1118,6 +1166,46 @@ pub fn spawn_preview(
                 message: format!("{} ({err})", s.preview_failed),
                 cancelled: false,
             },
+        };
+        send(&tx, &ctx, msg);
+    });
+}
+
+pub fn spawn_repair(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let s = crate::i18n::strings(lang);
+        let msg = match rpm_storage::repair_vault_v5(&path, None, cancel) {
+            Ok(r) => WorkerUpdate::RepairDone(match lang {
+                AppLanguage::Tr => format!(
+                    "{}: {} ({} blok kontrol edildi)",
+                    s.repair_done, r.repaired_bytes, r.blocks_checked
+                ),
+                AppLanguage::En => format!(
+                    "{}: {} ({} blocks checked)",
+                    s.repair_done, r.repaired_bytes, r.blocks_checked
+                ),
+            }),
+            Err(StorageError::Crypto(CryptoError::UnsupportedOperation(_))) => {
+                WorkerUpdate::Error(s.repair_requires_rs.into())
+            }
+            Err(StorageError::Crypto(CryptoError::Cancelled)) => {
+                WorkerUpdate::Error(s.repair_cancelled.into())
+            }
+            Err(StorageError::Crypto(CryptoError::InvalidFormat(_))) => {
+                WorkerUpdate::Error(s.repair_invalid.into())
+            }
+            Err(StorageError::Crypto(CryptoError::Io(e)))
+                if e.kind() == std::io::ErrorKind::InvalidData =>
+            {
+                WorkerUpdate::Error(s.repair_invalid.into())
+            }
+            Err(e) => WorkerUpdate::Error(format!("{}: {e}", s.repair_error)),
         };
         send(&tx, &ctx, msg);
     });

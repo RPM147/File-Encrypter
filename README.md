@@ -21,6 +21,7 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 - **Headless CLI (`rpm-encrypter-cli`):** Scriptable encryption, decryption, inspection, re-keying, password generation, and Windows shell integration without passing passwords on the command line.
 - **Container Padding & Hidden Vault (Plausible Deniability):** Pad vaults to fixed MiB container sizes with `OsRng` random bytes (`--container-mb` or GUI Container Size selector) and optionally embed an indistinguishable secondary hidden compartment (`--hidden` or GUI Hidden Vault panel) with independent credentials.
 - **Optional Stealth Mode (Encrypted Header):** Encrypt the outer password/recovery slots and frame prefixes with no plaintext `RPMV` header (`--stealth` or GUI Encrypt checkbox), using a fixed OWASP Argon2id profile (`64 MiB / 3 / 4`) so the entire file appears indistinguishable from uniform random bytes regardless of extension.
+- **Optional Reed-Solomon Bit-Rot Protection & Repair:** Add ~7% interleaved `RS(255, 239)` parity (`--reed-solomon` in CLI or GUI Encrypt checkbox; mutually exclusive with Stealth) to tolerate and transparently repair up to `512` contiguous corrupted bytes (one disk sector) per `16,320`-byte block, with passwordless atomic repair via CLI `repair` or GUI **Inspect → Repair (Reed-Solomon)**.
 - **Header-Only Vault Diff:** Compare two vaults' authenticated file manifests (added, removed, changed, unchanged) from headers alone in GUI **Inspect** or CLI `diff`.
 - **Windows Shell Integration (User-Scoped HKCU):** Optional right-click **"Encrypt with RPM Encrypter"** menu and `.vault` double-click opening (reversible, zero administrator rights required).
 
@@ -54,8 +55,10 @@ Passwords are never accepted as CLI flags; interactive secure prompts or `--pass
 
 ```bash
 cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-out recovery.txt
+cargo run -p rpm-cli -- encrypt ./folder --reed-solomon
 cargo run -p rpm-cli -- encrypt ./folder --stealth --container-mb 50
 cargo run -p rpm-cli -- encrypt ./decoy --container-mb 50 --hidden ./secret --hidden-keyfile ./hidden.key
+cargo run -p rpm-cli -- repair ./folder.vault
 cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored
 cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json
 cargo run -p rpm-cli -- diff ./vault-a.vault ./vault-b.vault

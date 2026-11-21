@@ -49,6 +49,9 @@ pub enum Commands {
         /// Encrypt the header as well as the payload, using the fixed Stealth KDF profile.
         #[arg(long)]
         stealth: bool,
+        /// Protect the encrypted vault against bit rot with interleaved Reed-Solomon parity.
+        #[arg(long, conflicts_with = "stealth")]
+        reed_solomon: bool,
         /// Pad the output container to this exact size in MiB.
         #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
         container_mb: Option<u64>,
@@ -112,6 +115,14 @@ pub enum Commands {
         recovery: bool,
         #[arg(long, conflicts_with_all = ["password_stdin", "recovery"])]
         recovery_stdin: bool,
+    },
+    /// Repair a Reed-Solomon envelope without a password (in place by default).
+    Repair {
+        vault: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Rotate a vault password (and optionally keyfile) in O(1) without decrypting payload.
     Rekey {
@@ -348,6 +359,7 @@ where
             sources,
             container_mb,
             stealth,
+            reed_solomon,
             hidden,
             hidden_keyfile,
             hidden_no_compress,
@@ -440,6 +452,7 @@ where
             let enc_res = if hidden.is_empty() {
                 let opts = EncryptOptions {
                     stealth,
+                    reed_solomon,
                     kdf,
                     recovery_key: Some(rec_entropy),
                     keyfile_hash,
@@ -479,6 +492,7 @@ where
                 };
                 let opts = HiddenEncryptOptions {
                     stealth,
+                    reed_solomon,
                     kdf,
                     container_size_bytes: container_size_bytes
                         .expect("--hidden requires --container-mb"),
@@ -710,6 +724,8 @@ where
                                 "file_size": rep.file_size,
                                 "sha256": rep.sha256_hex,
                                 "sha256_only": rep.sha256_only,
+                                "has_reed_solomon": rep.has_reed_solomon,
+                                "rs_repaired_bytes": rep.rs_repaired_bytes,
                                 "has_keyfile": rep.has_keyfile,
                                 "has_recovery": rep.has_recovery,
                                 "chunk_count": rep.chunk_count,
@@ -717,8 +733,20 @@ where
                             });
                             let _ =
                                 writeln!(stdout, "{}", serde_json::to_string_pretty(&val).unwrap());
-                        } else {
+                        } else if rep.sha256_only {
                             let _ = writeln!(stdout, "{}", rep.message);
+                        } else if rep.has_reed_solomon {
+                            let _ = writeln!(
+                                stdout,
+                                "{}\nhas_reed_solomon: {}\nrs_repaired_bytes: {}",
+                                rep.message, rep.has_reed_solomon, rep.rs_repaired_bytes
+                            );
+                        } else {
+                            let _ = writeln!(
+                                stdout,
+                                "{}\nhas_reed_solomon: {}",
+                                rep.message, rep.has_reed_solomon
+                            );
                         }
                         return if rep.ok { 0 } else { 1 };
                     }
@@ -800,21 +828,32 @@ where
                             "container_size": info.container_size,
                             "is_hidden_compartment": info.is_hidden_compartment,
                             "is_stealth": info.is_stealth,
+                            "has_reed_solomon": info.has_reed_solomon,
+                            "rs_repaired_bytes": info.rs_repaired_bytes,
                             "has_keyfile": info.has_keyfile,
                             "has_recovery": info.has_recovery,
                             "metadata": info.metadata,
                         });
                         let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&val).unwrap());
                     } else {
+                        let rs_line = if info.has_reed_solomon {
+                            format!(
+                                "has_reed_solomon: true\nrs_repaired_bytes: {}\n",
+                                info.rs_repaired_bytes
+                            )
+                        } else {
+                            "has_reed_solomon: false\n".into()
+                        };
                         let _ = writeln!(
                             stdout,
-                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\nis_stealth: {}\n{}",
+                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\nis_stealth: {}\n{}{}",
                             info.version,
                             info.cipher,
                             info.chunk_size / 1024,
                             info.container_size.map_or_else(|| "none".into(), |n| format!("{n} bytes")),
                             info.is_hidden_compartment,
                             info.is_stealth,
+                            rs_line,
                             format_metadata_plain(&info.metadata)
                         );
                     }
@@ -830,6 +869,28 @@ where
             }
         }
 
+        Commands::Repair {
+            vault,
+            output,
+            json,
+        } => match rpm_storage::repair_vault_v5(&vault, output.as_deref(), cancel) {
+            Ok(report) => {
+                if json {
+                    let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&report).unwrap());
+                } else {
+                    let _ = writeln!(
+                        stdout,
+                        "Checked {} blocks, repaired {} bytes (header repaired: {}).",
+                        report.blocks_checked, report.repaired_bytes, report.header_repaired
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "Repair failed: {e}");
+                1
+            }
+        },
         Commands::Rekey {
             vault,
             keyfile,

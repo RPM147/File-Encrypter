@@ -278,6 +278,8 @@ pub(crate) fn unlock<R: Read + Seek>(
         argon_iterations: kdf.iterations,
         argon_parallelism: kdf.parallelism,
         is_hidden_compartment: false,
+        has_reed_solomon: false,
+        rs_repaired_bytes: 0,
         is_stealth: true,
         container_size: padded.then_some(container),
         metadata,

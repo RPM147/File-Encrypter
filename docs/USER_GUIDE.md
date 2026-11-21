@@ -26,6 +26,7 @@ Use a fixed-size padded container to hide the true size of your payload or to em
 - **Container Size (Padding):** In the **Encrypt** tab, change **Container Size (Padding)** from `Auto (Content Size)` to `10 MiB`, `50 MiB`, `100 MiB`, `500 MiB`, or `Custom (MiB)` (1–65536 MiB), or pass `--container-mb <MiB>` in the CLI. Unused space is filled with random `OsRng` bytes, while keeping the exact same public header format.
 - **Hidden Vault (Plausible Deniability):** Expand **Hidden Vault (Plausible Deniability)** on the **Encrypt** tab and enable embedding a secondary hidden vault. Select separate hidden sources, a hidden password that **differs** from the outer password, and an optional hidden keyfile. Unlocking with the outer password reveals only the decoy vault; unlocking with the hidden password transparently reveals only the hidden vault.
 - **Stealth Mode (Encrypted Header):** Check **Stealth Mode (Encrypted Header)** on the **Encrypt** tab (or pass `--stealth` in CLI) to omit the plaintext `RPMV` magic bytes and JSON header so the entire file looks like uniform random data and can be renamed to any extension (`.bin`, `.dat`, etc.). Stealth containers always use a fixed OWASP Argon2id profile (`64 MiB / 3 iterations / 4 lanes`) regardless of Settings, report only file size and SHA-256 on passwordless integrity checks, and still support padding, Hidden Vault, and the 24-word recovery phrase for the outer vault.
+- **Reed-Solomon Bit-Rot Protection (~7% parity):** Check **Reed-Solomon Bit-Rot Protection (~7% parity)** on the **Encrypt** tab (or pass `--reed-solomon` in CLI) to guard standard, padded, or Hidden Vault archives against silent media corruption up to `512` contiguous bytes per `16,320`-byte block. Reed-Solomon cannot be combined with Stealth Mode (unencrypted parity syndromes distinguish RS blocks from random noise), and in-place `rekey` is disabled on RS containers.
 - **Important constraints:**
   - Hidden vaults require a fixed container size (`Auto` cannot be used).
   - **The 24-word recovery phrase unlocks only the outer (decoy) vault;** by design, no recovery phrase is generated for the hidden compartment.
@@ -50,7 +51,7 @@ Drag and drop `.vault` files onto the window. On the **Decrypt** tab, enter the 
 
 Use the **Inspect** tab to verify integrity or restore specific files without writing the whole archive to disk:
 
-- **Integrity Check (No Password):** Verifies the vault header, chunk framing, exact EOF/container-size boundary, and full-file SHA-256 digest without needing credentials.
+- **Integrity Check (No Password) & Repair:** Click **Integrity Check (No Password)** to verify the vault header, chunk framing, exact EOF/container-size boundary, Reed-Solomon repairable bytes (if enabled), and full-file SHA-256 digest without needing credentials. For Reed-Solomon protected vaults with disk damage, click **Repair (Reed-Solomon)** (or run `rpm-encrypter-cli repair <vault> [-o <copy>]`) to atomically write corrected blocks without a password.
 - **Inspect Metadata, RAM-Only Preview & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase, click **Preview** beside any file (up to `16 MiB`) to view UTF-8 text or images (`PNG/JPEG/WebP/GIF/BMP`) purely in RAM after full AEAD authentication completes with zero temporary files on disk (closing, `Esc`, switching tabs, or changing vaults scrubs the preview buffer), or check files/folders and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before anything is returned or written to disk.)*
 
 ## Comparing two vaults (Vault Diff)
@@ -88,6 +89,13 @@ Examples below assume a terminal opened in the extracted release folder with `./
 # Encrypt a folder with encrypted header (Stealth Mode) + 25 MiB padding
 ./rpm-encrypter-cli encrypt ./Docs --stealth --container-mb 25
 
+# Encrypt a folder with Reed-Solomon bit-rot protection (~7% parity)
+./rpm-encrypter-cli encrypt ./Docs --reed-solomon
+
+# Repair a damaged Reed-Solomon vault without a password (in place or to a copy)
+./rpm-encrypter-cli repair ./Docs.vault
+./rpm-encrypter-cli repair ./Docs.vault -o ./Docs.repaired.vault
+
 # Create an outer + hidden vault (uncompressed hidden compartment + hidden keyfile)
 ./rpm-encrypter-cli encrypt ./Decoy --container-mb 50 --hidden ./Secret --hidden-keyfile ./hidden.key --hidden-no-compress
 
@@ -115,11 +123,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.3.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.4.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.3.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.3.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.4.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.4.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.

@@ -172,7 +172,25 @@ pub fn ui(
         }
 
         ui.add_enabled_ui(!state.busy, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(s.btn_repair).clicked() {
+                    let path = PathBuf::from(state.inspect.vault_path.trim());
+                    if path.is_file() {
+                        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                        state.busy = true;
+                        state.transfer = None;
+                        state.set_status(s.repair_running, false);
+                        worker::spawn_repair(
+                            ctx.clone(),
+                            tx.clone(),
+                            path,
+                            cancel.clone(),
+                            state.config.language,
+                        );
+                    } else {
+                        state.set_status(s.err_select_vault, true);
+                    }
+                }
                 if ui.button(s.btn_integrity_check).clicked() {
                     let p = PathBuf::from(state.inspect.vault_path.trim());
                     if !p.is_file() {

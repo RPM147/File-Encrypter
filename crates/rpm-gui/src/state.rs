@@ -173,6 +173,7 @@ pub enum WorkerUpdate {
         manifest: Vec<FileManifestEntry>,
         vault_path: PathBuf,
     },
+    RepairDone(String),
     IntegrityDone {
         sha256_only: bool,
         text: String,
@@ -201,6 +202,7 @@ impl Drop for RecoveryPrompt {
 }
 
 pub struct EncryptFields {
+    pub reed_solomon: bool,
     pub stealth: bool,
     pub sources: Vec<PathBuf>,
     pub keyfile: Option<PathBuf>,
@@ -224,6 +226,19 @@ pub struct EncryptFields {
 }
 
 impl EncryptFields {
+    pub fn set_stealth(&mut self, on: bool) {
+        self.stealth = on;
+        if on {
+            self.reed_solomon = false;
+        }
+    }
+    pub fn set_reed_solomon(&mut self, on: bool) {
+        self.reed_solomon = on;
+        if on {
+            self.stealth = false;
+        }
+    }
+
     pub fn resolve_container_size(&self) -> Result<Option<u64>, ContainerSizeError> {
         let resolved = self
             .container_preset
@@ -528,6 +543,7 @@ impl Default for AppState {
             show_shell_install_modal: false,
             clipboard_deadline: None,
             encrypt: EncryptFields {
+                reed_solomon: false,
                 stealth: false,
                 sources: Vec::new(),
                 keyfile: None,
