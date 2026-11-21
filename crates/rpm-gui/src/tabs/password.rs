@@ -15,7 +15,32 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
 
     theme::card_frame(ui.visuals()).show(ui, |ui| {
         ui.add(egui::Slider::new(&mut state.pwgen.length, 12..=64).text(s.pwg_length));
-        ui.checkbox(&mut state.pwgen.include_symbols, s.chk_symbols);
+        ui.add_space(4.0);
+
+        let only_one = state.pwgen.enabled_class_count() <= 1;
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled(
+                !(only_one && state.pwgen.include_uppercase),
+                egui::Checkbox::new(&mut state.pwgen.include_uppercase, s.chk_uppercase),
+            )
+            .on_disabled_hover_text(s.err_pw_no_class);
+            ui.add_enabled(
+                !(only_one && state.pwgen.include_lowercase),
+                egui::Checkbox::new(&mut state.pwgen.include_lowercase, s.chk_lowercase),
+            )
+            .on_disabled_hover_text(s.err_pw_no_class);
+            ui.add_enabled(
+                !(only_one && state.pwgen.include_digits),
+                egui::Checkbox::new(&mut state.pwgen.include_digits, s.chk_digits),
+            )
+            .on_disabled_hover_text(s.err_pw_no_class);
+            ui.add_enabled(
+                !(only_one && state.pwgen.include_symbols),
+                egui::Checkbox::new(&mut state.pwgen.include_symbols, s.chk_symbols),
+            )
+            .on_disabled_hover_text(s.err_pw_no_class);
+        });
+        ui.checkbox(&mut state.pwgen.exclude_ambiguous, s.chk_exclude_ambiguous);
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {

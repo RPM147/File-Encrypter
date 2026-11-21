@@ -149,6 +149,7 @@ impl eframe::App for RpmApp {
         let ctx = &ui.ctx().clone();
         if !self.theme_initialized {
             self.state.apply_theme_visuals(ctx);
+            self.state.apply_ui_scale(ctx);
             self.theme_initialized = true;
         }
 

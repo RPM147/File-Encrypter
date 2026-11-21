@@ -1,13 +1,14 @@
 //! GUI state, launch routing, drag-and-drop triage, and zeroizing field management.
 
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rand::rngs::OsRng;
 use rand::Rng;
-use rpm_core::{FileManifestEntry, SecretKey};
+use rpm_core::{CryptoError, FileManifestEntry, KdfParams, SecretKey};
 use rpm_storage::config::{
     default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode,
 };
@@ -17,6 +18,28 @@ use zeroize::Zeroize;
 
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
+
+pub const UI_SCALE_PRESETS: [u16; 5] = [80, 90, 100, 110, 120];
+pub const UI_SCALE_MIN: u16 = 80;
+pub const UI_SCALE_MAX: u16 = 120;
+pub const UI_SCALE_DEFAULT: u16 = 100;
+
+pub const ARGON_ITERATIONS_RANGE: RangeInclusive<u32> = 1..=10;
+pub const ARGON_PARALLELISM_RANGE: RangeInclusive<u32> = 1..=16;
+
+pub const PWGEN_UPPERCASE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+pub const PWGEN_LOWERCASE: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+pub const PWGEN_DIGITS: &[u8] = b"0123456789";
+pub const PWGEN_SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{}";
+pub const PWGEN_AMBIGUOUS: &[u8] = b"0O1lI";
+
+pub fn clamp_ui_scale_percent(percent: u16) -> u16 {
+    percent.clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+}
+
+pub fn ui_scale_zoom_factor(percent: u16) -> f32 {
+    f32::from(clamp_ui_scale_percent(percent)) / 100.0
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -218,8 +241,60 @@ impl Drop for RekeyFields {
 
 pub struct PasswordGenFields {
     pub length: usize,
+    pub include_uppercase: bool,
+    pub include_lowercase: bool,
+    pub include_digits: bool,
     pub include_symbols: bool,
+    pub exclude_ambiguous: bool,
     pub generated: String,
+}
+
+impl Default for PasswordGenFields {
+    fn default() -> Self {
+        Self {
+            length: 24,
+            include_uppercase: true,
+            include_lowercase: true,
+            include_digits: true,
+            include_symbols: true,
+            exclude_ambiguous: true,
+            generated: String::new(),
+        }
+    }
+}
+
+impl PasswordGenFields {
+    pub fn enabled_class_count(&self) -> usize {
+        usize::from(self.include_uppercase)
+            + usize::from(self.include_lowercase)
+            + usize::from(self.include_digits)
+            + usize::from(self.include_symbols)
+    }
+
+    pub fn has_any_class(&self) -> bool {
+        self.enabled_class_count() > 0
+    }
+
+    /// Build the active ASCII character pool from selected classes and ambiguity filter.
+    pub fn build_alphabet(&self) -> Vec<u8> {
+        let mut alphabet = Vec::with_capacity(80);
+        if self.include_lowercase {
+            alphabet.extend_from_slice(PWGEN_LOWERCASE);
+        }
+        if self.include_uppercase {
+            alphabet.extend_from_slice(PWGEN_UPPERCASE);
+        }
+        if self.include_digits {
+            alphabet.extend_from_slice(PWGEN_DIGITS);
+        }
+        if self.include_symbols {
+            alphabet.extend_from_slice(PWGEN_SYMBOLS);
+        }
+        if self.exclude_ambiguous {
+            alphabet.retain(|b| !PWGEN_AMBIGUOUS.contains(b));
+        }
+        alphabet
+    }
 }
 
 impl Drop for PasswordGenFields {
@@ -238,6 +313,7 @@ pub struct AppState {
     pub logs: Vec<String>,
     pub config: AppConfig,
     pub config_path: Option<PathBuf>,
+    pub ui_scale_percent: u16,
     pub shell_status: ShellIntegrationStatus,
     pub show_shell_install_modal: bool,
     pub clipboard_deadline: Option<Instant>,
@@ -251,10 +327,16 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         let cfg_path = default_config_path();
-        let config = cfg_path
+        let mut config = cfg_path
             .as_deref()
             .map(load_config_from)
             .unwrap_or_default();
+        if config.kdf_params().validate().is_err() {
+            let defaults = KdfParams::owasp_default();
+            config.argon_memory_kib = defaults.memory_kib;
+            config.argon_iterations = defaults.iterations;
+            config.argon_parallelism = defaults.parallelism;
+        }
         let compress = config.compress_by_default;
         let s = i18n::strings(config.language);
 
@@ -268,6 +350,7 @@ impl Default for AppState {
             logs: Vec::new(),
             config,
             config_path: cfg_path,
+            ui_scale_percent: UI_SCALE_DEFAULT,
             shell_status: shell_integration::get_status(),
             show_shell_install_modal: false,
             clipboard_deadline: None,
@@ -316,11 +399,7 @@ impl Default for AppState {
                 confirm_password: String::new(),
                 show_password: false,
             },
-            pwgen: PasswordGenFields {
-                length: 24,
-                include_symbols: true,
-                generated: String::new(),
-            },
+            pwgen: PasswordGenFields::default(),
         }
     }
 }
@@ -362,9 +441,56 @@ impl AppState {
     }
 
     pub fn persist_config_best_effort(&self) {
+        if self.validate_kdf_params().is_err() {
+            return;
+        }
         if let Some(ref path) = self.config_path {
             let _ = save_config_to(path, &self.config);
         }
+    }
+
+    pub fn validate_kdf_params(&self) -> Result<KdfParams, CryptoError> {
+        let params = self.config.kdf_params();
+        params.validate()?;
+        Ok(params)
+    }
+
+    pub fn set_argon_params(
+        &mut self,
+        memory_kib: u32,
+        iterations: u32,
+        parallelism: u32,
+    ) -> Result<KdfParams, CryptoError> {
+        let candidate = KdfParams {
+            memory_kib,
+            iterations,
+            parallelism,
+        };
+        candidate.validate()?;
+        self.config.argon_memory_kib = candidate.memory_kib;
+        self.config.argon_iterations = candidate.iterations;
+        self.config.argon_parallelism = candidate.parallelism;
+        Ok(candidate)
+    }
+
+    pub fn save_preferences(&mut self) -> Result<(), String> {
+        let s = self.strings();
+        if let Err(e) = self.validate_kdf_params() {
+            let msg = format!("{}: {e}", s.err_invalid_kdf);
+            self.set_status(msg.clone(), true);
+            return Err(msg);
+        }
+        if let Some(ref p) = self.config_path {
+            match save_config_to(p, &self.config) {
+                Ok(()) => self.set_status(s.status_prefs_saved, false),
+                Err(e) => {
+                    let msg = format!("{}: {e}", s.err_save_prefs);
+                    self.set_status(msg.clone(), true);
+                    return Err(msg);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_encrypt_secrets(&mut self) {
@@ -511,10 +637,12 @@ impl AppState {
     }
 
     pub fn generate_password(&mut self) {
-        let mut alphabet: Vec<u8> =
-            b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789".to_vec();
-        if self.pwgen.include_symbols {
-            alphabet.extend_from_slice(b"!@#$%^&*()-_=+[]{}");
+        let alphabet = self.pwgen.build_alphabet();
+        if alphabet.is_empty() {
+            self.pwgen.generated.zeroize();
+            let msg = self.strings().err_pw_no_class;
+            self.set_status(msg, true);
+            return;
         }
         let len = self.pwgen.length.clamp(12, 64);
         self.pwgen.generated.zeroize();
@@ -547,6 +675,19 @@ impl AppState {
 
     pub fn apply_theme_visuals(&self, ctx: &egui::Context) {
         crate::theme::apply_theme(ctx, self.config.theme);
+    }
+
+    pub fn ui_scale_zoom_factor(&self) -> f32 {
+        ui_scale_zoom_factor(self.ui_scale_percent)
+    }
+
+    pub fn set_ui_scale_percent(&mut self, percent: u16, ctx: &egui::Context) {
+        self.ui_scale_percent = clamp_ui_scale_percent(percent);
+        self.apply_ui_scale(ctx);
+    }
+
+    pub fn apply_ui_scale(&self, ctx: &egui::Context) {
+        ctx.set_zoom_factor(self.ui_scale_zoom_factor());
     }
 }
 

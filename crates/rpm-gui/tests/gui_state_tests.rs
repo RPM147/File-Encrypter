@@ -8,7 +8,12 @@ use rpm_gui::progress::{
     format_bytes, format_eta, format_rate, format_transfer_summary, format_transfer_tooltip,
     TransferMeter, TransferSnapshot,
 };
-use rpm_gui::state::{strength_label_and_color_for, AppState, RecoveryPrompt, Tab};
+use rpm_gui::state::{
+    clamp_ui_scale_percent, strength_label_and_color_for, ui_scale_zoom_factor, AppState,
+    PasswordGenFields, RecoveryPrompt, Tab, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE,
+    PWGEN_AMBIGUOUS, PWGEN_DIGITS, PWGEN_LOWERCASE, PWGEN_SYMBOLS, PWGEN_UPPERCASE,
+    UI_SCALE_DEFAULT, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_PRESETS,
+};
 use rpm_gui::{fonts, i18n, load_app_icon, worker};
 use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
 use rpm_storage::{GuiLaunchIntent, LaunchTab};
@@ -314,4 +319,335 @@ fn transfer_meter_and_bilingual_formatting_handle_edge_cases() {
     assert_eq!(st.progress, 0.0);
     assert!(st.transfer.is_none());
     assert_eq!(st.status, "Starting");
+}
+
+#[test]
+fn password_generator_character_classes_ambiguous_exclusion_and_guard() {
+    // 1. Defaults preserve existing behavior (all 4 classes enabled, ambiguous excluded)
+    let def = PasswordGenFields::default();
+    assert_eq!(def.length, 24);
+    assert!(def.include_uppercase);
+    assert!(def.include_lowercase);
+    assert!(def.include_digits);
+    assert!(def.include_symbols);
+    assert!(def.exclude_ambiguous);
+    assert_eq!(def.enabled_class_count(), 4);
+    assert!(def.has_any_class());
+
+    let default_alpha = def.build_alphabet();
+    // 25 lowercase + 24 uppercase + 8 digits + 18 symbols = 75 unique bytes
+    assert_eq!(default_alpha.len(), 75);
+    for &amb in PWGEN_AMBIGUOUS {
+        assert!(
+            !default_alpha.contains(&amb),
+            "default alphabet must exclude ambiguous char {}",
+            amb as char
+        );
+    }
+
+    // Including ambiguous chars adds all 5 back (0, O, 1, l, I) -> 80 bytes
+    let mut with_amb = PasswordGenFields::default();
+    with_amb.exclude_ambiguous = false;
+    let full_alpha = with_amb.build_alphabet();
+    assert_eq!(full_alpha.len(), 80);
+    for &amb in PWGEN_AMBIGUOUS {
+        assert!(
+            full_alpha.contains(&amb),
+            "full alphabet must include ambiguous char {}",
+            amb as char
+        );
+    }
+
+    // 2. Single-class combinations (with & without ambiguous exclusion)
+    let mut st = AppState::default();
+    st.pwgen.length = 64;
+
+    // Uppercase only, exclude ambiguous
+    st.pwgen.include_uppercase = true;
+    st.pwgen.include_lowercase = false;
+    st.pwgen.include_digits = false;
+    st.pwgen.include_symbols = false;
+    st.pwgen.exclude_ambiguous = true;
+    assert_eq!(st.pwgen.enabled_class_count(), 1);
+    assert_eq!(st.pwgen.build_alphabet().len(), 24);
+    st.generate_password();
+    assert!(!st.is_error);
+    assert_eq!(st.pwgen.generated.len(), 64);
+    assert!(st
+        .pwgen
+        .generated
+        .bytes()
+        .all(|b| { PWGEN_UPPERCASE.contains(&b) && !PWGEN_AMBIGUOUS.contains(&b) }));
+
+    // Lowercase only, include ambiguous
+    st.pwgen.include_uppercase = false;
+    st.pwgen.include_lowercase = true;
+    st.pwgen.exclude_ambiguous = false;
+    assert_eq!(st.pwgen.build_alphabet().len(), 26);
+    st.generate_password();
+    assert!(!st.is_error);
+    assert!(st
+        .pwgen
+        .generated
+        .bytes()
+        .all(|b| PWGEN_LOWERCASE.contains(&b)));
+
+    // Digits only, exclude ambiguous -> only '2'..='9'
+    st.pwgen.include_lowercase = false;
+    st.pwgen.include_digits = true;
+    st.pwgen.exclude_ambiguous = true;
+    assert_eq!(st.pwgen.build_alphabet(), b"23456789");
+    st.generate_password();
+    assert!(!st.is_error);
+    assert!(st
+        .pwgen
+        .generated
+        .bytes()
+        .all(|b| { PWGEN_DIGITS.contains(&b) && !PWGEN_AMBIGUOUS.contains(&b) }));
+
+    // Symbols only (ambiguous exclusion does not empty symbols)
+    st.pwgen.include_digits = false;
+    st.pwgen.include_symbols = true;
+    st.pwgen.exclude_ambiguous = true;
+    assert_eq!(st.pwgen.build_alphabet(), PWGEN_SYMBOLS);
+    st.generate_password();
+    assert!(!st.is_error);
+    assert!(st
+        .pwgen
+        .generated
+        .bytes()
+        .all(|b| PWGEN_SYMBOLS.contains(&b)));
+
+    // Mixed subset: uppercase + digits, no lowercase/symbols
+    st.pwgen.include_uppercase = true;
+    st.pwgen.include_digits = true;
+    st.pwgen.include_symbols = false;
+    st.pwgen.exclude_ambiguous = false;
+    assert_eq!(st.pwgen.enabled_class_count(), 2);
+    assert_eq!(st.pwgen.build_alphabet().len(), 36);
+    st.generate_password();
+    assert!(!st.is_error);
+    assert!(st
+        .pwgen
+        .generated
+        .bytes()
+        .all(|b| { PWGEN_UPPERCASE.contains(&b) || PWGEN_DIGITS.contains(&b) }));
+
+    // Length clamping: below 12 clamps to 12, above 64 clamps to 64
+    st.pwgen.length = 4;
+    st.generate_password();
+    assert_eq!(st.pwgen.generated.len(), 12);
+    st.pwgen.length = 200;
+    st.generate_password();
+    assert_eq!(st.pwgen.generated.len(), 64);
+
+    // Non-determinism via OsRng
+    let first = st.pwgen.generated.clone();
+    st.generate_password();
+    assert_ne!(first, st.pwgen.generated);
+
+    // 3. All-disabled guard: non-panicking, clears previous secret, sets localized error
+    st.pwgen.include_uppercase = false;
+    st.pwgen.include_lowercase = false;
+    st.pwgen.include_digits = false;
+    st.pwgen.include_symbols = false;
+    assert_eq!(st.pwgen.enabled_class_count(), 0);
+    assert!(!st.pwgen.has_any_class());
+    assert!(st.pwgen.build_alphabet().is_empty());
+
+    st.config.language = AppLanguage::Tr;
+    st.pwgen.generated = "stale-secret".into();
+    st.generate_password();
+    assert!(st.is_error);
+    assert!(st.pwgen.generated.is_empty());
+    assert_eq!(st.status, i18n::TR.err_pw_no_class);
+
+    st.config.language = AppLanguage::En;
+    st.pwgen.generated = "stale-secret".into();
+    st.generate_password();
+    assert!(st.is_error);
+    assert!(st.pwgen.generated.is_empty());
+    assert_eq!(st.status, i18n::EN.err_pw_no_class);
+
+    // Re-enabling a class recovers cleanly
+    st.pwgen.include_lowercase = true;
+    st.pwgen.length = 20;
+    st.generate_password();
+    assert!(!st.is_error);
+    assert_eq!(st.pwgen.generated.len(), 20);
+    assert_eq!(st.status, i18n::EN.status_pw_generated);
+}
+
+#[test]
+fn argon2id_settings_validation_and_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("prefs.json");
+
+    let mut st = AppState {
+        config_path: Some(cfg_path.clone()),
+        ..Default::default()
+    };
+    st.config.language = AppLanguage::En;
+
+    // Every UI slider endpoint for iterations (1..=10) & parallelism (1..=16) is valid
+    assert_eq!(ARGON_ITERATIONS_RANGE, 1..=10);
+    assert_eq!(ARGON_PARALLELISM_RANGE, 1..=16);
+    for mem in [16_384, 65_536, 131_072, 262_144] {
+        for iters in [
+            *ARGON_ITERATIONS_RANGE.start(),
+            *ARGON_ITERATIONS_RANGE.end(),
+        ] {
+            for par in [
+                *ARGON_PARALLELISM_RANGE.start(),
+                *ARGON_PARALLELISM_RANGE.end(),
+            ] {
+                let kdf = st
+                    .set_argon_params(mem, iters, par)
+                    .expect("UI Argon2id range must satisfy KdfParams::validate");
+                assert_eq!(kdf.memory_kib, mem);
+                assert_eq!(kdf.iterations, iters);
+                assert_eq!(kdf.parallelism, par);
+                assert!(st.validate_kdf_params().is_ok());
+            }
+        }
+    }
+
+    // Valid params save and reload cleanly
+    st.set_argon_params(131_072, 5, 8).unwrap();
+    assert!(st.save_preferences().is_ok());
+    assert!(!st.is_error);
+    assert_eq!(st.status, i18n::EN.status_prefs_saved);
+    let reloaded = load_config_from(&cfg_path);
+    assert_eq!(reloaded.argon_memory_kib, 131_072);
+    assert_eq!(reloaded.argon_iterations, 5);
+    assert_eq!(reloaded.argon_parallelism, 8);
+
+    // Invalid params are rejected by set_argon_params without mutating existing config
+    assert!(st.set_argon_params(65_536, 0, 4).is_err());
+    assert!(st.set_argon_params(65_536, 65, 4).is_err());
+    assert!(st.set_argon_params(65_536, 3, 0).is_err());
+    assert!(st.set_argon_params(65_536, 3, 65).is_err());
+    assert!(st.set_argon_params(1024, 3, 4).is_err());
+    assert_eq!(st.config.argon_memory_kib, 131_072);
+    assert_eq!(st.config.argon_iterations, 5);
+    assert_eq!(st.config.argon_parallelism, 8);
+
+    // Direct invalid mutation blocks both save_preferences and persist_config_best_effort
+    let bad_path = dir.path().join("should_not_exist.json");
+    st.config_path = Some(bad_path.clone());
+    st.config.argon_iterations = 0;
+    assert!(st.validate_kdf_params().is_err());
+    st.persist_config_best_effort();
+    assert!(!bad_path.exists());
+
+    let err_en = st.save_preferences().unwrap_err();
+    assert!(st.is_error);
+    assert!(err_en.starts_with(i18n::EN.err_invalid_kdf));
+    assert!(!bad_path.exists());
+
+    st.config.language = AppLanguage::Tr;
+    st.config.argon_iterations = 3;
+    st.config.argon_parallelism = 0;
+    let err_tr = st.save_preferences().unwrap_err();
+    assert!(st.is_error);
+    assert!(err_tr.starts_with(i18n::TR.err_invalid_kdf));
+    assert!(!bad_path.exists());
+}
+
+#[test]
+fn ui_scale_clamping_zoom_factor_and_context_application() {
+    assert_eq!(UI_SCALE_PRESETS, [80, 90, 100, 110, 120]);
+    assert_eq!(UI_SCALE_MIN, 80);
+    assert_eq!(UI_SCALE_MAX, 120);
+    assert_eq!(UI_SCALE_DEFAULT, 100);
+
+    // Clamping bounds
+    assert_eq!(clamp_ui_scale_percent(0), 80);
+    assert_eq!(clamp_ui_scale_percent(50), 80);
+    assert_eq!(clamp_ui_scale_percent(79), 80);
+    assert_eq!(clamp_ui_scale_percent(80), 80);
+    assert_eq!(clamp_ui_scale_percent(100), 100);
+    assert_eq!(clamp_ui_scale_percent(120), 120);
+    assert_eq!(clamp_ui_scale_percent(121), 120);
+    assert_eq!(clamp_ui_scale_percent(300), 120);
+    assert_eq!(clamp_ui_scale_percent(u16::MAX), 120);
+
+    // Zoom factor conversion across all presets and out-of-range values
+    for (pct, expected) in [
+        (50, 0.8_f32),
+        (80, 0.8_f32),
+        (90, 0.9_f32),
+        (100, 1.0_f32),
+        (110, 1.1_f32),
+        (120, 1.2_f32),
+        (250, 1.2_f32),
+    ] {
+        assert!(
+            (ui_scale_zoom_factor(pct) - expected).abs() < 1e-6,
+            "pct={pct}"
+        );
+    }
+
+    // AppState default and egui::Context integration
+    let mut st = AppState::default();
+    assert_eq!(st.ui_scale_percent, 100);
+    assert!((st.ui_scale_zoom_factor() - 1.0).abs() < 1e-6);
+
+    let ctx = egui::Context::default();
+    let flush_zoom = |ctx: &egui::Context| -> f32 {
+        ctx.begin_pass(egui::RawInput::default());
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        ctx.zoom_factor()
+    };
+
+    st.set_ui_scale_percent(110, &ctx);
+    assert_eq!(st.ui_scale_percent, 110);
+    assert!((flush_zoom(&ctx) - 1.1).abs() < 1e-6);
+
+    st.set_ui_scale_percent(40, &ctx);
+    assert_eq!(st.ui_scale_percent, 80);
+    assert!((flush_zoom(&ctx) - 0.8).abs() < 1e-6);
+
+    st.set_ui_scale_percent(250, &ctx);
+    assert_eq!(st.ui_scale_percent, 120);
+    assert!((flush_zoom(&ctx) - 1.2).abs() < 1e-6);
+
+    // Direct field mutation still clamps safely in apply_ui_scale
+    st.ui_scale_percent = 999;
+    st.apply_ui_scale(&ctx);
+    assert!((flush_zoom(&ctx) - 1.2).abs() < 1e-6);
+}
+
+#[test]
+fn phase2_settings_and_password_gen_bilingual_strings_parity() {
+    let tr = i18n::strings(AppLanguage::Tr);
+    let en = i18n::strings(AppLanguage::En);
+
+    let pairs = [
+        (tr.chk_uppercase, en.chk_uppercase),
+        (tr.chk_lowercase, en.chk_lowercase),
+        (tr.chk_digits, en.chk_digits),
+        (tr.chk_symbols, en.chk_symbols),
+        (tr.chk_exclude_ambiguous, en.chk_exclude_ambiguous),
+        (tr.err_pw_no_class, en.err_pw_no_class),
+        (tr.lbl_ui_scale, en.lbl_ui_scale),
+        (tr.lbl_argon_iterations, en.lbl_argon_iterations),
+        (tr.lbl_argon_parallelism, en.lbl_argon_parallelism),
+        (tr.err_invalid_kdf, en.err_invalid_kdf),
+        (tr.err_save_prefs, en.err_save_prefs),
+    ];
+
+    for (t, e) in pairs {
+        assert!(!t.trim().is_empty(), "TR string must be non-empty");
+        assert!(!e.trim().is_empty(), "EN string must be non-empty");
+        assert_ne!(t, e, "TR and EN strings should be localized distinctly");
+    }
+
+    assert!(tr.chk_exclude_ambiguous.contains("0, O, 1, l, I"));
+    assert!(en.chk_exclude_ambiguous.contains("0, O, 1, l, I"));
+    assert!(tr.lbl_argon_iterations.contains("Argon2id"));
+    assert!(en.lbl_argon_iterations.contains("Argon2id"));
+    assert!(tr.lbl_argon_parallelism.contains("Argon2id"));
+    assert!(en.lbl_argon_parallelism.contains("Argon2id"));
 }

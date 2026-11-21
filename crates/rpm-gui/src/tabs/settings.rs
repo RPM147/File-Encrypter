@@ -1,10 +1,10 @@
 //! Settings & Windows Shell Integration tab UI.
 
 use eframe::egui;
-use rpm_storage::config::{save_config_to, AppLanguage, ThemeMode};
+use rpm_storage::config::{AppLanguage, ThemeMode};
 use rpm_storage::shell_integration;
 
-use crate::state::AppState;
+use crate::state::{AppState, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, UI_SCALE_PRESETS};
 use crate::theme;
 
 pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
@@ -45,9 +45,32 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
 
         let s = state.strings();
         ui.horizontal(|ui| {
+            ui.label(s.lbl_ui_scale);
+            let mut selected_scale = state.ui_scale_percent;
+            let mut scale_changed = false;
+            for pct in UI_SCALE_PRESETS {
+                if ui
+                    .selectable_value(&mut selected_scale, pct, format!("{pct}%"))
+                    .clicked()
+                {
+                    scale_changed = true;
+                }
+            }
+            if scale_changed {
+                state.set_ui_scale_percent(selected_scale, ctx);
+            }
+        });
+
+        ui.separator();
+
+        let mut argon_mem = state.config.argon_memory_kib;
+        let mut argon_iters = state.config.argon_iterations;
+        let mut argon_par = state.config.argon_parallelism;
+
+        ui.horizontal(|ui| {
             ui.label(s.lbl_argon_mem);
             egui::ComboBox::from_id_salt("argon_mem")
-                .selected_text(format!("{} MiB", state.config.argon_memory_kib / 1024))
+                .selected_text(format!("{} MiB", argon_mem / 1024))
                 .show_ui(ui, |ui| {
                     for (kib, label) in [
                         (16_384, s.argon_16),
@@ -55,10 +78,36 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
                         (131_072, s.argon_128),
                         (262_144, s.argon_256),
                     ] {
-                        ui.selectable_value(&mut state.config.argon_memory_kib, kib, label);
+                        ui.selectable_value(&mut argon_mem, kib, label);
                     }
                 });
         });
+
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_argon_iterations);
+            ui.add(egui::Slider::new(&mut argon_iters, ARGON_ITERATIONS_RANGE));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_argon_parallelism);
+            ui.add(egui::Slider::new(&mut argon_par, ARGON_PARALLELISM_RANGE));
+        });
+
+        if argon_mem != state.config.argon_memory_kib
+            || argon_iters != state.config.argon_iterations
+            || argon_par != state.config.argon_parallelism
+        {
+            if let Err(e) = state.set_argon_params(argon_mem, argon_iters, argon_par) {
+                state.set_status(format!("{}: {e}", s.err_invalid_kdf), true);
+            }
+        }
+
+        if let Err(e) = state.validate_kdf_params() {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 80, 80),
+                format!("{}: {e}", s.err_invalid_kdf),
+            );
+        }
 
         ui.checkbox(
             &mut state.config.compress_by_default,
@@ -75,12 +124,7 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
             .add(theme::primary_button(s.btn_save_prefs, ui.visuals()))
             .clicked()
         {
-            if let Some(ref p) = state.config_path {
-                match save_config_to(p, &state.config) {
-                    Ok(()) => state.set_status(s.status_prefs_saved, false),
-                    Err(e) => state.set_status(format!("Error: {e}"), true),
-                }
-            }
+            let _ = state.save_preferences();
         }
     });
 
