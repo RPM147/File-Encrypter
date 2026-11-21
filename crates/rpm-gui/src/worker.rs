@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
-    check_integrity, hash_keyfile_reader, inspect_header, mnemonic_to_entropy, Auth,
-    EncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultInfo,
+    check_integrity, diff_metadata, hash_keyfile_reader, inspect_header, mnemonic_to_entropy, Auth,
+    EncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultDiff, VaultInfo,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
@@ -24,6 +24,7 @@ use crate::progress::{TransferMeter, TransferSnapshot};
 use crate::state::WorkerUpdate;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
+const MAX_REPORT_ENTRIES: usize = 150;
 
 fn send(tx: &mpsc::Sender<WorkerUpdate>, ctx: &egui::Context, msg: WorkerUpdate) {
     let _ = tx.send(msg);
@@ -150,24 +151,174 @@ pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
         match lang {
             AppLanguage::Tr => {
                 lines.push(format!("DOSYA LİSTESİ ({} girdi):", m.files.len()));
-                for entry in m.files.iter().take(150) {
+                for entry in m.files.iter().take(MAX_REPORT_ENTRIES) {
                     lines.push(format!("  - {} ({} bayt)", entry.path, entry.size));
                 }
-                if m.files.len() > 150 {
-                    lines.push(format!("  ... ve {} girdi daha", m.files.len() - 150));
+                if m.files.len() > MAX_REPORT_ENTRIES {
+                    lines.push(format!(
+                        "  ... ve {} girdi daha",
+                        m.files.len() - MAX_REPORT_ENTRIES
+                    ));
                 }
             }
             AppLanguage::En => {
                 lines.push(format!("FILE MANIFEST ({} entries):", m.files.len()));
-                for entry in m.files.iter().take(150) {
+                for entry in m.files.iter().take(MAX_REPORT_ENTRIES) {
                     lines.push(format!("  - {} ({} bytes)", entry.path, entry.size));
                 }
-                if m.files.len() > 150 {
-                    lines.push(format!("  ... and {} more", m.files.len() - 150));
+                if m.files.len() > MAX_REPORT_ENTRIES {
+                    lines.push(format!(
+                        "  ... and {} more",
+                        m.files.len() - MAX_REPORT_ENTRIES
+                    ));
                 }
             }
         }
     }
+    lines.join("\n")
+}
+
+fn format_signed_delta(delta: i128) -> String {
+    if delta > 0 {
+        format!("+{delta}")
+    } else {
+        delta.to_string()
+    }
+}
+
+/// Format a header-only Vault Diff (A -> B) summary & categorized entries for localized GUI display.
+pub fn format_diff_report(diff: &VaultDiff, lang: AppLanguage) -> String {
+    let mut lines = match lang {
+        AppLanguage::Tr => vec![
+            "KASA KARŞILAŞTIRMA (A -> B, Yalnızca Başlık)".to_string(),
+            format!(
+                "Özet: +{} eklenen, -{} silinen, ~{} değişen, ={} değişmeyen",
+                diff.added.len(),
+                diff.removed.len(),
+                diff.changed.len(),
+                diff.unchanged.len()
+            ),
+        ],
+        AppLanguage::En => vec![
+            "VAULT DIFF (A -> B, Header-Only)".to_string(),
+            format!(
+                "Summary: +{} added, -{} removed, ~{} changed, ={} unchanged",
+                diff.added.len(),
+                diff.removed.len(),
+                diff.changed.len(),
+                diff.unchanged.len()
+            ),
+        ],
+    };
+
+    if diff.added.is_empty() && diff.removed.is_empty() && diff.changed.is_empty() {
+        lines.push(match lang {
+            AppLanguage::Tr => {
+                "Fark bulunamadı — her iki kasa dosya listesi birebir aynı.".to_string()
+            }
+            AppLanguage::En => {
+                "No differences found — both vault manifests are identical.".to_string()
+            }
+        });
+    }
+
+    let push_simple_section =
+        |lines: &mut Vec<String>,
+         heading_tr: &str,
+         heading_en: &str,
+         prefix: char,
+         entries: &[rpm_core::FileManifestEntry]| {
+            if entries.is_empty() {
+                return;
+            }
+            lines.push(String::new());
+            match lang {
+                AppLanguage::Tr => {
+                    lines.push(format!("{heading_tr} ({}):", entries.len()));
+                    for entry in entries.iter().take(MAX_REPORT_ENTRIES) {
+                        lines.push(format!("  {prefix} {} ({} bayt)", entry.path, entry.size));
+                    }
+                    if entries.len() > MAX_REPORT_ENTRIES {
+                        lines.push(format!(
+                            "  ... ve {} girdi daha",
+                            entries.len() - MAX_REPORT_ENTRIES
+                        ));
+                    }
+                }
+                AppLanguage::En => {
+                    lines.push(format!("{heading_en} ({}):", entries.len()));
+                    for entry in entries.iter().take(MAX_REPORT_ENTRIES) {
+                        lines.push(format!("  {prefix} {} ({} bytes)", entry.path, entry.size));
+                    }
+                    if entries.len() > MAX_REPORT_ENTRIES {
+                        lines.push(format!(
+                            "  ... and {} more",
+                            entries.len() - MAX_REPORT_ENTRIES
+                        ));
+                    }
+                }
+            }
+        };
+
+    push_simple_section(&mut lines, "EKLENEN", "ADDED", '+', &diff.added);
+    push_simple_section(&mut lines, "SİLİNEN", "REMOVED", '-', &diff.removed);
+
+    if !diff.changed.is_empty() {
+        lines.push(String::new());
+        match lang {
+            AppLanguage::Tr => {
+                lines.push(format!("DEĞİŞEN ({}):", diff.changed.len()));
+                for entry in diff.changed.iter().take(MAX_REPORT_ENTRIES) {
+                    let size_delta = i128::from(entry.after.size) - i128::from(entry.before.size);
+                    let mtime_delta = i128::from(entry.after.modified_unix)
+                        - i128::from(entry.before.modified_unix);
+                    lines.push(format!(
+                        "  ~ {} (boyut: {} -> {} bayt [{}], mtime: {} -> {} [{} sn])",
+                        entry.after.path,
+                        entry.before.size,
+                        entry.after.size,
+                        format_signed_delta(size_delta),
+                        entry.before.modified_unix,
+                        entry.after.modified_unix,
+                        format_signed_delta(mtime_delta),
+                    ));
+                }
+                if diff.changed.len() > MAX_REPORT_ENTRIES {
+                    lines.push(format!(
+                        "  ... ve {} girdi daha",
+                        diff.changed.len() - MAX_REPORT_ENTRIES
+                    ));
+                }
+            }
+            AppLanguage::En => {
+                lines.push(format!("CHANGED ({}):", diff.changed.len()));
+                for entry in diff.changed.iter().take(MAX_REPORT_ENTRIES) {
+                    let size_delta = i128::from(entry.after.size) - i128::from(entry.before.size);
+                    let mtime_delta = i128::from(entry.after.modified_unix)
+                        - i128::from(entry.before.modified_unix);
+                    lines.push(format!(
+                        "  ~ {} (size: {} -> {} bytes [{}], mtime: {} -> {} [{}s])",
+                        entry.after.path,
+                        entry.before.size,
+                        entry.after.size,
+                        format_signed_delta(size_delta),
+                        entry.before.modified_unix,
+                        entry.after.modified_unix,
+                        format_signed_delta(mtime_delta),
+                    ));
+                }
+                if diff.changed.len() > MAX_REPORT_ENTRIES {
+                    lines.push(format!(
+                        "  ... and {} more",
+                        diff.changed.len() - MAX_REPORT_ENTRIES
+                    ));
+                }
+            }
+        }
+    }
+
+    push_simple_section(&mut lines, "DEĞİŞMEYEN", "UNCHANGED", '=', &diff.unchanged);
+
     lines.join("\n")
 }
 
@@ -451,6 +602,103 @@ pub fn spawn_inspect(
                         vault_path: vault.clone(),
                     },
                 );
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        }
+    });
+}
+
+pub struct VaultDiffTarget {
+    pub path: PathBuf,
+    pub use_recovery: bool,
+    pub secret: Zeroizing<String>,
+    pub keyfile: Option<PathBuf>,
+}
+
+fn unlock_vault_header_for_diff(
+    label: &str,
+    target: &VaultDiffTarget,
+    lang: AppLanguage,
+) -> Result<VaultInfo, String> {
+    let prefix = match lang {
+        AppLanguage::Tr => format!("Kasa {label}"),
+        AppLanguage::En => format!("Vault {label}"),
+    };
+    if !target.path.is_file() {
+        return Err(match lang {
+            AppLanguage::Tr => format!("{prefix}: dosya bulunamadı: {}", target.path.display()),
+            AppLanguage::En => format!("{prefix}: vault not found: {}", target.path.display()),
+        });
+    }
+    let keyfile_hash = if target.use_recovery {
+        None
+    } else {
+        load_optional_keyfile(target.keyfile.as_deref())
+            .map_err(|e| format!("{prefix}: {}", keyfile_error_msg(&e, lang)))?
+    };
+    let recovery_key = if target.use_recovery {
+        Some(mnemonic_to_entropy(&target.secret).map_err(|e| format!("{prefix}: {e}"))?)
+    } else {
+        None
+    };
+
+    let mut reader = File::open(&target.path)
+        .map(BufReader::new)
+        .map_err(|e| format!("{prefix}: {e}"))?;
+    let auth = if let Some(ref rk) = recovery_key {
+        Auth::RecoveryKey(rk)
+    } else {
+        Auth::Password {
+            password: target.secret.as_bytes(),
+            keyfile_hash: keyfile_hash.as_ref(),
+        }
+    };
+    inspect_header(&mut reader, auth).map_err(|e| format!("{prefix}: {e}"))
+}
+
+pub fn spawn_vault_diff(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    vault_a: VaultDiffTarget,
+    vault_b: VaultDiffTarget,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let info_a = match unlock_vault_header_for_diff("A", &vault_a, lang) {
+            Ok(info) => info,
+            Err(err) => {
+                send(&tx, &ctx, WorkerUpdate::Error(err));
+                return;
+            }
+        };
+        let info_b = match unlock_vault_header_for_diff("B", &vault_b, lang) {
+            Ok(info) => info,
+            Err(err) => {
+                send(&tx, &ctx, WorkerUpdate::Error(err));
+                return;
+            }
+        };
+
+        match diff_metadata(&info_a.metadata, &info_b.metadata) {
+            Ok(diff) => {
+                let text = format_diff_report(&diff, lang);
+                let status = match lang {
+                    AppLanguage::Tr => format!(
+                        "Karşılaştırma tamamlandı: +{} -{} ~{} ={}",
+                        diff.added.len(),
+                        diff.removed.len(),
+                        diff.changed.len(),
+                        diff.unchanged.len()
+                    ),
+                    AppLanguage::En => format!(
+                        "Comparison complete: +{} -{} ~{} ={}",
+                        diff.added.len(),
+                        diff.removed.len(),
+                        diff.changed.len(),
+                        diff.unchanged.len()
+                    ),
+                };
+                send(&tx, &ctx, WorkerUpdate::DiffDone { text, status });
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use rpm_core::{FileManifestEntry, IntegrityReport, SecretKey, VaultInfo, VaultMetadata};
+use rpm_core::{
+    ChangedEntry, FileManifestEntry, IntegrityReport, SecretKey, VaultDiff, VaultInfo,
+    VaultMetadata,
+};
 use rpm_gui::progress::{
     format_bytes, format_eta, format_rate, format_transfer_summary, format_transfer_tooltip,
     TransferMeter, TransferSnapshot,
@@ -556,23 +559,24 @@ fn argon2id_settings_validation_and_persistence() {
 
 #[test]
 fn ui_scale_clamping_zoom_factor_and_context_application() {
-    assert_eq!(UI_SCALE_PRESETS, [80, 90, 100, 110, 120]);
+    assert_eq!(UI_SCALE_PRESETS, [80, 90, 100, 110, 120, 130, 150]);
     assert_eq!(UI_SCALE_MIN, 80);
-    assert_eq!(UI_SCALE_MAX, 120);
+    assert_eq!(UI_SCALE_MAX, 150);
     assert_eq!(UI_SCALE_DEFAULT, 100);
 
-    // Clamping bounds
+    // Clamping bounds (80..=150 matching AppConfig)
     assert_eq!(clamp_ui_scale_percent(0), 80);
     assert_eq!(clamp_ui_scale_percent(50), 80);
     assert_eq!(clamp_ui_scale_percent(79), 80);
     assert_eq!(clamp_ui_scale_percent(80), 80);
     assert_eq!(clamp_ui_scale_percent(100), 100);
-    assert_eq!(clamp_ui_scale_percent(120), 120);
-    assert_eq!(clamp_ui_scale_percent(121), 120);
-    assert_eq!(clamp_ui_scale_percent(300), 120);
-    assert_eq!(clamp_ui_scale_percent(u16::MAX), 120);
+    assert_eq!(clamp_ui_scale_percent(125), 125);
+    assert_eq!(clamp_ui_scale_percent(150), 150);
+    assert_eq!(clamp_ui_scale_percent(151), 150);
+    assert_eq!(clamp_ui_scale_percent(300), 150);
+    assert_eq!(clamp_ui_scale_percent(u16::MAX), 150);
 
-    // Zoom factor conversion across all presets and out-of-range values
+    // Zoom factor conversion across presets, custom in-range, and out-of-range values
     for (pct, expected) in [
         (50, 0.8_f32),
         (80, 0.8_f32),
@@ -580,7 +584,10 @@ fn ui_scale_clamping_zoom_factor_and_context_application() {
         (100, 1.0_f32),
         (110, 1.1_f32),
         (120, 1.2_f32),
-        (250, 1.2_f32),
+        (125, 1.25_f32),
+        (130, 1.3_f32),
+        (150, 1.5_f32),
+        (250, 1.5_f32),
     ] {
         assert!(
             (ui_scale_zoom_factor(pct) - expected).abs() < 1e-6,
@@ -588,9 +595,10 @@ fn ui_scale_clamping_zoom_factor_and_context_application() {
         );
     }
 
-    // AppState default and egui::Context integration
+    // AppState config binding and egui::Context integration
     let mut st = AppState::default();
-    assert_eq!(st.ui_scale_percent, 100);
+    st.config.ui_scale_percent = UI_SCALE_DEFAULT;
+    assert_eq!(st.config.ui_scale_percent, 100);
     assert!((st.ui_scale_zoom_factor() - 1.0).abs() < 1e-6);
 
     let ctx = egui::Context::default();
@@ -601,22 +609,164 @@ fn ui_scale_clamping_zoom_factor_and_context_application() {
         ctx.zoom_factor()
     };
 
-    st.set_ui_scale_percent(110, &ctx);
-    assert_eq!(st.ui_scale_percent, 110);
-    assert!((flush_zoom(&ctx) - 1.1).abs() < 1e-6);
+    st.set_ui_scale_percent(130, &ctx);
+    assert_eq!(st.config.ui_scale_percent, 130);
+    assert!((flush_zoom(&ctx) - 1.3).abs() < 1e-6);
 
     st.set_ui_scale_percent(40, &ctx);
-    assert_eq!(st.ui_scale_percent, 80);
+    assert_eq!(st.config.ui_scale_percent, 80);
     assert!((flush_zoom(&ctx) - 0.8).abs() < 1e-6);
 
     st.set_ui_scale_percent(250, &ctx);
-    assert_eq!(st.ui_scale_percent, 120);
-    assert!((flush_zoom(&ctx) - 1.2).abs() < 1e-6);
+    assert_eq!(st.config.ui_scale_percent, 150);
+    assert!((flush_zoom(&ctx) - 1.5).abs() < 1e-6);
 
     // Direct field mutation still clamps safely in apply_ui_scale
-    st.ui_scale_percent = 999;
+    st.config.ui_scale_percent = 999;
     st.apply_ui_scale(&ctx);
-    assert!((flush_zoom(&ctx) - 1.2).abs() < 1e-6);
+    assert!((flush_zoom(&ctx) - 1.5).abs() < 1e-6);
+
+    // Persistent round-trip via save_preferences -> load_config_from
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("ui_scale_prefs.json");
+    st.config_path = Some(cfg_path.clone());
+    st.set_ui_scale_percent(125, &ctx);
+    assert!(st.save_preferences().is_ok());
+    let reloaded = load_config_from(&cfg_path);
+    assert_eq!(reloaded.ui_scale_percent, 125);
+
+    // Out-of-range direct mutation is clamped before writing to disk
+    st.config.ui_scale_percent = 300;
+    assert!(st.save_preferences().is_ok());
+    assert_eq!(st.config.ui_scale_percent, 150);
+    assert_eq!(load_config_from(&cfg_path).ui_scale_percent, 150);
+
+    st.config.ui_scale_percent = 20;
+    st.persist_config_best_effort();
+    assert_eq!(load_config_from(&cfg_path).ui_scale_percent, 80);
+}
+
+#[test]
+fn vault_diff_report_formatting_and_secret_clearing() {
+    let diff = VaultDiff {
+        added: vec![FileManifestEntry {
+            path: "docs/new.txt".into(),
+            size: 512,
+            modified_unix: 1_700_000_100,
+        }],
+        removed: vec![FileManifestEntry {
+            path: "docs/old.txt".into(),
+            size: 128,
+            modified_unix: 1_700_000_000,
+        }],
+        changed: vec![
+            ChangedEntry {
+                before: FileManifestEntry {
+                    path: "notes.md".into(),
+                    size: 100,
+                    modified_unix: 1_000,
+                },
+                after: FileManifestEntry {
+                    path: "notes.md".into(),
+                    size: 150,
+                    modified_unix: 1_060,
+                },
+            },
+            ChangedEntry {
+                before: FileManifestEntry {
+                    path: "shrink.bin".into(),
+                    size: 300,
+                    modified_unix: 2_000,
+                },
+                after: FileManifestEntry {
+                    path: "shrink.bin".into(),
+                    size: 200,
+                    modified_unix: 1_950,
+                },
+            },
+        ],
+        unchanged: vec![FileManifestEntry {
+            path: "same.txt".into(),
+            size: 64,
+            modified_unix: 500,
+        }],
+    };
+
+    let tr_report = worker::format_diff_report(&diff, AppLanguage::Tr);
+    assert!(tr_report.contains("KASA KARŞILAŞTIRMA"));
+    assert!(tr_report.contains("+1 eklenen, -1 silinen, ~2 değişen, =1 değişmeyen"));
+    assert!(tr_report.contains("EKLENEN (1):"));
+    assert!(tr_report.contains("docs/new.txt (512 bayt)"));
+    assert!(tr_report.contains("SİLİNEN (1):"));
+    assert!(tr_report.contains("docs/old.txt (128 bayt)"));
+    assert!(tr_report.contains("DEĞİŞEN (2):"));
+    assert!(
+        tr_report.contains("notes.md (boyut: 100 -> 150 bayt [+50], mtime: 1000 -> 1060 [+60 sn])")
+    );
+    assert!(tr_report
+        .contains("shrink.bin (boyut: 300 -> 200 bayt [-100], mtime: 2000 -> 1950 [-50 sn])"));
+    assert!(tr_report.contains("DEĞİŞMEYEN (1):"));
+    assert!(tr_report.contains("same.txt (64 bayt)"));
+
+    let en_report = worker::format_diff_report(&diff, AppLanguage::En);
+    assert!(en_report.contains("VAULT DIFF"));
+    assert!(en_report.contains("+1 added, -1 removed, ~2 changed, =1 unchanged"));
+    assert!(en_report.contains("ADDED (1):"));
+    assert!(en_report.contains("docs/new.txt (512 bytes)"));
+    assert!(en_report.contains("REMOVED (1):"));
+    assert!(en_report.contains("docs/old.txt (128 bytes)"));
+    assert!(en_report.contains("CHANGED (2):"));
+    assert!(
+        en_report.contains("notes.md (size: 100 -> 150 bytes [+50], mtime: 1000 -> 1060 [+60s])")
+    );
+    assert!(en_report
+        .contains("shrink.bin (size: 300 -> 200 bytes [-100], mtime: 2000 -> 1950 [-50s])"));
+    assert!(en_report.contains("UNCHANGED (1):"));
+    assert!(en_report.contains("same.txt (64 bytes)"));
+
+    // Identical vaults message in both languages
+    let identical = VaultDiff {
+        unchanged: vec![FileManifestEntry {
+            path: "only.txt".into(),
+            size: 10,
+            modified_unix: 10,
+        }],
+        ..Default::default()
+    };
+    let id_tr = worker::format_diff_report(&identical, AppLanguage::Tr);
+    let id_en = worker::format_diff_report(&identical, AppLanguage::En);
+    assert!(id_tr.contains("Fark bulunamadı"));
+    assert!(id_tr.contains("DEĞİŞMEYEN (1):"));
+    assert!(id_en.contains("No differences found"));
+    assert!(id_en.contains("UNCHANGED (1):"));
+
+    // Long list truncation (> 150 entries)
+    let many_added = VaultDiff {
+        added: (0..155)
+            .map(|i| FileManifestEntry {
+                path: format!("file_{i:03}.dat"),
+                size: i as u64,
+                modified_unix: 0,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    assert!(
+        worker::format_diff_report(&many_added, AppLanguage::Tr).contains("... ve 5 girdi daha")
+    );
+    assert!(worker::format_diff_report(&many_added, AppLanguage::En).contains("... and 5 more"));
+
+    // clear_diff_secrets wipes all 4 secret fields cleanly
+    let mut st = AppState::default();
+    st.diff.password_a = "SecretA!".into();
+    st.diff.recovery_phrase_a = "alpha beta gamma".into();
+    st.diff.password_b = "SecretB!".into();
+    st.diff.recovery_phrase_b = "delta epsilon zeta".into();
+    st.clear_diff_secrets();
+    assert!(st.diff.password_a.is_empty());
+    assert!(st.diff.recovery_phrase_a.is_empty());
+    assert!(st.diff.password_b.is_empty());
+    assert!(st.diff.recovery_phrase_b.is_empty());
 }
 
 #[test]
@@ -636,6 +786,15 @@ fn phase2_settings_and_password_gen_bilingual_strings_parity() {
         (tr.lbl_argon_parallelism, en.lbl_argon_parallelism),
         (tr.err_invalid_kdf, en.err_invalid_kdf),
         (tr.err_save_prefs, en.err_save_prefs),
+        (tr.diff_heading, en.diff_heading),
+        (tr.diff_subtitle, en.diff_subtitle),
+        (tr.lbl_vault_a, en.lbl_vault_a),
+        (tr.lbl_vault_b, en.lbl_vault_b),
+        (tr.btn_compare_vaults, en.btn_compare_vaults),
+        (tr.diff_default_results, en.diff_default_results),
+        (tr.err_diff_select_vaults, en.err_diff_select_vaults),
+        (tr.err_diff_enter_creds, en.err_diff_enter_creds),
+        (tr.status_comparing_vaults, en.status_comparing_vaults),
     ];
 
     for (t, e) in pairs {

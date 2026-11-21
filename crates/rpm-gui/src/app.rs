@@ -93,6 +93,12 @@ impl RpmApp {
                     let _ = s;
                     self.state.set_status(label, !ok);
                 }
+                WorkerUpdate::DiffDone { text, status } => {
+                    self.state.busy = false;
+                    self.state.transfer = None;
+                    self.state.diff.results = text;
+                    self.state.set_status(status, false);
+                }
                 WorkerUpdate::RekeyDone { status } => {
                     self.state.busy = false;
                     self.state.transfer = None;

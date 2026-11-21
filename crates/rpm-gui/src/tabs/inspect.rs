@@ -7,7 +7,9 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::i18n::Strings;
 use crate::state::{AppState, WorkerUpdate};
+use crate::worker::VaultDiffTarget;
 use crate::{theme, worker};
 
 fn format_size(bytes: u64) -> String {
@@ -18,6 +20,75 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_vault_side_ui(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    vault_label: &str,
+    vault_path: &mut String,
+    keyfile: &mut Option<PathBuf>,
+    use_recovery: &mut bool,
+    password: &mut String,
+    show_password: &mut bool,
+    recovery_phrase: &mut String,
+    s: &'static Strings,
+) {
+    ui.push_id(id_salt, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(vault_label);
+            ui.text_edit_singleline(vault_path);
+            if ui.button(s.btn_browse).clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("RPM Vault", &["vault"])
+                    .pick_file()
+                {
+                    *vault_path = p.display().to_string();
+                }
+            }
+        });
+
+        ui.checkbox(use_recovery, s.chk_unlock_rec);
+        if *use_recovery {
+            ui.add(
+                egui::TextEdit::multiline(recovery_phrase)
+                    .desired_width(500.0)
+                    .desired_rows(2)
+                    .font(egui::TextStyle::Monospace),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(s.lbl_password);
+                ui.add(
+                    egui::TextEdit::singleline(password)
+                        .password(!*show_password)
+                        .desired_width(240.0),
+                );
+                let toggle_lbl = if *show_password {
+                    s.btn_hide
+                } else {
+                    s.btn_show
+                };
+                if ui.small_button(toggle_lbl).clicked() {
+                    *show_password = !*show_password;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(s.lbl_keyfile_opt);
+                if let Some(ref kf) = *keyfile {
+                    ui.label(kf.display().to_string());
+                    if ui.small_button(s.btn_clear).clicked() {
+                        *keyfile = None;
+                    }
+                } else if ui.button(s.btn_select_keyfile).clicked() {
+                    if let Some(kf) = rfd::FileDialog::new().pick_file() {
+                        *keyfile = Some(kf);
+                    }
+                }
+            });
+        }
+    });
 }
 
 pub fn ui(
@@ -294,4 +365,117 @@ pub fn ui(
             });
         });
     }
+
+    ui.add_space(12.0);
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        ui.strong(s.diff_heading);
+        ui.weak(s.diff_subtitle);
+        ui.add_space(6.0);
+
+        diff_vault_side_ui(
+            ui,
+            "diff_vault_a",
+            s.lbl_vault_a,
+            &mut state.diff.vault_a_path,
+            &mut state.diff.keyfile_a,
+            &mut state.diff.use_recovery_a,
+            &mut state.diff.password_a,
+            &mut state.diff.show_password_a,
+            &mut state.diff.recovery_phrase_a,
+            s,
+        );
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        diff_vault_side_ui(
+            ui,
+            "diff_vault_b",
+            s.lbl_vault_b,
+            &mut state.diff.vault_b_path,
+            &mut state.diff.keyfile_b,
+            &mut state.diff.use_recovery_b,
+            &mut state.diff.password_b,
+            &mut state.diff.show_password_b,
+            &mut state.diff.recovery_phrase_b,
+            s,
+        );
+
+        ui.add_space(6.0);
+        ui.add_enabled_ui(!state.busy, |ui| {
+            if ui
+                .add(theme::primary_button(s.btn_compare_vaults, ui.visuals()))
+                .clicked()
+            {
+                let path_a = PathBuf::from(state.diff.vault_a_path.trim());
+                let path_b = PathBuf::from(state.diff.vault_b_path.trim());
+                if !path_a.is_file() || !path_b.is_file() {
+                    state.set_status(s.err_diff_select_vaults, true);
+                    return;
+                }
+
+                let use_recovery_a = state.diff.use_recovery_a;
+                let use_recovery_b = state.diff.use_recovery_b;
+                let sec_a = Zeroizing::new(if use_recovery_a {
+                    std::mem::take(&mut state.diff.recovery_phrase_a)
+                } else {
+                    std::mem::take(&mut state.diff.password_a)
+                });
+                let sec_b = Zeroizing::new(if use_recovery_b {
+                    std::mem::take(&mut state.diff.recovery_phrase_b)
+                } else {
+                    std::mem::take(&mut state.diff.password_b)
+                });
+                state.clear_diff_secrets();
+
+                if sec_a.trim().is_empty() || sec_b.trim().is_empty() {
+                    state.set_status(s.err_diff_enter_creds, true);
+                    return;
+                }
+
+                let target_a = VaultDiffTarget {
+                    path: path_a,
+                    use_recovery: use_recovery_a,
+                    secret: sec_a,
+                    keyfile: (!use_recovery_a)
+                        .then(|| state.diff.keyfile_a.clone())
+                        .flatten(),
+                };
+                let target_b = VaultDiffTarget {
+                    path: path_b,
+                    use_recovery: use_recovery_b,
+                    secret: sec_b,
+                    keyfile: (!use_recovery_b)
+                        .then(|| state.diff.keyfile_b.clone())
+                        .flatten(),
+                };
+
+                state.busy = true;
+                state.transfer = None;
+                state.set_status(s.status_comparing_vaults, false);
+                worker::spawn_vault_diff(
+                    ctx.clone(),
+                    tx.clone(),
+                    target_a,
+                    target_b,
+                    state.config.language,
+                );
+            }
+        });
+
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("inspect_diff_results")
+            .max_height(210.0)
+            .show(ui, |ui| {
+                let mut view = state.diff.results.as_str();
+                ui.add(
+                    egui::TextEdit::multiline(&mut view)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(10)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+    });
 }

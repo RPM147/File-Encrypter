@@ -19,9 +19,9 @@ use zeroize::Zeroize;
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
 
-pub const UI_SCALE_PRESETS: [u16; 5] = [80, 90, 100, 110, 120];
+pub const UI_SCALE_PRESETS: [u16; 7] = [80, 90, 100, 110, 120, 130, 150];
 pub const UI_SCALE_MIN: u16 = 80;
-pub const UI_SCALE_MAX: u16 = 120;
+pub const UI_SCALE_MAX: u16 = 150;
 pub const UI_SCALE_DEFAULT: u16 = 100;
 
 pub const ARGON_ITERATIONS_RANGE: RangeInclusive<u32> = 1..=10;
@@ -96,6 +96,10 @@ pub enum WorkerUpdate {
     IntegrityDone {
         text: String,
         ok: bool,
+    },
+    DiffDone {
+        text: String,
+        status: String,
     },
     RekeyDone {
         status: String,
@@ -220,6 +224,31 @@ impl Drop for InspectFields {
     }
 }
 
+pub struct DiffFields {
+    pub vault_a_path: String,
+    pub keyfile_a: Option<PathBuf>,
+    pub use_recovery_a: bool,
+    pub password_a: String,
+    pub show_password_a: bool,
+    pub recovery_phrase_a: String,
+    pub vault_b_path: String,
+    pub keyfile_b: Option<PathBuf>,
+    pub use_recovery_b: bool,
+    pub password_b: String,
+    pub show_password_b: bool,
+    pub recovery_phrase_b: String,
+    pub results: String,
+}
+
+impl Drop for DiffFields {
+    fn drop(&mut self) {
+        self.password_a.zeroize();
+        self.recovery_phrase_a.zeroize();
+        self.password_b.zeroize();
+        self.recovery_phrase_b.zeroize();
+    }
+}
+
 pub struct RekeyFields {
     pub vault_path: String,
     pub current_keyfile: Option<PathBuf>,
@@ -313,13 +342,13 @@ pub struct AppState {
     pub logs: Vec<String>,
     pub config: AppConfig,
     pub config_path: Option<PathBuf>,
-    pub ui_scale_percent: u16,
     pub shell_status: ShellIntegrationStatus,
     pub show_shell_install_modal: bool,
     pub clipboard_deadline: Option<Instant>,
     pub encrypt: EncryptFields,
     pub decrypt: DecryptFields,
     pub inspect: InspectFields,
+    pub diff: DiffFields,
     pub rekey: RekeyFields,
     pub pwgen: PasswordGenFields,
 }
@@ -331,6 +360,7 @@ impl Default for AppState {
             .as_deref()
             .map(load_config_from)
             .unwrap_or_default();
+        config.ui_scale_percent = clamp_ui_scale_percent(config.ui_scale_percent);
         if config.kdf_params().validate().is_err() {
             let defaults = KdfParams::owasp_default();
             config.argon_memory_kib = defaults.memory_kib;
@@ -350,7 +380,6 @@ impl Default for AppState {
             logs: Vec::new(),
             config,
             config_path: cfg_path,
-            ui_scale_percent: UI_SCALE_DEFAULT,
             shell_status: shell_integration::get_status(),
             show_shell_install_modal: false,
             clipboard_deadline: None,
@@ -388,6 +417,21 @@ impl Default for AppState {
                 selected_paths: HashSet::new(),
                 filter_query: String::new(),
                 extract_output_dir: String::new(),
+            },
+            diff: DiffFields {
+                vault_a_path: String::new(),
+                keyfile_a: None,
+                use_recovery_a: false,
+                password_a: String::new(),
+                show_password_a: false,
+                recovery_phrase_a: String::new(),
+                vault_b_path: String::new(),
+                keyfile_b: None,
+                use_recovery_b: false,
+                password_b: String::new(),
+                show_password_b: false,
+                recovery_phrase_b: String::new(),
+                results: s.diff_default_results.into(),
             },
             rekey: RekeyFields {
                 vault_path: String::new(),
@@ -445,7 +489,9 @@ impl AppState {
             return;
         }
         if let Some(ref path) = self.config_path {
-            let _ = save_config_to(path, &self.config);
+            let mut cfg = self.config.clone();
+            cfg.ui_scale_percent = clamp_ui_scale_percent(cfg.ui_scale_percent);
+            let _ = save_config_to(path, &cfg);
         }
     }
 
@@ -480,6 +526,7 @@ impl AppState {
             self.set_status(msg.clone(), true);
             return Err(msg);
         }
+        self.config.ui_scale_percent = clamp_ui_scale_percent(self.config.ui_scale_percent);
         if let Some(ref p) = self.config_path {
             match save_config_to(p, &self.config) {
                 Ok(()) => self.set_status(s.status_prefs_saved, false),
@@ -502,6 +549,13 @@ impl AppState {
     pub fn clear_decrypt_secrets(&mut self) {
         self.decrypt.password.zeroize();
         self.decrypt.recovery_phrase.zeroize();
+    }
+
+    pub fn clear_diff_secrets(&mut self) {
+        self.diff.password_a.zeroize();
+        self.diff.recovery_phrase_a.zeroize();
+        self.diff.password_b.zeroize();
+        self.diff.recovery_phrase_b.zeroize();
     }
 
     pub fn clear_rekey_secrets(&mut self) {
@@ -678,11 +732,11 @@ impl AppState {
     }
 
     pub fn ui_scale_zoom_factor(&self) -> f32 {
-        ui_scale_zoom_factor(self.ui_scale_percent)
+        ui_scale_zoom_factor(self.config.ui_scale_percent)
     }
 
     pub fn set_ui_scale_percent(&mut self, percent: u16, ctx: &egui::Context) {
-        self.ui_scale_percent = clamp_ui_scale_percent(percent);
+        self.config.ui_scale_percent = clamp_ui_scale_percent(percent);
         self.apply_ui_scale(ctx);
     }
 

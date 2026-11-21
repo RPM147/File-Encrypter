@@ -92,6 +92,17 @@ pub struct Strings {
     pub ins_reenter_creds_hint: &'static str,
     pub status_extracting_selected: &'static str,
 
+    // Inspect tab — Vault Diff
+    pub diff_heading: &'static str,
+    pub diff_subtitle: &'static str,
+    pub lbl_vault_a: &'static str,
+    pub lbl_vault_b: &'static str,
+    pub btn_compare_vaults: &'static str,
+    pub diff_default_results: &'static str,
+    pub err_diff_select_vaults: &'static str,
+    pub err_diff_enter_creds: &'static str,
+    pub status_comparing_vaults: &'static str,
+
     // Re-key tab
     pub rek_heading: &'static str,
     pub rek_subtitle: &'static str,
@@ -250,6 +261,16 @@ pub const TR: Strings = Strings {
     ins_reenter_creds_hint: "Not: Çıkarma için yukarıdaki parola veya kurtarma cümlesinin girili olması gerekir.",
     status_extracting_selected: "Seçili dosyalar doğrulayarak çıkarılıyor...",
 
+    diff_heading: "Kasa Karşılaştırma (Vault Diff)",
+    diff_subtitle: "İki kasanın şifreli dosya listesini yalnızca başlıkları açarak karşılaştırır (veri çözülmez).",
+    lbl_vault_a: "Kasa A (.vault):",
+    lbl_vault_b: "Kasa B (.vault):",
+    btn_compare_vaults: "Kasaları Karşılaştır",
+    diff_default_results: "İki .vault dosyası seçip kimlik bilgilerini girerek Kasaları Karşılaştır düğmesine tıklayın.",
+    err_diff_select_vaults: "Mevcut iki .vault dosyası (Kasa A ve Kasa B) seçin",
+    err_diff_enter_creds: "Her iki kasa için parola veya kurtarma cümlesini girin",
+    status_comparing_vaults: "Kasa başlıkları açılıyor ve karşılaştırılıyor...",
+
     rek_heading: "Anahtar Değiştir (O(1) Başlık Döndürme)",
     rek_subtitle: "Veri parçalarını yeniden şifrelemeden kasa parolasını ve keyfile bağını anında günceller.",
     lbl_current_pw: "Mevcut Parola:",
@@ -403,6 +424,16 @@ pub const EN: Strings = Strings {
     err_select_manifest_files: "Select at least one file from the manifest",
     ins_reenter_creds_hint: "Note: Ensure password or recovery phrase is entered above to extract.",
     status_extracting_selected: "Authenticating vault & extracting selected files...",
+
+    diff_heading: "Vault Comparison (Vault Diff)",
+    diff_subtitle: "Compares two vaults' encrypted manifests from headers only (no payload decrypted).",
+    lbl_vault_a: "Vault A (.vault):",
+    lbl_vault_b: "Vault B (.vault):",
+    btn_compare_vaults: "Compare Vaults",
+    diff_default_results: "Select two .vault files, enter their credentials, and click Compare Vaults.",
+    err_diff_select_vaults: "Select two existing .vault files (Vault A and Vault B)",
+    err_diff_enter_creds: "Enter password or recovery phrase for both vaults",
+    status_comparing_vaults: "Unlocking vault headers and comparing manifests...",
 
     rek_heading: "Re-Key (O(1) Key Envelope Rotation)",
     rek_subtitle: "Re-wraps the DEK under a new password/keyfile without decrypting payload chunks.",

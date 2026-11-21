@@ -46,7 +46,7 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
         let s = state.strings();
         ui.horizontal(|ui| {
             ui.label(s.lbl_ui_scale);
-            let mut selected_scale = state.ui_scale_percent;
+            let mut selected_scale = state.config.ui_scale_percent;
             let mut scale_changed = false;
             for pct in UI_SCALE_PRESETS {
                 if ui
@@ -55,6 +55,9 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
                 {
                     scale_changed = true;
                 }
+            }
+            if !UI_SCALE_PRESETS.contains(&selected_scale) {
+                ui.weak(format!("({selected_scale}%)"));
             }
             if scale_changed {
                 state.set_ui_scale_percent(selected_scale, ctx);
