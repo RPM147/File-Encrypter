@@ -10,6 +10,8 @@ Uygulama varsayılan olarak Türkçe arayüzle açılır; sol menünün altında
 
 ## Dosyaları şifreleme
 
+Şifreleme ve çözme sırasında ilerleme çubuğunun yanında aktarım hızını (ör. MiB/s) ve tahmini kalan süreyi görebilirsiniz.
+
 1. Dosyaları veya klasörleri uygulama penceresine sürükleyin. **Şifrele** sekmesinde listeyi ve kasanın kaydedileceği yeri kontrol edin.
 2. Uzun, benzersiz bir parola girip tekrarlayın. Ek koruma için boş olmayan bir **anahtar dosyası (keyfile)** seçebilirsiniz. Bu durumda kasayı parolayla her açtığınızda aynı içeriğe sahip dosya da gerekir. Anahtar dosyasının yedeğini kasa dışında, güvenli bir yerde saklayın.
 3. **Şimdi Şifrele** düğmesine basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın. Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
@@ -55,6 +57,23 @@ Bu işlem yalnızca kasa anahtarını yeni parolayla yeniden şifreler. Bu adım
 # Aynı anahtar dosyasını kullanarak parolayı değiştir
 ./rpm-encrypter-cli rekey ./Belgeler.vault --keyfile ./anahtar.key
 ```
+
+`encrypt` ve `decrypt` komutlarında `--progress` seçeneği, hız ve tahmini kalan süre bilgilerinin standart hata akışına (`stderr`) ne zaman yazılacağını belirler. `auto` varsayılandır ve yalnızca etkileşimli terminalde gösterir. `always` çıktı yönlendirilse de gösterir. `never` ilerleme bilgisini kapatır.
+
+```sh
+./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key --progress always
+```
+
+## Windows için WinGet manifesti oluşturma
+
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.0.1/` klasörüne yazar.
+
+```powershell
+.\packaging\winget\generate-manifests.ps1 -Version 4.0.1
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.0.1
+```
+
+WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)
 
 ## SSD ve güvenli silme
 
