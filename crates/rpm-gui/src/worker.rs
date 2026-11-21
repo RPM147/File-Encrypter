@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
-    check_integrity, diff_metadata, hash_keyfile_reader, inspect_header, mnemonic_to_entropy, Auth,
-    EncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultDiff, VaultInfo,
+    check_integrity, diff_metadata, hash_keyfile_reader, inspect_header_seekable,
+    mnemonic_to_entropy, Auth, EncryptOptions, HiddenEncryptOptions, IntegrityReport, KdfParams,
+    SecretKey, VaultDiff, VaultInfo,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
-    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
-    SecureWiper, StorageError,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_hidden_sources_v5, encrypt_sources_v5,
+    rekey_vault_v5, unique_path, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -145,6 +146,26 @@ pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
             format!("Recovery Slot  : {rec}"),
         ],
     };
+
+    if let Some(container_size) = info.container_size {
+        let container_mib = (container_size as f64) / (1024.0 * 1024.0);
+        lines.push(match lang {
+            AppLanguage::Tr => {
+                format!("Konteyner Boyutu: {container_size} bayt ({container_mib:.2} MiB)")
+            }
+            AppLanguage::En => {
+                format!("Container Size : {container_size} bytes ({container_mib:.2} MiB)")
+            }
+        });
+    }
+    if info.is_hidden_compartment {
+        lines.push(match lang {
+            AppLanguage::Tr => {
+                "Bölme           : Gizli Kasa (Makul İnkâr Edilebilirlik)".to_string()
+            }
+            AppLanguage::En => "Compartment    : Hidden Vault (Plausible Deniability)".to_string(),
+        });
+    }
 
     if !m.files.is_empty() {
         lines.push(String::new());
@@ -322,6 +343,50 @@ pub fn format_diff_report(diff: &VaultDiff, lang: AppLanguage) -> String {
     lines.join("\n")
 }
 
+fn resolve_output_vault_path(sources: &[PathBuf], output_dir: Option<PathBuf>) -> PathBuf {
+    let base_dir = output_dir.unwrap_or_else(|| {
+        sources
+            .first()
+            .and_then(|s| s.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let base_name = if sources.len() == 1 {
+        sources[0]
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Archive".into())
+    } else {
+        "Archive".into()
+    };
+    unique_path(&base_dir.join(format!("{base_name}.vault")))
+}
+
+fn wipe_sources(
+    sources: &[PathBuf],
+    wipe_passes: u8,
+    tx: &mpsc::Sender<WorkerUpdate>,
+    ctx: &egui::Context,
+    lang: AppLanguage,
+) {
+    let wiper = SecureWiper::new(wipe_passes);
+    for s in sources {
+        let wres = if s.is_dir() {
+            wiper.wipe_folder(s)
+        } else {
+            wiper.wipe_file(s)
+        };
+        if let Err(err) = wres {
+            let warn = match lang {
+                AppLanguage::Tr => format!("Güvenli silme uyarısı: {err}"),
+                AppLanguage::En => format!("Wipe warning: {err}"),
+            };
+            send(tx, ctx, WorkerUpdate::Log(warn));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_encrypt(
     ctx: egui::Context,
@@ -333,6 +398,7 @@ pub fn spawn_encrypt(
     keyfile: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     compress: bool,
+    container_size_bytes: Option<u64>,
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
@@ -353,25 +419,10 @@ pub fn spawn_encrypt(
             recovery_key: Some(recovery_entropy),
             keyfile_hash,
             compressed: compress,
-            container_size_bytes: None,
+            container_size_bytes,
         };
 
-        let base_dir = output_dir.unwrap_or_else(|| {
-            sources[0]
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-        let base_name = if sources.len() == 1 {
-            sources[0]
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Archive".into())
-        } else {
-            "Archive".into()
-        };
-        let out_vault = unique_path(&base_dir.join(format!("{base_name}.vault")));
+        let out_vault = resolve_output_vault_path(&sources, output_dir);
         let start_log = match lang {
             AppLanguage::Tr => format!("Şifreleniyor -> {}", out_vault.display()),
             AppLanguage::En => format!("Encrypting -> {}", out_vault.display()),
@@ -401,21 +452,7 @@ pub fn spawn_encrypt(
         match res {
             Ok((_summary, meta)) => {
                 if secure_wipe {
-                    let wiper = SecureWiper::new(wipe_passes);
-                    for s in &sources {
-                        let wres = if s.is_dir() {
-                            wiper.wipe_folder(s)
-                        } else {
-                            wiper.wipe_file(s)
-                        };
-                        if let Err(err) = wres {
-                            let warn = match lang {
-                                AppLanguage::Tr => format!("Güvenli silme uyarısı: {err}"),
-                                AppLanguage::En => format!("Wipe warning: {err}"),
-                            };
-                            send(&tx, &ctx, WorkerUpdate::Log(warn));
-                        }
-                    }
+                    wipe_sources(&sources, wipe_passes, &tx, &ctx, lang);
                 }
                 let vault_name = out_vault
                     .file_name()
@@ -428,6 +465,117 @@ pub fn spawn_encrypt(
                     AppLanguage::En => {
                         format!("Encrypted {} file(s) -> {vault_name}", meta.file_count)
                     }
+                };
+                send(&tx, &ctx, WorkerUpdate::EncryptDone { status });
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_encrypt_hidden(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    decoy_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+    decoy_password: Zeroizing<String>,
+    hidden_password: Zeroizing<String>,
+    decoy_recovery_entropy: SecretKey,
+    decoy_keyfile: Option<PathBuf>,
+    hidden_keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    decoy_compressed: bool,
+    hidden_compressed: bool,
+    container_size_bytes: u64,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let decoy_keyfile_hash = match load_optional_keyfile(decoy_keyfile.as_deref()) {
+            Ok(k) => k,
+            Err(e) => {
+                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                return;
+            }
+        };
+        let hidden_keyfile_hash = match load_optional_keyfile(hidden_keyfile.as_deref()) {
+            Ok(k) => k,
+            Err(e) => {
+                let msg = match lang {
+                    AppLanguage::Tr => format!("Gizli anahtar dosyası hatası: {e}"),
+                    AppLanguage::En => format!("Hidden keyfile error: {e}"),
+                };
+                send(&tx, &ctx, WorkerUpdate::Error(msg));
+                return;
+            }
+        };
+
+        let opts = HiddenEncryptOptions {
+            kdf,
+            chunk_size: rpm_core::constants::DEFAULT_CHUNK_SIZE,
+            container_size_bytes,
+            decoy_recovery_key: Some(decoy_recovery_entropy),
+            decoy_keyfile_hash,
+            decoy_compressed,
+            hidden_keyfile_hash,
+            hidden_compressed,
+        };
+
+        let out_vault = resolve_output_vault_path(&decoy_sources, output_dir);
+        let start_log = match lang {
+            AppLanguage::Tr => {
+                format!("Gizli kasa konteyneri yazılıyor -> {}", out_vault.display())
+            }
+            AppLanguage::En => format!("Writing hidden vault container -> {}", out_vault.display()),
+        };
+        send(&tx, &ctx, WorkerUpdate::Log(start_log));
+
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        let tx_skip = tx.clone();
+        let ctx_skip = ctx.clone();
+
+        let res = encrypt_hidden_sources_v5(
+            &decoy_sources,
+            &hidden_sources,
+            &out_vault,
+            decoy_password.as_bytes(),
+            hidden_password.as_bytes(),
+            &opts,
+            progress,
+            cancel,
+            move |msg| {
+                let line = match lang {
+                    AppLanguage::Tr => format!("Atlandı: {msg}"),
+                    AppLanguage::En => format!("Skipped: {msg}"),
+                };
+                send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
+            },
+        );
+
+        match res {
+            Ok((summary, decoy_meta, hidden_meta)) => {
+                if secure_wipe {
+                    wipe_sources(&decoy_sources, wipe_passes, &tx, &ctx, lang);
+                    wipe_sources(&hidden_sources, wipe_passes, &tx, &ctx, lang);
+                }
+                let vault_name = out_vault
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "vault".into());
+                let container_mib = (summary.container_size as f64) / (1024.0 * 1024.0);
+                let status = match lang {
+                    AppLanguage::Tr => format!(
+                        "{} dış + {} gizli dosya şifrelendi ({container_mib:.1} MiB) -> {vault_name}",
+                        decoy_meta.file_count, hidden_meta.file_count
+                    ),
+                    AppLanguage::En => format!(
+                        "Encrypted {} decoy + {} hidden file(s) ({container_mib:.1} MiB) -> {vault_name}",
+                        decoy_meta.file_count, hidden_meta.file_count
+                    ),
                 };
                 send(&tx, &ctx, WorkerUpdate::EncryptDone { status });
             }
@@ -585,12 +733,14 @@ pub fn spawn_inspect(
             }
         };
 
-        match inspect_header(&mut reader, auth) {
+        match inspect_header_seekable(&mut reader, auth) {
             Ok(info) => {
                 let text = format_inspect_report(&info, lang);
-                let status = match lang {
-                    AppLanguage::Tr => "Kasa meta verisi açıldı",
-                    AppLanguage::En => "Vault metadata unlocked",
+                let status = match (lang, info.is_hidden_compartment) {
+                    (AppLanguage::Tr, true) => "Gizli kasa meta verisi açıldı",
+                    (AppLanguage::Tr, false) => "Kasa meta verisi açıldı",
+                    (AppLanguage::En, true) => "Hidden vault metadata unlocked",
+                    (AppLanguage::En, false) => "Vault metadata unlocked",
                 };
                 let manifest = info.metadata.files.clone();
                 send(
@@ -654,7 +804,7 @@ fn unlock_vault_header_for_diff(
             keyfile_hash: keyfile_hash.as_ref(),
         }
     };
-    inspect_header(&mut reader, auth).map_err(|e| format!("{prefix}: {e}"))
+    inspect_header_seekable(&mut reader, auth).map_err(|e| format!("{prefix}: {e}"))
 }
 
 pub fn spawn_vault_diff(

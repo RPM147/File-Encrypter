@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use rand::rngs::OsRng;
 use rand::Rng;
+use rpm_core::constants::{MAX_CONTAINER_SIZE, MIN_CONTAINER_SIZE};
 use rpm_core::{CryptoError, FileManifestEntry, KdfParams, SecretKey};
 use rpm_storage::config::{
     default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode,
@@ -18,6 +19,74 @@ use zeroize::Zeroize;
 
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
+
+pub const CONTAINER_MIB: u64 = 1024 * 1024;
+pub const CONTAINER_MAX_MIB: u64 = MAX_CONTAINER_SIZE / CONTAINER_MIB;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContainerSizePreset {
+    Auto,
+    MiB10,
+    MiB50,
+    MiB100,
+    MiB500,
+    Custom,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContainerSizeError {
+    InvalidCustomValue,
+    OutOfRange,
+    RequiredForHidden,
+}
+
+impl ContainerSizePreset {
+    pub const ALL: [ContainerSizePreset; 6] = [
+        ContainerSizePreset::Auto,
+        ContainerSizePreset::MiB10,
+        ContainerSizePreset::MiB50,
+        ContainerSizePreset::MiB100,
+        ContainerSizePreset::MiB500,
+        ContainerSizePreset::Custom,
+    ];
+
+    pub fn localized_label(self, s: &'static Strings) -> &'static str {
+        match self {
+            Self::Auto => s.container_auto,
+            Self::MiB10 => s.container_10_mib,
+            Self::MiB50 => s.container_50_mib,
+            Self::MiB100 => s.container_100_mib,
+            Self::MiB500 => s.container_500_mib,
+            Self::Custom => s.container_custom,
+        }
+    }
+
+    pub fn resolve_bytes(self, custom_mb: &str) -> Result<Option<u64>, ContainerSizeError> {
+        let bytes = match self {
+            Self::Auto => return Ok(None),
+            Self::MiB10 => 10 * CONTAINER_MIB,
+            Self::MiB50 => 50 * CONTAINER_MIB,
+            Self::MiB100 => 100 * CONTAINER_MIB,
+            Self::MiB500 => 500 * CONTAINER_MIB,
+            Self::Custom => {
+                let parsed: u64 = custom_mb
+                    .trim()
+                    .parse()
+                    .map_err(|_| ContainerSizeError::InvalidCustomValue)?;
+                if parsed == 0 {
+                    return Err(ContainerSizeError::InvalidCustomValue);
+                }
+                parsed
+                    .checked_mul(CONTAINER_MIB)
+                    .ok_or(ContainerSizeError::OutOfRange)?
+            }
+        };
+        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&bytes) {
+            return Err(ContainerSizeError::OutOfRange);
+        }
+        Ok(Some(bytes))
+    }
+}
 
 pub const UI_SCALE_PRESETS: [u16; 7] = [80, 90, 100, 110, 120, 130, 150];
 pub const UI_SCALE_MIN: u16 = 80;
@@ -130,12 +199,53 @@ pub struct EncryptFields {
     pub save_next_to_source: bool,
     pub output_dir: String,
     pub recovery_prompt: Option<RecoveryPrompt>,
+    pub container_preset: ContainerSizePreset,
+    pub container_custom_mb: String,
+    pub enable_hidden: bool,
+    pub hidden_sources: Vec<PathBuf>,
+    pub hidden_keyfile: Option<PathBuf>,
+    pub hidden_password: String,
+    pub hidden_confirm_password: String,
+    pub show_hidden_password: bool,
+    pub hidden_compress: bool,
+}
+
+impl EncryptFields {
+    pub fn resolve_container_size(&self) -> Result<Option<u64>, ContainerSizeError> {
+        let resolved = self
+            .container_preset
+            .resolve_bytes(&self.container_custom_mb)?;
+        if self.enable_hidden && resolved.is_none() {
+            return Err(ContainerSizeError::RequiredForHidden);
+        }
+        Ok(resolved)
+    }
+
+    pub fn set_hidden_enabled(&mut self, enabled: bool) {
+        self.enable_hidden = enabled;
+        if enabled && self.container_preset == ContainerSizePreset::Auto {
+            self.container_preset = ContainerSizePreset::MiB50;
+        }
+    }
+
+    pub fn add_hidden_sources(&mut self, paths: Vec<PathBuf>) -> usize {
+        let mut added = 0usize;
+        for p in paths {
+            if !self.hidden_sources.contains(&p) {
+                self.hidden_sources.push(p);
+                added += 1;
+            }
+        }
+        added
+    }
 }
 
 impl Drop for EncryptFields {
     fn drop(&mut self) {
         self.password.zeroize();
         self.confirm_password.zeroize();
+        self.hidden_password.zeroize();
+        self.hidden_confirm_password.zeroize();
     }
 }
 
@@ -394,6 +504,15 @@ impl Default for AppState {
                 save_next_to_source: true,
                 output_dir: String::new(),
                 recovery_prompt: None,
+                container_preset: ContainerSizePreset::Auto,
+                container_custom_mb: "100".into(),
+                enable_hidden: false,
+                hidden_sources: Vec::new(),
+                hidden_keyfile: None,
+                hidden_password: String::new(),
+                hidden_confirm_password: String::new(),
+                show_hidden_password: false,
+                hidden_compress: compress,
             },
             decrypt: DecryptFields {
                 vaults: Vec::new(),
@@ -543,6 +662,8 @@ impl AppState {
     pub fn clear_encrypt_secrets(&mut self) {
         self.encrypt.password.zeroize();
         self.encrypt.confirm_password.zeroize();
+        self.encrypt.hidden_password.zeroize();
+        self.encrypt.hidden_confirm_password.zeroize();
         self.encrypt.recovery_prompt = None;
     }
 

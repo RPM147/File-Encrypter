@@ -48,6 +48,7 @@ impl RpmApp {
                     self.state.progress = 1.0;
                     self.state.transfer = None;
                     self.state.encrypt.sources.clear();
+                    self.state.encrypt.hidden_sources.clear();
                     self.state.set_status(status, false);
                 }
                 WorkerUpdate::DecryptDone { status } => {

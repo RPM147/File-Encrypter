@@ -1,10 +1,15 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use rpm_core::constants::MIN_CHUNK_SIZE;
 use rpm_core::{
-    ChangedEntry, FileManifestEntry, IntegrityReport, SecretKey, VaultDiff, VaultInfo,
+    diff_metadata, inspect_header_seekable, Auth, ChangedEntry, FileManifestEntry,
+    HiddenEncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultDiff, VaultInfo,
     VaultMetadata,
 };
 use rpm_gui::progress::{
@@ -13,13 +18,14 @@ use rpm_gui::progress::{
 };
 use rpm_gui::state::{
     clamp_ui_scale_percent, strength_label_and_color_for, ui_scale_zoom_factor, AppState,
-    PasswordGenFields, RecoveryPrompt, Tab, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE,
+    ContainerSizeError, ContainerSizePreset, PasswordGenFields, RecoveryPrompt, Tab,
+    ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, CONTAINER_MAX_MIB, CONTAINER_MIB,
     PWGEN_AMBIGUOUS, PWGEN_DIGITS, PWGEN_LOWERCASE, PWGEN_SYMBOLS, PWGEN_UPPERCASE,
     UI_SCALE_DEFAULT, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_PRESETS,
 };
 use rpm_gui::{fonts, i18n, load_app_icon, worker};
 use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
-use rpm_storage::{GuiLaunchIntent, LaunchTab};
+use rpm_storage::{encrypt_hidden_sources_v5, GuiLaunchIntent, LaunchTab};
 
 #[test]
 fn dropped_files_route_vaults_to_decrypt_and_regular_to_encrypt() {
@@ -811,4 +817,273 @@ fn phase2_settings_and_password_gen_bilingual_strings_parity() {
     assert!(en.lbl_argon_iterations.contains("Argon2id"));
     assert!(tr.lbl_argon_parallelism.contains("Argon2id"));
     assert!(en.lbl_argon_parallelism.contains("Argon2id"));
+}
+
+#[test]
+fn container_size_preset_resolution_and_hidden_validation() {
+    assert_eq!(ContainerSizePreset::Auto.resolve_bytes(""), Ok(None));
+    assert_eq!(
+        ContainerSizePreset::MiB10.resolve_bytes(""),
+        Ok(Some(10 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        ContainerSizePreset::MiB50.resolve_bytes(""),
+        Ok(Some(50 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        ContainerSizePreset::MiB100.resolve_bytes(""),
+        Ok(Some(100 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        ContainerSizePreset::MiB500.resolve_bytes(""),
+        Ok(Some(500 * CONTAINER_MIB))
+    );
+
+    // Custom valid bounds (whitespace trimmed)
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes(" 1 "),
+        Ok(Some(CONTAINER_MIB))
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes("256"),
+        Ok(Some(256 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes(&CONTAINER_MAX_MIB.to_string()),
+        Ok(Some(CONTAINER_MAX_MIB * CONTAINER_MIB))
+    );
+
+    // Custom invalid / zero / out-of-range
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes("0"),
+        Err(ContainerSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes("-5"),
+        Err(ContainerSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes("abc"),
+        Err(ContainerSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes(""),
+        Err(ContainerSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes(&(CONTAINER_MAX_MIB + 1).to_string()),
+        Err(ContainerSizeError::OutOfRange)
+    );
+    assert_eq!(
+        ContainerSizePreset::Custom.resolve_bytes(&u64::MAX.to_string()),
+        Err(ContainerSizeError::OutOfRange)
+    );
+
+    // Hidden mode auto-switches preset away from Auto and requires fixed container size
+    let mut st = AppState::default();
+    assert_eq!(st.encrypt.container_preset, ContainerSizePreset::Auto);
+    assert_eq!(st.encrypt.resolve_container_size(), Ok(None));
+
+    st.encrypt.set_hidden_enabled(true);
+    assert!(st.encrypt.enable_hidden);
+    assert_eq!(st.encrypt.container_preset, ContainerSizePreset::MiB50);
+    assert_eq!(
+        st.encrypt.resolve_container_size(),
+        Ok(Some(50 * CONTAINER_MIB))
+    );
+
+    // Even if forced back to Auto, resolve_container_size rejects hidden without container size
+    st.encrypt.container_preset = ContainerSizePreset::Auto;
+    assert_eq!(
+        st.encrypt.resolve_container_size(),
+        Err(ContainerSizeError::RequiredForHidden)
+    );
+
+    // Hidden source deduplication
+    assert_eq!(
+        st.encrypt.add_hidden_sources(vec![
+            PathBuf::from("secret.txt"),
+            PathBuf::from("secret.txt")
+        ]),
+        1
+    );
+    assert_eq!(st.encrypt.hidden_sources, vec![PathBuf::from("secret.txt")]);
+}
+
+#[test]
+fn clear_encrypt_secrets_wipes_outer_and_hidden_passwords() {
+    let mut st = AppState::default();
+    st.encrypt.password = "OuterSecret!1".into();
+    st.encrypt.confirm_password = "OuterSecret!1".into();
+    st.encrypt.hidden_password = "HiddenSecret!2".into();
+    st.encrypt.hidden_confirm_password = "HiddenSecret!2".into();
+    st.encrypt.recovery_prompt = Some(RecoveryPrompt {
+        phrase: "alpha beta gamma".into(),
+        entropy: SecretKey::new([0x33u8; 32]),
+        confirmed: true,
+    });
+
+    st.clear_encrypt_secrets();
+    assert!(st.encrypt.password.is_empty());
+    assert!(st.encrypt.confirm_password.is_empty());
+    assert!(st.encrypt.hidden_password.is_empty());
+    assert!(st.encrypt.hidden_confirm_password.is_empty());
+    assert!(st.encrypt.recovery_prompt.is_none());
+}
+
+#[test]
+fn format_inspect_report_shows_container_size_and_hidden_compartment() {
+    let info = VaultInfo {
+        version: 5,
+        vault_id: "0123456789abcdef".into(),
+        cipher: "AES-256-GCM-CHUNKED".into(),
+        chunk_size: 1024 * 1024,
+        has_recovery: false,
+        has_keyfile: true,
+        compressed: true,
+        argon_memory_kib: 65_536,
+        argon_iterations: 3,
+        argon_parallelism: 4,
+        container_size: Some(50 * 1024 * 1024),
+        is_hidden_compartment: true,
+        metadata: VaultMetadata {
+            filename: "secret".into(),
+            source_type: "folder".into(),
+            original_size: 1024,
+            file_count: 1,
+            created_at: "2026-11-21T00:00:00Z".into(),
+            compressed: true,
+            files: vec![],
+        },
+    };
+
+    let tr = worker::format_inspect_report(&info, AppLanguage::Tr);
+    assert!(tr.contains("Konteyner Boyutu: 52428800 bayt (50.00 MiB)"));
+    assert!(tr.contains("Bölme           : Gizli Kasa"));
+
+    let en = worker::format_inspect_report(&info, AppLanguage::En);
+    assert!(en.contains("Container Size : 52428800 bytes (50.00 MiB)"));
+    assert!(en.contains("Compartment    : Hidden Vault"));
+}
+
+#[test]
+fn phase3_container_and_hidden_bilingual_strings_parity() {
+    let tr = i18n::strings(AppLanguage::Tr);
+    let en = i18n::strings(AppLanguage::En);
+
+    let pairs = [
+        (tr.lbl_container_size, en.lbl_container_size),
+        (tr.container_auto, en.container_auto),
+        (tr.container_custom, en.container_custom),
+        (tr.hint_container_padding, en.hint_container_padding),
+        (tr.hidden_section_title, en.hidden_section_title),
+        (tr.chk_enable_hidden, en.chk_enable_hidden),
+        (tr.hidden_section_hint, en.hidden_section_hint),
+        (tr.hidden_sources_hint, en.hidden_sources_hint),
+        (tr.hidden_no_sources, en.hidden_no_sources),
+        (tr.lbl_hidden_password, en.lbl_hidden_password),
+        (tr.lbl_hidden_confirm, en.lbl_hidden_confirm),
+        (tr.lbl_hidden_keyfile_opt, en.lbl_hidden_keyfile_opt),
+        (tr.chk_hidden_compress, en.chk_hidden_compress),
+        (tr.hidden_recovery_note, en.hidden_recovery_note),
+        (tr.err_container_invalid_mb, en.err_container_invalid_mb),
+        (tr.err_container_out_of_range, en.err_container_out_of_range),
+        (
+            tr.err_hidden_requires_container,
+            en.err_hidden_requires_container,
+        ),
+        (tr.err_hidden_add_source, en.err_hidden_add_source),
+        (tr.err_hidden_enter_pw, en.err_hidden_enter_pw),
+        (tr.err_hidden_pw_mismatch, en.err_hidden_pw_mismatch),
+        (tr.err_hidden_same_pw, en.err_hidden_same_pw),
+        (tr.status_enc_hidden_running, en.status_enc_hidden_running),
+    ];
+
+    for (t, e) in pairs {
+        assert!(!t.trim().is_empty(), "TR string must be non-empty");
+        assert!(!e.trim().is_empty(), "EN string must be non-empty");
+        assert_ne!(t, e, "TR and EN strings should be localized distinctly");
+    }
+
+    assert_eq!(tr.container_10_mib, "10 MiB");
+    assert_eq!(en.container_10_mib, "10 MiB");
+    assert_eq!(tr.container_50_mib, "50 MiB");
+    assert_eq!(en.container_50_mib, "50 MiB");
+    assert_eq!(tr.container_100_mib, "100 MiB");
+    assert_eq!(en.container_100_mib, "100 MiB");
+    assert_eq!(tr.container_500_mib, "500 MiB");
+    assert_eq!(en.container_500_mib, "500 MiB");
+}
+
+#[test]
+fn seekable_inspect_and_diff_support_hidden_vault_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let decoy_file = dir.path().join("public_readme.txt");
+    let hidden_file = dir.path().join("private_keys.txt");
+    fs::write(&decoy_file, b"public decoy contents").unwrap();
+    fs::write(&hidden_file, b"secret hidden contents").unwrap();
+
+    let vault = dir.path().join("container.vault");
+    let container_size = 512 * 1024;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opts = HiddenEncryptOptions {
+        kdf: KdfParams::fast_test(),
+        chunk_size: MIN_CHUNK_SIZE,
+        container_size_bytes: container_size,
+        decoy_recovery_key: None,
+        decoy_keyfile_hash: None,
+        decoy_compressed: true,
+        hidden_keyfile_hash: None,
+        hidden_compressed: true,
+    };
+
+    encrypt_hidden_sources_v5(
+        std::slice::from_ref(&decoy_file),
+        std::slice::from_ref(&hidden_file),
+        &vault,
+        b"DecoyPw!1",
+        b"HiddenPw!2",
+        &opts,
+        Arc::new(|_, _| {}),
+        cancel,
+        |_| {},
+    )
+    .unwrap();
+
+    let mut reader_outer = BufReader::new(File::open(&vault).unwrap());
+    let outer_info = inspect_header_seekable(
+        &mut reader_outer,
+        Auth::Password {
+            password: b"DecoyPw!1",
+            keyfile_hash: None,
+        },
+    )
+    .unwrap();
+    assert!(!outer_info.is_hidden_compartment);
+    assert_eq!(outer_info.container_size, Some(container_size));
+
+    let mut reader_hidden = BufReader::new(File::open(&vault).unwrap());
+    let hidden_info = inspect_header_seekable(
+        &mut reader_hidden,
+        Auth::Password {
+            password: b"HiddenPw!2",
+            keyfile_hash: None,
+        },
+    )
+    .unwrap();
+    assert!(hidden_info.is_hidden_compartment);
+    assert_eq!(hidden_info.container_size, Some(container_size));
+
+    let hidden_tr = worker::format_inspect_report(&hidden_info, AppLanguage::Tr);
+    let hidden_en = worker::format_inspect_report(&hidden_info, AppLanguage::En);
+    assert!(hidden_tr.contains("Gizli Kasa"));
+    assert!(hidden_en.contains("Hidden Vault"));
+    assert!(hidden_tr.contains("Konteyner Boyutu"));
+    assert!(hidden_en.contains("Container Size"));
+
+    let diff = diff_metadata(&outer_info.metadata, &hidden_info.metadata).unwrap();
+    let diff_report = worker::format_diff_report(&diff, AppLanguage::En);
+    assert!(diff_report.contains("+1 added, -1 removed"));
+    assert!(diff_report.contains("private_keys.txt"));
+    assert!(diff_report.contains("public_readme.txt"));
 }
