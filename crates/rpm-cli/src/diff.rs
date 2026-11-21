@@ -1,6 +1,6 @@
 use super::{load_keyfile, read_secret_line};
 use clap::Args;
-use rpm_core::{diff_metadata, inspect_header, mnemonic_to_entropy, Auth, VaultMetadata};
+use rpm_core::{diff_metadata, inspect_header_seekable, mnemonic_to_entropy, Auth, VaultMetadata};
 use rpm_storage::StorageError;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -66,7 +66,7 @@ impl DiffArgs {
                 keyfile_hash: keyfile.as_ref(),
             }
         };
-        Ok(inspect_header(&mut reader, auth)?.metadata)
+        Ok(inspect_header_seekable(&mut reader, auth)?.metadata)
     }
 
     pub fn run(

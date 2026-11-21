@@ -14,13 +14,13 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use rpm_core::{
     check_integrity, entropy_to_mnemonic, generate_recovery_entropy, hash_keyfile_reader,
-    inspect_header, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions, KdfParams, SecretKey,
-    VaultMetadata,
+    inspect_header_seekable, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
+    HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
 };
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, rekey_vault_v5, unique_path,
-    SecureWiper, StorageError,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_hidden_sources_v5, encrypt_sources_v5,
+    rekey_vault_v5, unique_path, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -46,6 +46,16 @@ pub enum Commands {
     Encrypt {
         #[arg(required = true)]
         sources: Vec<PathBuf>,
+        /// Pad the output container to this exact size in MiB.
+        #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
+        container_mb: Option<u64>,
+        /// Store these sources in a separately password-protected compartment.
+        #[arg(long, value_name = "PATH", num_args = 1.., requires = "container_mb")]
+        hidden: Vec<PathBuf>,
+        #[arg(long, requires = "hidden")]
+        hidden_keyfile: Option<PathBuf>,
+        #[arg(long, requires = "hidden")]
+        hidden_no_compress: bool,
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
         #[arg(long)]
@@ -56,6 +66,7 @@ pub enum Commands {
         wipe: bool,
         #[arg(long)]
         recovery_out: Option<PathBuf>,
+        /// Read the outer password on line one and, with --hidden, the hidden password on line two.
         #[arg(long)]
         password_stdin: bool,
         /// Progress display on stderr: auto (TTY only), always, or never.
@@ -132,6 +143,9 @@ pub enum ShellAction {
     Uninstall,
 }
 
+const MIB: u64 = 1024 * 1024;
+const MAX_CONTAINER_MIB: u64 = rpm_core::constants::MAX_CONTAINER_SIZE / MIB;
+
 fn read_secret_line<R: BufRead>(
     prompt: &str,
     from_stdin: bool,
@@ -139,15 +153,16 @@ fn read_secret_line<R: BufRead>(
     stdin: &mut R,
 ) -> Result<Zeroizing<String>, String> {
     if from_stdin {
-        let mut line = String::new();
+        let mut line = Zeroizing::new(String::new());
         stdin
             .read_line(&mut line)
             .map_err(|e| format!("failed reading stdin: {e}"))?;
-        let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
-        if trimmed.is_empty() {
+        let len = line.trim_end_matches(&['\r', '\n'][..]).len();
+        line.truncate(len);
+        if line.is_empty() {
             return Err("empty secret input from stdin".into());
         }
-        return Ok(Zeroizing::new(trimmed));
+        return Ok(line);
     }
 
     let first = Zeroizing::new(
@@ -178,6 +193,47 @@ fn load_keyfile(path: Option<&Path>) -> Result<Option<SecretKey>, String> {
             Ok(Some(key))
         }
     }
+}
+
+fn check_compartment_sources(outer: &[PathBuf], hidden: &[PathBuf]) -> std::io::Result<()> {
+    let outer = outer
+        .iter()
+        .map(fs::canonicalize)
+        .collect::<Result<Vec<_>, _>>()?;
+    for source in hidden {
+        let source = fs::canonicalize(source)?;
+        if outer
+            .iter()
+            .any(|path| path.starts_with(&source) || source.starts_with(path))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "outer and hidden source paths overlap; select separate files or directories",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_wipe_targets<'a>(
+    sources: impl Iterator<Item = &'a PathBuf>,
+    output_dir: &Path,
+    keyfiles: impl Iterator<Item = &'a PathBuf>,
+) -> std::io::Result<()> {
+    let mut protected = vec![fs::canonicalize(output_dir)?];
+    for keyfile in keyfiles {
+        protected.push(fs::canonicalize(keyfile)?);
+    }
+    for source in sources {
+        let source = fs::canonicalize(source)?;
+        if protected.iter().any(|path| path.starts_with(&source)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--wipe would remove the output directory or a required keyfile",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn format_metadata_plain(meta: &VaultMetadata) -> String {
@@ -287,6 +343,10 @@ where
         },
         Commands::Encrypt {
             sources,
+            container_mb,
+            hidden,
+            hidden_keyfile,
+            hidden_no_compress,
             output_dir,
             keyfile,
             no_compress,
@@ -295,7 +355,7 @@ where
             password_stdin,
             progress,
         } => {
-            for s in &sources {
+            for s in sources.iter().chain(&hidden) {
                 if !s.exists() {
                     let _ = writeln!(stderr, "Error: source not found: {}", s.display());
                     return 1;
@@ -304,6 +364,13 @@ where
             if let Some(dir) = output_dir.as_deref() {
                 if !dir.is_dir() {
                     let _ = writeln!(stderr, "Error: output directory missing: {}", dir.display());
+                    return 1;
+                }
+            }
+
+            if !hidden.is_empty() {
+                if let Err(err) = check_compartment_sources(&sources, &hidden) {
+                    let _ = writeln!(stderr, "Error: {err}");
                     return 1;
                 }
             }
@@ -338,15 +405,6 @@ where
                 }
             };
 
-            let opts = EncryptOptions {
-                kdf,
-                chunk_size: rpm_core::constants::DEFAULT_CHUNK_SIZE,
-                recovery_key: Some(rec_entropy),
-                keyfile_hash,
-                compressed: !no_compress,
-                container_size_bytes: None,
-            };
-
             let base_dir = output_dir.as_deref().unwrap_or_else(|| {
                 sources[0]
                     .parent()
@@ -362,17 +420,82 @@ where
                 "Archive".into()
             };
             let out_vault = unique_path(&base_dir.join(format!("{base_name}.vault")));
+            if wipe {
+                if let Err(err) = check_wipe_targets(
+                    sources.iter().chain(&hidden),
+                    base_dir,
+                    keyfile.iter().chain(&hidden_keyfile),
+                ) {
+                    let _ = writeln!(stderr, "Error: {err}");
+                    return 1;
+                }
+            }
             let reporter = CliProgressReporter::new(progress, stderr_is_tty, "Encrypting");
 
-            let enc_res = encrypt_sources_v5(
-                &sources,
-                &out_vault,
-                password.as_bytes(),
-                &opts,
-                reporter.callback(),
-                Arc::clone(&cancel),
-                |_| {},
-            );
+            let container_size_bytes = container_mb.map(|mb| mb * MIB);
+            let enc_res = if hidden.is_empty() {
+                let opts = EncryptOptions {
+                    kdf,
+                    recovery_key: Some(rec_entropy),
+                    keyfile_hash,
+                    compressed: !no_compress,
+                    container_size_bytes,
+                    ..Default::default()
+                };
+                encrypt_sources_v5(
+                    &sources,
+                    &out_vault,
+                    password.as_bytes(),
+                    &opts,
+                    reporter.callback(),
+                    Arc::clone(&cancel),
+                    |_| {},
+                )
+                .map(|_| ())
+            } else {
+                let hidden_password = match read_secret_line(
+                    "Hidden password: ",
+                    password_stdin,
+                    !password_stdin,
+                    stdin,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = writeln!(stderr, "Error: {e}");
+                        return 1;
+                    }
+                };
+                let hidden_keyfile_hash = match load_keyfile(hidden_keyfile.as_deref()) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        let _ = writeln!(stderr, "Error: {e}");
+                        return 1;
+                    }
+                };
+                let opts = HiddenEncryptOptions {
+                    kdf,
+                    container_size_bytes: container_size_bytes
+                        .expect("--hidden requires --container-mb"),
+                    decoy_recovery_key: Some(rec_entropy),
+                    decoy_keyfile_hash: keyfile_hash,
+                    decoy_compressed: !no_compress,
+                    hidden_keyfile_hash,
+                    hidden_compressed: !hidden_no_compress,
+                    ..Default::default()
+                };
+                encrypt_hidden_sources_v5(
+                    &sources,
+                    &hidden,
+                    &out_vault,
+                    password.as_bytes(),
+                    hidden_password.as_bytes(),
+                    &opts,
+                    reporter.callback(),
+                    Arc::clone(&cancel),
+                    |_| {},
+                )
+                .map(|_| ())
+            };
             reporter.finish(stderr);
             if let Err(err) = enc_res {
                 let _ = writeln!(stderr, "Error encrypting: {err}");
@@ -381,7 +504,7 @@ where
 
             if wipe {
                 let wiper = SecureWiper::new(1);
-                for s in &sources {
+                for s in sources.iter().chain(&hidden) {
                     let res = if s.is_dir() {
                         wiper.wipe_folder(s)
                     } else {
@@ -394,6 +517,11 @@ where
             }
 
             let _ = writeln!(stdout, "Encrypted: {}", out_vault.display());
+            let recovery_label = if hidden.is_empty() {
+                "Recovery phrase"
+            } else {
+                "Outer vault recovery phrase"
+            };
             if let Some(rec_path) = recovery_out {
                 if let Some(parent) = rec_path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     let _ = fs::create_dir_all(parent);
@@ -402,9 +530,16 @@ where
                     let _ = writeln!(stderr, "Error writing recovery file: {e}");
                     return 1;
                 }
-                let _ = writeln!(stdout, "Recovery phrase written to: {}", rec_path.display());
+                let _ = writeln!(
+                    stdout,
+                    "{recovery_label} written to: {}",
+                    rec_path.display()
+                );
             } else {
-                let _ = writeln!(stdout, "\nIMPORTANT - Save this 24-word recovery phrase:");
+                let _ = writeln!(
+                    stdout,
+                    "\nIMPORTANT - {recovery_label} (save these 24 words):"
+                );
                 let _ = writeln!(stdout, "  {}", phrase.as_str());
             }
             0
@@ -656,7 +791,7 @@ where
                     return 1;
                 }
             };
-            match inspect_header(&mut reader, auth) {
+            match inspect_header_seekable(&mut reader, auth) {
                 Ok(info) => {
                     if json {
                         let val = serde_json::json!({
@@ -664,6 +799,8 @@ where
                             "version": info.version,
                             "cipher": info.cipher,
                             "chunk_size": info.chunk_size,
+                            "container_size": info.container_size,
+                            "is_hidden_compartment": info.is_hidden_compartment,
                             "has_keyfile": info.has_keyfile,
                             "has_recovery": info.has_recovery,
                             "metadata": info.metadata,
@@ -672,10 +809,12 @@ where
                     } else {
                         let _ = writeln!(
                             stdout,
-                            "Version: v{}  Cipher: {}  Chunk: {} KiB\n{}",
+                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\n{}",
                             info.version,
                             info.cipher,
                             info.chunk_size / 1024,
+                            info.container_size.map_or_else(|| "none".into(), |n| format!("{n} bytes")),
+                            info.is_hidden_compartment,
                             format_metadata_plain(&info.metadata)
                         );
                     }
