@@ -1,96 +1,125 @@
-# RPM Encrypter kullanım kılavuzu
+# RPM Encrypter User Guide
 
-RPM Encrypter, dosya ve klasörlerinizi bilgisayarınızda şifreleyip `.vault` uzantılı bir kasaya kaydeder. Bu kılavuz Vault Format v5 içindir.
+> Türkçe: [USER_GUIDE.tr.md](USER_GUIDE.tr.md)
 
-## Uygulamayı açma
+RPM Encrypter encrypts files and folders locally on your computer and saves them into a `.vault` archive. This guide covers Vault Format v5.
 
-Windows’ta indirdiğiniz ZIP paketini bir klasöre çıkarın ve `rpm-encrypter.exe` dosyasına çift tıklayın. Linux’ta `.tar.gz` paketini çıkarın, o klasörde bir terminal açın ve `./rpm-encrypter` komutunu çalıştırın.
+## Launching the application
 
-Uygulama varsayılan olarak Türkçe arayüzle açılır; sol menünün altından veya **Ayarlar** sekmesinden dili (`TR / EN`) ve temayı (**Açık / Koyu**) değiştirebilirsiniz. Windows kullanıcıları **Ayarlar** sekmesinden yönetici izni gerektirmeden (yalnızca kendi oturumu için) Explorer sağ tık **Encrypt with RPM Encrypter** menüsünü ve `.vault` çift tık açma ilişkisini ekleyip kaldırabilir.
+On Windows, extract the downloaded ZIP archive into a folder and double-click `rpm-encrypter.exe`. On Linux, extract the `.tar.gz` archive, open a terminal in that folder, and run `./rpm-encrypter`.
 
-## Dosyaları şifreleme
+The application opens in Turkish by default; switch language (`TR / EN`) and theme (**Dark / Light**) anytime from the bottom of the left sidebar or in **Settings**. On Windows, **Settings** also lets standard (non-admin) users install or remove user-scoped (`HKCU`) Explorer right-click **Encrypt with RPM Encrypter** integration and `.vault` double-click association.
 
-Şifreleme ve çözme sırasında ilerleme çubuğunun yanında aktarım hızını (ör. MiB/s) ve tahmini kalan süreyi görebilirsiniz.
+## Encrypting files
 
-1. Dosyaları veya klasörleri uygulama penceresine sürükleyin. **Şifrele** sekmesinde listeyi ve kasanın kaydedileceği yeri kontrol edin.
-2. Uzun, benzersiz bir parola girip tekrarlayın. Ek koruma için boş olmayan bir **anahtar dosyası (keyfile)** seçebilirsiniz. Bu durumda kasayı parolayla her açtığınızda aynı içeriğe sahip dosya da gerekir. Anahtar dosyasının yedeğini kasa dışında, güvenli bir yerde saklayın.
-3. **Şimdi Şifrele** düğmesine basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın. Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
-4. İşlem tamamlandığında yeni kasayı ayrı bir klasöre çözerek dosyalarınızı açabildiğinizi kontrol edin. Bu kontrolü yapana kadar asılları saklayın.
+During encryption and decryption, live throughput (e.g., `MiB/s`) and an estimated time remaining (ETA) appear next to the progress bar.
 
-## Kasayı açma
+1. Drag and drop files or folders onto the window (or use **Add Files...** / **Add Folder...**). Verify the source list and destination directory on the **Encrypt** tab.
+2. Enter and confirm a strong, unique password. Optionally bind a non-empty **keyfile** as a second factor; if bound, that exact file is required alongside the password on every unlock, so back it up safely outside the vault.
+3. Click **Encrypt Now**. Write down the **24-word BIP-39 recovery phrase** in order and store it separately from the vault, then confirm to start. Anyone holding this phrase can unlock the vault without the password or keyfile.
+4. Once finished, test decrypting the new `.vault` into a separate folder before deleting or wiping the originals.
 
-`.vault` dosyasını pencereye sürükleyin. **Çöz** sekmesinde parolayı girin ve kasaya bağladıysanız anahtar dosyasını seçin. Parolanızı veya anahtar dosyanızı kaybettiyseniz kurtarma cümlesi seçeneğini işaretleyip 24 kelimeyi aynı sırayla girin. Hedef klasörü seçip **Şimdi Çöz** düğmesine basın. Çıkarılan dosyalar bu klasörde şifresiz olarak bulunur.
+## Container Size (Padding) & Hidden Vault (Plausible Deniability)
 
-## Kasayı inceleme ve seçici dosya çıkarma
+Use a fixed-size padded container to hide the true size of your payload or to embed a second, cryptographically indistinguishable hidden compartment inside the same `.vault` file:
 
-Tüm kasayı açmadan içeriği kontrol etmek veya yalnızca belirli dosyaları çıkarmak için **İncele** sekmesini kullanın:
-
-- **Bütünlük Kontrolü (Parolasız):** Kasa başlığını, tüm veri parçalarının (chunk) çerçeve yapısını, sonda bozuk/artık bayt bulunmadığını ve dosyanın SHA-256 özetini parola girmeden doğrular.
-- **Meta Veriyi İncele ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra arama kutusu ve onay kutularıyla yalnızca istediğiniz dosya/klasörleri seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda kasanın tüm şifreli parçaları yine doğrulanır; yalnızca seçtiğiniz öğeler diske yazılır.)*
-
-## İki kasayı karşılaştırma
-
-**İncele → Kasa Karşılaştırma (Vault Diff)** bölümünde önceki kasayı **Kasa A**, sonraki kasayı **Kasa B** olarak seçin. Her biri için parolayı ve varsa bağlı anahtar dosyasını girin veya kurtarma cümlesini kullanın. **Kasaları Karşılaştır** düğmesi yalnızca başlıklardaki dosya listelerini okur. Eklenen ve silinen yollar A’dan B’ye göre gösterilir. “Değişmedi” sonucu yol, boyut ve değişiklik zamanının eşleştiği anlamına gelir. Dosya içeriklerinin birebir aynı olduğunu kanıtlamaz.
-
-Terminalde aynı karşılaştırmayı yapmak için aşağıdaki komutu kullanın. JSON çıktı için `--json`, anahtar dosyaları için `--keyfile-a` veya `--keyfile-b`, kurtarma cümlesiyle açacağınız taraf için `--recovery-a` veya `--recovery-b` ekleyebilirsiniz.
+- **Container Size (Padding):** In the **Encrypt** tab, change **Container Size (Padding)** from `Auto (Content Size)` to `10 MiB`, `50 MiB`, `100 MiB`, `500 MiB`, or `Custom (MiB)` (1–65536 MiB), or pass `--container-mb <MiB>` in the CLI. Unused space is filled with random `OsRng` bytes, while keeping the exact same public header format.
+- **Hidden Vault (Plausible Deniability):** Expand **Hidden Vault (Plausible Deniability)** on the **Encrypt** tab and enable embedding a secondary hidden vault. Select separate hidden sources, a hidden password that **differs** from the outer password, and an optional hidden keyfile. Unlocking with the outer password reveals only the decoy vault; unlocking with the hidden password transparently reveals only the hidden vault.
+- **Important constraints:**
+  - Hidden vaults require a fixed container size (`Auto` cannot be used).
+  - **The 24-word recovery phrase unlocks only the outer (decoy) vault;** by design, no recovery phrase is generated for the hidden compartment.
+  - To prevent distinguishing padded decoy containers from hidden-vault containers, **Re-Key (`rekey`) is disabled** on all fixed-size padded containers.
+  - **Decrypt**, **Inspect**, selective extraction, and **Vault Diff** automatically choose the decoy or hidden compartment based on the credentials provided.
 
 ```sh
-./rpm-encrypter-cli diff ./onceki.vault ./sonraki.vault
+# Create a 50 MiB container holding an outer decoy vault and an inner hidden vault
+./rpm-encrypter-cli encrypt ./DecoyDocs --container-mb 50 --hidden ./SecretDocs --hidden-keyfile ./hidden.key
+
+# Non-interactive scripts: line 1 is outer password, line 2 is hidden password
+printf "OuterPass!\nHiddenPass!\n" | ./rpm-encrypter-cli encrypt ./DecoyDocs --container-mb 10 --hidden ./SecretDocs --password-stdin
 ```
 
-## Ayarlar ve Parola Üretici
+To decrypt or inspect the hidden compartment in `decrypt`, `inspect`, or `diff`, pass the hidden password (and `--keyfile ./hidden.key` if a hidden keyfile was bound).
 
-**Ayarlar** sekmesinde Argon2id yineleme sayısı (1–10), paroladan anahtar türetirken yapılan iş miktarını belirler. Paralellik (1–16), bu işin kaç şeride bölüneceğini ayarlar. Arayüzü büyütmek veya küçültmek için %80–150 arasındaki hazır ölçeklerden birini seçin. Tercihlerin sonraki açılışta da kullanılması için **Tercihleri Kaydet** düğmesine basın.
+## Decrypting a vault
 
-**Parola Üretici** sekmesinde büyük harf, küçük harf, rakam ve sembol sınıflarından en az birini seçin. Parolayı elle yazacaksanız karıştırılabilir karakterleri hariç tutarak `0`, `O`, `1`, `l` ve `I` karakterlerini elemeniz mümkün.
+Drag and drop `.vault` files onto the window. On the **Decrypt** tab, enter the password and select any bound keyfile (or enter the hidden password and hidden keyfile to unlock a hidden compartment). If you lost the outer password or keyfile, check **Use 24-word recovery phrase instead of password** and enter all 24 words in order. Choose the output folder and click **Decrypt Now**.
 
-## Parolayı değiştirme
+## Inspecting a vault and selective extraction
 
-**Anahtar Değiştir** sekmesinde kasayı seçin. Mevcut parolayı, varsa bağlı anahtar dosyasını ve yeni parolayı girin. Yeni parolayı doğrulayıp **Anahtarı Güncelle** düğmesine basın.
+Use the **Inspect** tab to verify integrity or restore specific files without writing the whole archive to disk:
 
-Bu işlem yalnızca kasa anahtarını yeni parolayla yeniden şifreler. Bu adımın maliyeti kasa boyutundan bağımsızdır (O(1)). Uygulama değişikliği kaydederken şifreli içeriği kopyalar. Büyük kasalarda işlem süresi uzayabilir ve diskte yaklaşık bir kasa boyutu kadar boş yer gerekir.
+- **Integrity Check (No Password):** Verifies the vault header, chunk framing, exact EOF/container-size boundary, and full-file SHA-256 digest without needing credentials.
+- **Inspect Metadata & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase, filter or check the files/folders you want, and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before promoted files are written atomically.)*
 
-## Komut satırından hızlı kullanım
+## Comparing two vaults (Vault Diff)
 
-Örnekte paket klasöründe bir terminal açıldığı, `Belgeler` klasörünün ve `anahtar.key` dosyasının burada bulunduğu varsayılır. Windows PowerShell’de komutların başındaki `./rpm-encrypter-cli` yerine `.\rpm-encrypter-cli.exe` yazın. Parolayı program sorduğunda girin. İlk komutun sonunda gösterilen kurtarma cümlesini güvenli bir yere kaydedin.
+Under **Inspect → Vault Comparison (Vault Diff)**, pick **Vault A** and **Vault B**, provide credentials (password + optional keyfile, or 24-word recovery phrase) for each side, and click **Compare Vaults**. Only headers are read (no payload decryption). Added and removed paths are reported directionally from A to B; you can also compare the outer and hidden compartments of the same `.vault` file by giving different credentials for A and B. “Unchanged” indicates matching path, size, and modification timestamp — it does not prove identical file bytes.
+
+Terminal equivalent (supports `--json`, `--keyfile-a`, `--keyfile-b`, `--recovery-a`, `--recovery-b`):
 
 ```sh
-# Klasörü parola ve anahtar dosyasıyla şifrele
-./rpm-encrypter-cli encrypt ./Belgeler --keyfile ./anahtar.key
-
-# Oluşan kasayı aç (çıktıda farklı bir kasa adı gördüyseniz onu kullanın)
-./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key
-
-# Kurtarma cümlesiyle aç
-./rpm-encrypter-cli decrypt ./Belgeler.vault --recovery
-
-# Yalnızca tek dosya veya alt klasör seçerek aç (--only tekrarlanabilir)
-./rpm-encrypter-cli decrypt ./Belgeler.vault --only Belgeler/notlar.txt
-
-# Parola istemeden yapısal bütünlük + SHA-256 kontrolü
-./rpm-encrypter-cli inspect ./Belgeler.vault --integrity-only
-
-# Aynı anahtar dosyasını kullanarak parolayı değiştir
-./rpm-encrypter-cli rekey ./Belgeler.vault --keyfile ./anahtar.key
+./rpm-encrypter-cli diff ./previous.vault ./current.vault
 ```
 
-`encrypt` ve `decrypt` komutlarında `--progress` seçeneği, hız ve tahmini kalan süre bilgilerinin standart hata akışına (`stderr`) ne zaman yazılacağını belirler. `auto` varsayılandır ve yalnızca etkileşimli terminalde gösterir. `always` çıktı yönlendirilse de gösterir. `never` ilerleme bilgisini kapatır.
+## Settings & Password Generator
+
+- **Settings:** Configure Argon2id memory (`16–256 MiB`), iterations (`1–10`), parallelism (`1–16`), default gzip compression, secure wipe passes, and persistent UI scale (`80–150%`). Click **Save Preferences** to persist settings across restarts.
+- **Password Gen:** Independently toggle uppercase letters, lowercase letters, digits, and symbols, and optionally exclude visually ambiguous characters (`0`, `O`, `1`, `l`, `I`).
+
+## Changing a password (Re-Key)
+
+On the **Re-Key** tab, select a standard (non-padded) `.vault` file, enter the current password and any bound keyfile, enter and confirm the new password, choose whether to keep or change the keyfile binding, and click **Re-Key Vault**.
+
+Re-keying only re-wraps the DEK under the new credentials (`O(1)` cryptographic cost) while rewriting the container cleanly on disk. *(Fixed-size padded containers and containers holding a hidden vault reject `rekey` by design.)*
+
+## Quick CLI usage
+
+Examples below assume a terminal opened in the extracted release folder with `./Docs` and `./my.key` nearby. On Windows PowerShell, replace `./rpm-encrypter-cli` with `.\rpm-encrypter-cli.exe`. Save the 24-word recovery phrase printed at the end of `encrypt`.
 
 ```sh
-./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key --progress always
+# Encrypt a folder with password + keyfile
+./rpm-encrypter-cli encrypt ./Docs --keyfile ./my.key
+
+# Pad to a fixed 25 MiB container
+./rpm-encrypter-cli encrypt ./Docs --container-mb 25
+
+# Create an outer + hidden vault (uncompressed hidden compartment + hidden keyfile)
+./rpm-encrypter-cli encrypt ./Decoy --container-mb 50 --hidden ./Secret --hidden-keyfile ./hidden.key --hidden-no-compress
+
+# Decrypt the vault
+./rpm-encrypter-cli decrypt ./Docs.vault --keyfile ./my.key
+
+# Decrypt with the 24-word recovery phrase (outer compartment only)
+./rpm-encrypter-cli decrypt ./Docs.vault --recovery
+
+# Extract only specific file(s) or folder(s) (--only is repeatable)
+./rpm-encrypter-cli decrypt ./Docs.vault --only Docs/notes.txt
+
+# Passwordless structural integrity + SHA-256 verification
+./rpm-encrypter-cli inspect ./Docs.vault --integrity-only
+
+# Rotate password keeping the same keyfile (non-padded vaults only)
+./rpm-encrypter-cli rekey ./Docs.vault --keyfile ./my.key
 ```
 
-## Windows için WinGet manifesti oluşturma
+For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `stderr`: `auto` (default, TTY only), `always`, or `never`.
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.0.2/` klasörüne yazar.
+```sh
+./rpm-encrypter-cli decrypt ./Docs.vault --keyfile ./my.key --progress always
+```
+
+## Generating WinGet manifests (Windows)
+
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.1.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.0.2
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.0.2
+.\packaging\winget\generate-manifests.ps1 -Version 4.1.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.1.0
 ```
 
-WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)
+See [WinGet packaging guide](../packaging/winget/README.md) for submission details.
 
-## SSD ve güvenli silme
+## SSDs and secure wipe caveats
 
-SSD ve USB belleklerde **güvenli silme** seçeneği eski verilerin fiziksel olarak silinmesini garanti edemez. Yedekler ve eşitlenen klasörler de şifresiz kopyalar içerebilir. Hassas dosyalarla çalışıyorsanız en baştan tam disk şifrelemesi kullanın. [Güvenlik ayrıntıları](../SECURITY.md)
+On SSDs and USB flash drives, **secure wipe** cannot guarantee physical erasure of prior blocks due to wear leveling, and backups or synced folders may retain unencrypted copies. Use full-disk encryption from the start for sensitive workloads. See [SECURITY.md](../SECURITY.md).

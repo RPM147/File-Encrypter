@@ -1,5 +1,12 @@
 # Changelog
 
+## v4.1.0
+
+- **Container Padding:** Padded `.vault` containers (`--container-mb` in CLI and **Container Size (Padding)** presets or custom MiB in GUI Encrypt) conceal true archive size with `OsRng` random padding while using the same public `VaultHeader` layout (`container_size` + `container_salt`) and enforcing exact-size integrity checks.
+- **Hidden Vault (Plausible Deniability):** Embed a separately encrypted hidden compartment inside any fixed-size container (`--hidden`, `--hidden-keyfile`, `--hidden-no-compress` in CLI; collapsible **Hidden Vault** panel in GUI) with a trailing 108-byte AES-GCM mini-header, randomized pre-gap offset, and HKDF XOR-masked frame prefixes indistinguishable from random padding.
+- **Compartment-Aware Operations & Security Boundaries:** `decrypt`, selective extract, `inspect`, and `diff` transparently select the outer or hidden compartment based on the supplied credentials via `inspect_header_seekable` / `unlock_seekable`. `rekey` is uniformly rejected on padded containers to preserve plausible deniability, and the 24-word recovery phrase unlocks only the outer decoy vault.
+- **Documentation & Repository Cleanup:** Added bilingual English and Turkish documentation (`docs/USER_GUIDE.md`, `docs/USER_GUIDE.tr.md`, `docs/RELEASE_CHECKLIST.md`, `docs/RELEASE_CHECKLIST.tr.md`), expanded the threat model in `SECURITY.md` for container padding and hidden compartments, and removed the retired Python `legacy/` directory from Git tracking.
+
 ## v4.0.2
 
 - Vault Diff compares authenticated file lists from two vault headers. The core API, CLI `diff` command and desktop Inspect tab report added, removed, changed and unchanged paths using file sizes and modification times.

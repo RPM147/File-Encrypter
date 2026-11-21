@@ -1,20 +1,21 @@
-# v4.0.2 sürüm kontrol listesi
+# v4.1.0 Release Checklist
 
-## Etiketten önce
+> Türkçe: [RELEASE_CHECKLIST.tr.md](RELEASE_CHECKLIST.tr.md)
 
-- [ ] **CI.** Etiketlenecek commit için Windows ve Ubuntu işleri ile RustSec, lisans ve bağımlılık kaynağı denetimlerini yapan `dependency-audit` işi başarılı. [CI çalışmaları](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
-- [ ] **ZIP ve SHA-256.** Aday commit’ten proje kökünde `.\scripts\package-release.ps1` çalıştır. `Get-FileHash .\dist\rpm-encrypter-4.0.2-windows-x86_64.zip -Algorithm SHA256` çıktısını `dist\SHA256SUMS.txt` içindeki aynı dosya adı ve özetle karşılaştır. Özetler büyük/küçük harften bağımsız eşleşmeli. ZIP’i boş bir klasöre çıkar. İki EXE ile `README.md`, `SECURITY.md`, `LICENSE` ve `docs/USER_GUIDE.md` dosyaları bulunmalı. `rpm-encrypter.exe` simgesini Explorer’da, `4.0.2` dosya/ürün sürümünü Dosya Özellikleri → Ayrıntılar’da doğrula.
-- [ ] **Sürüm notu başlığı.** Etiketlenecek commit’te `CHANGELOG.md` içinde tek bir `## v4.0.2` başlığı ve altında İngilizce sürüm notları bulunuyor.
-- [ ] **Türkçe yazı tipi.** ZIP’ten çıkan `rpm-encrypter.exe` dosyasını aç; varsayılan olarak Türkçe arayüzle açıldığını ve EN/TR dil geçişinin çalıştığını doğrula. Sekmelerde ve düğmelerde “Şifrele”, “Çöz” ve “İncele” okunuyor. Dosya listesinde `Iğdır-ölçü.txt` adı eksik karakter veya kare kutu olmadan görünüyor.
-- [ ] **Sürükle-bırak.** İki farklı deneme dosyası içeren bir klasörü pencereye bırakıp şifrele. Oluşan `.vault` dosyasını pencereye bırak. **Çöz** sekmesi açılıyor ve boş bir hedef klasöre geri yüklenen iki dosyanın içeriği asıllarıyla eşleşiyor.
-- [ ] **Seçici çıkarma.** Aynı kasayı **İncele** sekmesinde açıp meta veriyi görüntüle. İki dosyadan birini seçip **Seçilenleri Çıkar** ile başka bir boş klasöre çıkar. Seçilen dosyanın içeriği doğru ve diğer dosya hedefte yok.
-- [ ] **Windows sağ tık (HKCU).** Standart kullanıcı hesabında Ayarlar’dan Explorer entegrasyonunu etkinleştir. Bir deneme dosyasının sağ tık menüsünden şifrelemeyi aç ve doğru dosyanın seçildiğini gör. Entegrasyonu kaldırıp menü öğesinin kaybolduğunu doğrula.
+## Before tagging
 
-- [ ] **Kasa Karşılaştırma.** Bir deneme klasörünü A kasasına kaydet. Bir dosya ekle, birini sil, birinin boyutunu değiştir ve bir dosyayı olduğu gibi bırak. Aynı klasörü B kasasına kaydet. **İncele → Kasa Karşılaştırma** ekranındaki dört grubun `rpm-encrypter-cli diff A.vault B.vault --json` çıktısıyla ve yaptığın değişikliklerle eşleştiğini doğrula.
-- [ ] **Ayarlar.** Argon2id için 4 yineleme ve 2 paralellik seç. Arayüzü %120 ölçeğe getirip **Tercihleri Kaydet** düğmesine bas. Uygulamayı yeniden açınca üç değer korunmalı ve yeni oluşturulan bir deneme kasası çözülebilmeli.
-- [ ] **Parola Üretici.** Yalnızca rakamları etkinleştir ve karıştırılabilir karakter filtresini aç. Üretilen parolada yalnızca 2–9 rakamları bulunmalı. Ardından yalnızca sembolleri seçip üretilen parolada harf veya rakam bulunmadığını doğrula.
+- [ ] **CI.** On the candidate commit, Windows and Ubuntu CI jobs plus the `dependency-audit` job (`cargo-deny` RustSec, license, and source checks) are green. [CI workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
+- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.1.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.1.0` in Properties → Details.
+- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.1.0` heading with non-empty English release notes underneath.
+- [ ] **Turkish glyphs & i18n.** Open `rpm-encrypter.exe` from the ZIP; verify it starts in Turkish and `TR / EN` switching updates tabs and buttons cleanly (`Şifrele`, `Çöz`, `İncele`). Confirm `Iğdır-ölçü.txt` renders without missing-glyph boxes.
+- [ ] **Drag-and-drop round-trip.** Drop a folder with two test files onto the window to encrypt, then drop the resulting `.vault` onto the window, verify **Decrypt** opens, and confirm extracted file bytes match originals.
+- [ ] **Selective extraction.** Unlock the same vault on **Inspect**, check one of the two files, and click **Extract Selected** into an empty folder; confirm only that file is written with exact contents.
+- [ ] **Windows right-click (HKCU).** Enable Explorer integration in **Settings** under a standard user account, launch encryption from a test file’s right-click menu, then uninstall integration and verify the menu entry disappears.
+- [ ] **Vault Diff.** Create Vault A and Vault B from test folders (one added, one removed, one modified, one untouched file) and verify the four groups in **Inspect → Vault Comparison** match `rpm-encrypter-cli diff A.vault B.vault --json`.
+- [ ] **Settings & Password Gen.** Set Argon2id to 4 iterations and 2 parallelism with 120% UI scale and click **Save Preferences**; restart and confirm persistence. Enable only Digits + Exclude Ambiguous in **Password Gen** and verify output contains only `2–9`.
+- [ ] **Container Padding & Hidden Vault.** From the GUI **Encrypt** tab, choose `10 MiB`, enable **Hidden Vault (Plausible Deniability)** with separate decoy/hidden sources and passwords, encrypt, and verify exact file size (`10485760` bytes). Verify **Decrypt**, **Inspect**, selective extract, and **Vault Diff** transparently open each compartment when given its credentials, and verify `rekey` is rejected on padded containers (both GUI/CLI: `rpm-encrypter-cli encrypt ... --container-mb 10 --hidden ...`).
 
-## Yayından sonra
+## After publishing
 
-- [ ] **Otomatik sürüm notları.** GitHub Release açıklamasının `CHANGELOG.md` içindeki `v4.0.2` bölümünün gövdesiyle eşleştiğini doğrula. [Release iş akışı](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
-- [ ] **Derleme kaynağı (provenance).** Yayımlanan Windows ZIP ve Linux TAR.GZ dosyalarının her biri için `gh attestation verify <arşiv> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.0.2` komutunu çalıştır. Her iki doğrulama da başarılı olmalı. [GitHub CLI başvurusu](https://cli.github.com/manual/gh_attestation_verify)
+- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.1.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
+- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.1.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)

@@ -6,7 +6,7 @@ RPM Encrypter is a **Pure-Rust, local-only** file encryption utility using **Chu
 
 Everything runs locally with zero telemetry, cloud accounts, or network dependencies. The retired Python + Flet (Vault Format v4) codebase is preserved in earlier Git history.
 
-[User guide (Türkçe)](docs/USER_GUIDE.md) · [Changelog](CHANGELOG.md)
+[User Guide (English)](docs/USER_GUIDE.md) · [Kullanım Kılavuzu (Türkçe)](docs/USER_GUIDE.tr.md) · [Changelog](CHANGELOG.md)
 
 ## Key Features
 
@@ -19,6 +19,8 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 - **Native Desktop GUI + OS Drag-and-Drop (`rpm-encrypter`):** Built with `eframe`/`egui` and `rfd`, featuring a bilingual Turkish/English UI (`TR`/`EN`), external file/folder drag-and-drop, and a 30-second auto-clearing clipboard timer.
 - **Selective File Extraction:** Restore individual files or subfolders using the GUI **Inspect** tab checklist or repeatable `decrypt --only <PATH>` flags in the CLI, guarded by the same stage-and-swap authentication boundary.
 - **Headless CLI (`rpm-encrypter-cli`):** Scriptable encryption, decryption, inspection, re-keying, password generation, and Windows shell integration without passing passwords on the command line.
+- **Container Padding & Hidden Vault (Plausible Deniability):** Pad vaults to fixed MiB container sizes with `OsRng` random bytes (`--container-mb` or GUI Container Size selector) and optionally embed an indistinguishable secondary hidden compartment (`--hidden` or GUI Hidden Vault panel) with independent credentials.
+- **Header-Only Vault Diff:** Compare two vaults' authenticated file manifests (added, removed, changed, unchanged) from headers alone in GUI **Inspect** or CLI `diff`.
 - **Windows Shell Integration (User-Scoped HKCU):** Optional right-click **"Encrypt with RPM Encrypter"** menu and `.vault` double-click opening (reversible, zero administrator rights required).
 
 ## Building & Running (Pure Rust)
@@ -51,8 +53,10 @@ Passwords are never accepted as CLI flags; interactive secure prompts or `--pass
 
 ```bash
 cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-out recovery.txt
+cargo run -p rpm-cli -- encrypt ./decoy --container-mb 50 --hidden ./secret --hidden-keyfile ./hidden.key
 cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored
 cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json
+cargo run -p rpm-cli -- diff ./vault-a.vault ./vault-b.vault
 cargo run -p rpm-cli -- rekey ./folder.vault --keyfile ./my.key
 cargo run -p rpm-cli -- password --length 24
 cargo run -p rpm-cli -- shell-integration install   # Windows HKCU only

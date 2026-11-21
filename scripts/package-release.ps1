@@ -36,6 +36,7 @@ try {
         'SECURITY.md'           = 'SECURITY.md'
         'LICENSE'               = 'LICENSE'
         'docs/USER_GUIDE.md'    = 'docs/USER_GUIDE.md'
+        'docs/USER_GUIDE.tr.md' = 'docs/USER_GUIDE.tr.md'
     }
     $missing = @(
         foreach ($entry in $entries.GetEnumerator()) {

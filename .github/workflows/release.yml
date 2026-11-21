@@ -73,7 +73,7 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/rpm-encrypter-${RELEASE_TAG#v}-linux-x86_64.tar.gz" \
-            README.md SECURITY.md LICENSE docs/USER_GUIDE.md \
+            README.md SECURITY.md LICENSE docs/USER_GUIDE.md docs/USER_GUIDE.tr.md \
             -C target/release rpm-encrypter rpm-encrypter-cli
 
       - uses: actions/upload-artifact@v7
