@@ -47,9 +47,14 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
         }
     };
     visuals.window_corner_radius = CornerRadius::same(8);
-    ctx.set_visuals(visuals);
+    let egui_theme = match mode {
+        ThemeMode::Dark => egui::Theme::Dark,
+        ThemeMode::Light => egui::Theme::Light,
+    };
+    ctx.set_theme(egui_theme);
+    ctx.set_visuals_of(egui_theme, visuals);
 
-    ctx.style_mut(|style| {
+    ctx.style_mut_of(egui_theme, |style| {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
         style.spacing.window_margin = egui::Margin::same(14);

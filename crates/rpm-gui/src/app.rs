@@ -145,7 +145,8 @@ impl RpmApp {
 }
 
 impl eframe::App for RpmApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         if !self.theme_initialized {
             self.state.apply_theme_visuals(ctx);
             self.theme_initialized = true;
@@ -171,7 +172,8 @@ impl eframe::App for RpmApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|df| df.path.clone())
+                .map(|df| df.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
         if !dropped.is_empty() {
@@ -183,15 +185,14 @@ impl eframe::App for RpmApp {
         }
         let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
+        ui.reset_style();
         let s = self.state.strings();
-        let accent = theme::accent_color(&ctx.style().visuals);
+        let style = ctx.global_style();
+        let accent = theme::accent_color(&style.visuals);
 
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(14, 8)),
-            )
-            .show(ctx, |ui| {
+        egui::Panel::bottom("status_bar")
+            .frame(egui::Frame::side_top_panel(&style).inner_margin(egui::Margin::symmetric(14, 8)))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.state.is_error {
                         ui.colored_label(egui::Color32::from_rgb(230, 80, 80), &self.state.status);
@@ -224,10 +225,10 @@ impl eframe::App for RpmApp {
                 });
             });
 
-        egui::SidePanel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(false)
-            .default_width(200.0)
-            .show(ctx, |ui| {
+            .default_size(200.0)
+            .show(ui, |ui| {
                 ui.add_space(10.0);
                 ui.heading(s.app_title);
                 ui.colored_label(accent, egui::RichText::new(s.app_badge).small().strong());
@@ -269,7 +270,7 @@ impl eframe::App for RpmApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if is_hovering_files {
                 egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(20, 184, 166, 36))

@@ -1,8 +1,6 @@
 [advisories]
 version = 2
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "Transitive Linux-only dep via eframe 0.31 -> accesskit_unix -> atspi -> zbus_xml 4.0.0 -> quick-xml 0.30.0; parses local AT-SPI D-Bus introspection only, never untrusted or vault inputs. Remove when upgrading eframe." },
-    { id = "RUSTSEC-2026-0195", reason = "Transitive Linux-only dep via eframe 0.31 -> accesskit_unix -> atspi -> zbus_xml 4.0.0 -> quick-xml 0.30.0; parses local AT-SPI D-Bus introspection only, never untrusted or vault inputs. Remove when upgrading eframe." },
     { id = "RUSTSEC-2026-0543", reason = "Transitive unmaintained notice for chrono 0.4.45 via zxcvbn 3.1.1 (latest release); used only for offline password-strength date-pattern checks. Direct chrono usage was removed from rpm-storage." },
 ]
 
