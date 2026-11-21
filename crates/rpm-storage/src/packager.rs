@@ -198,6 +198,7 @@ fn append_recursive<W: Write>(
     fs_path: &Path,
     arc_path: &str,
     cancel: Option<&AtomicBool>,
+    excluded: Option<&Path>,
     on_skip: &mut dyn FnMut(&str),
 ) -> Result<(), StorageError> {
     check_cancelled(cancel)?;
@@ -215,6 +216,15 @@ fn append_recursive<W: Write>(
     }
 
     if meta.is_file() {
+        // A destination inside a selected directory may appear after manifest collection.
+        if let Some(path) = excluded {
+            if path.file_name() == fs_path.file_name()
+                && fs::canonicalize(path)
+                    .is_ok_and(|out| fs::canonicalize(fs_path).is_ok_and(|input| input == out))
+            {
+                return Ok(());
+            }
+        }
         let mut f = File::open(fs_path)?;
         builder.append_file(arc_path, &mut f)?;
         return Ok(());
@@ -230,7 +240,7 @@ fn append_recursive<W: Write>(
         for child in children {
             let name = child.file_name().unwrap_or_default().to_string_lossy();
             let next_arc = format!("{arc_path}/{name}");
-            append_recursive(builder, &child, &next_arc, cancel, on_skip)?;
+            append_recursive(builder, &child, &next_arc, cancel, excluded, on_skip)?;
         }
     }
     Ok(())
@@ -243,6 +253,17 @@ pub fn pack_sources<W: Write>(
     writer: W,
     compress: bool,
     cancel: Option<&AtomicBool>,
+    on_skip: impl FnMut(&str),
+) -> Result<(), StorageError> {
+    pack_sources_excluding(sources, writer, compress, cancel, None, on_skip)
+}
+
+pub(crate) fn pack_sources_excluding<W: Write>(
+    sources: &[PathBuf],
+    writer: W,
+    compress: bool,
+    cancel: Option<&AtomicBool>,
+    excluded: Option<&Path>,
     mut on_skip: impl FnMut(&str),
 ) -> Result<(), StorageError> {
     let roots = assign_unique_roots(sources);
@@ -250,7 +271,14 @@ pub fn pack_sources<W: Write>(
         let enc = GzEncoder::new(writer, Compression::default());
         let mut builder = Builder::new(enc);
         for (fs_path, arc_root) in roots {
-            append_recursive(&mut builder, &fs_path, &arc_root, cancel, &mut on_skip)?;
+            append_recursive(
+                &mut builder,
+                &fs_path,
+                &arc_root,
+                cancel,
+                excluded,
+                &mut on_skip,
+            )?;
         }
         let enc = builder.into_inner()?;
         let inner = enc.finish()?;
@@ -258,7 +286,14 @@ pub fn pack_sources<W: Write>(
     } else {
         let mut builder = Builder::new(writer);
         for (fs_path, arc_root) in roots {
-            append_recursive(&mut builder, &fs_path, &arc_root, cancel, &mut on_skip)?;
+            append_recursive(
+                &mut builder,
+                &fs_path,
+                &arc_root,
+                cancel,
+                excluded,
+                &mut on_skip,
+            )?;
         }
         let inner = builder.into_inner()?;
         drop(inner);

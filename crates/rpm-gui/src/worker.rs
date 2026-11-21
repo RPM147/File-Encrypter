@@ -102,6 +102,18 @@ fn yes_no(flag: bool, lang: AppLanguage) -> &'static str {
 
 /// Format a passwordless structural integrity report for localized GUI display.
 pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> String {
+    if rep.sha256_only {
+        let size_label = match lang {
+            AppLanguage::Tr => "Dosya boyutu",
+            AppLanguage::En => "File size",
+        };
+        return format!(
+            "{size_label}: {} B\nSHA-256: {}\n{}",
+            rep.file_size,
+            rep.sha256_hex,
+            crate::i18n::strings(lang).digest_computed
+        );
+    }
     let kf = yes_no(rep.has_keyfile, lang);
     let rec = yes_no(rep.has_recovery, lang);
     match lang {
@@ -161,6 +173,22 @@ pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
         ],
     };
 
+    if info.is_stealth {
+        lines.push(match lang {
+            AppLanguage::Tr => {
+                format!(
+                    "Başlık Modu     : {}",
+                    crate::i18n::strings(lang).stealth_mode
+                )
+            }
+            AppLanguage::En => {
+                format!(
+                    "Header Mode    : {}",
+                    crate::i18n::strings(lang).stealth_mode
+                )
+            }
+        });
+    }
     if let Some(container_size) = info.container_size {
         let container_mib = (container_size as f64) / (1024.0 * 1024.0);
         lines.push(match lang {
@@ -413,6 +441,7 @@ pub fn spawn_encrypt(
     output_dir: Option<PathBuf>,
     compress: bool,
     container_size_bytes: Option<u64>,
+    stealth: bool,
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
@@ -428,7 +457,12 @@ pub fn spawn_encrypt(
         };
 
         let opts = EncryptOptions {
-            kdf,
+            stealth,
+            kdf: if stealth {
+                rpm_core::STEALTH_KDF_PARAMS
+            } else {
+                kdf
+            },
             chunk_size: rpm_core::constants::DEFAULT_CHUNK_SIZE,
             recovery_key: Some(recovery_entropy),
             keyfile_hash,
@@ -503,6 +537,7 @@ pub fn spawn_encrypt_hidden(
     decoy_compressed: bool,
     hidden_compressed: bool,
     container_size_bytes: u64,
+    stealth: bool,
     secure_wipe: bool,
     wipe_passes: u8,
     kdf: KdfParams,
@@ -529,7 +564,12 @@ pub fn spawn_encrypt_hidden(
         };
 
         let opts = HiddenEncryptOptions {
-            kdf,
+            stealth,
+            kdf: if stealth {
+                rpm_core::STEALTH_KDF_PARAMS
+            } else {
+                kdf
+            },
             chunk_size: rpm_core::constants::DEFAULT_CHUNK_SIZE,
             container_size_bytes,
             decoy_recovery_key: Some(decoy_recovery_entropy),
@@ -696,7 +736,15 @@ pub fn spawn_integrity_check(
     thread::spawn(move || match check_integrity(&vault) {
         Ok(rep) => {
             let text = format_integrity_report(&rep, lang);
-            send(&tx, &ctx, WorkerUpdate::IntegrityDone { text, ok: rep.ok });
+            send(
+                &tx,
+                &ctx,
+                WorkerUpdate::IntegrityDone {
+                    text,
+                    ok: rep.ok,
+                    sha256_only: rep.sha256_only,
+                },
+            );
         }
         Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
     });

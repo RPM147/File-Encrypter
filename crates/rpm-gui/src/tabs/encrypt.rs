@@ -192,6 +192,11 @@ pub fn ui(
             ui.checkbox(&mut state.encrypt.secure_wipe, s.chk_secure_wipe);
         });
 
+        ui.checkbox(&mut state.encrypt.stealth, s.stealth_mode);
+        if state.encrypt.stealth {
+            ui.weak(s.stealth_help);
+        }
+
         ui.horizontal(|ui| {
             ui.label(s.lbl_container_size);
             egui::ComboBox::from_id_salt("enc_container_preset")
@@ -460,6 +465,7 @@ pub fn ui(
                     state.encrypt.compress,
                     state.encrypt.hidden_compress,
                     container_size_bytes,
+                    state.encrypt.stealth,
                     state.encrypt.secure_wipe,
                     state.config.wipe_passes,
                     state.config.kdf_params(),
@@ -480,6 +486,7 @@ pub fn ui(
                     out_dir,
                     state.encrypt.compress,
                     container_size,
+                    state.encrypt.stealth,
                     state.encrypt.secure_wipe,
                     state.config.wipe_passes,
                     state.config.kdf_params(),

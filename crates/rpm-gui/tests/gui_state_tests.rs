@@ -38,8 +38,19 @@ fn dropped_files_route_vaults_to_decrypt_and_regular_to_encrypt() {
     assert_eq!(st.active_tab, Tab::Decrypt);
     assert_eq!(st.decrypt.vaults, vec![PathBuf::from("secret.vault")]);
 
-    // Non-.vault dropped onto Decrypt is rejected cleanly
+    // An explicit Decrypt selection accepts an existing file with any extension.
+    let dir = tempfile::tempdir().unwrap();
+    let opaque = dir.path().join("archive.bin");
+    fs::write(&opaque, b"opaque").unwrap();
+    st.add_dropped_paths(vec![opaque.clone()], Some(Tab::Decrypt));
+    assert!(st.decrypt.vaults.contains(&opaque));
+    // Missing non-vault paths and directories are rejected on Decrypt.
     st.add_dropped_paths(vec![PathBuf::from("plain.txt")], Some(Tab::Decrypt));
+    assert!(st.is_error);
+    let sub = dir.path().join("folder");
+    fs::create_dir(&sub).unwrap();
+    st.is_error = false;
+    st.add_dropped_paths(vec![sub], Some(Tab::Decrypt));
     assert!(st.is_error);
 }
 
@@ -190,6 +201,7 @@ fn inspect_manifest_selection_filtering_and_vault_change_reset() {
 #[test]
 fn worker_reports_format_cleanly_in_tr_and_en() {
     let rep = IntegrityReport {
+        sha256_only: false,
         ok: true,
         version: 5,
         file_size: 4096,
@@ -207,6 +219,7 @@ fn worker_reports_format_cleanly_in_tr_and_en() {
     assert!(rep_en.contains("Yes") && rep_en.contains("No"));
 
     let info = VaultInfo {
+        is_stealth: false,
         version: 5,
         vault_id: "0123456789abcdef".into(),
         cipher: "AES-256-GCM-CHUNKED".into(),
@@ -934,6 +947,7 @@ fn clear_encrypt_secrets_wipes_outer_and_hidden_passwords() {
 #[test]
 fn format_inspect_report_shows_container_size_and_hidden_compartment() {
     let info = VaultInfo {
+        is_stealth: false,
         version: 5,
         vault_id: "0123456789abcdef".into(),
         cipher: "AES-256-GCM-CHUNKED".into(),
@@ -1017,75 +1031,125 @@ fn phase3_container_and_hidden_bilingual_strings_parity() {
 
 #[test]
 fn seekable_inspect_and_diff_support_hidden_vault_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let decoy_file = dir.path().join("public_readme.txt");
-    let hidden_file = dir.path().join("private_keys.txt");
-    fs::write(&decoy_file, b"public decoy contents").unwrap();
-    fs::write(&hidden_file, b"secret hidden contents").unwrap();
+    for stealth in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let decoy_file = dir.path().join("public_readme.txt");
+        let hidden_file = dir.path().join("private_keys.txt");
+        fs::write(&decoy_file, b"public decoy contents").unwrap();
+        fs::write(&hidden_file, b"secret hidden contents").unwrap();
 
-    let vault = dir.path().join("container.vault");
-    let container_size = 512 * 1024;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let opts = HiddenEncryptOptions {
-        kdf: KdfParams::fast_test(),
-        chunk_size: MIN_CHUNK_SIZE,
-        container_size_bytes: container_size,
-        decoy_recovery_key: None,
-        decoy_keyfile_hash: None,
-        decoy_compressed: true,
-        hidden_keyfile_hash: None,
-        hidden_compressed: true,
-    };
+        let vault = dir.path().join("container.vault");
+        let container_size = 512 * 1024;
+        let cancel = Arc::new(AtomicBool::new(false));
+        if stealth {
+            use rpm_gui::state::WorkerUpdate;
+            use zeroize::Zeroizing;
+            let (tx, rx) = std::sync::mpsc::channel();
+            worker::spawn_encrypt_hidden(
+                egui::Context::default(),
+                tx,
+                cancel,
+                vec![decoy_file.clone()],
+                vec![hidden_file],
+                Zeroizing::new("DecoyPw!1".into()),
+                Zeroizing::new("HiddenPw!2".into()),
+                SecretKey::new([5; 32]),
+                None,
+                None,
+                None,
+                true,
+                true,
+                container_size,
+                true,
+                false,
+                1,
+                KdfParams::fast_test(),
+                AppLanguage::En,
+            );
+            loop {
+                match rx.recv_timeout(Duration::from_secs(60)).unwrap() {
+                    WorkerUpdate::EncryptDone { .. } => break,
+                    WorkerUpdate::Error(err) => panic!("{err}"),
+                    _ => {}
+                }
+            }
+            fs::rename(dir.path().join("public_readme.txt.vault"), &vault).unwrap();
+        } else {
+            let opts = HiddenEncryptOptions {
+                stealth: false,
+                kdf: KdfParams::fast_test(),
+                chunk_size: MIN_CHUNK_SIZE,
+                container_size_bytes: container_size,
+                decoy_recovery_key: None,
+                decoy_keyfile_hash: None,
+                decoy_compressed: true,
+                hidden_keyfile_hash: None,
+                hidden_compressed: true,
+            };
 
-    encrypt_hidden_sources_v5(
-        std::slice::from_ref(&decoy_file),
-        std::slice::from_ref(&hidden_file),
-        &vault,
-        b"DecoyPw!1",
-        b"HiddenPw!2",
-        &opts,
-        Arc::new(|_, _| {}),
-        cancel,
-        |_| {},
-    )
-    .unwrap();
+            encrypt_hidden_sources_v5(
+                std::slice::from_ref(&decoy_file),
+                std::slice::from_ref(&hidden_file),
+                &vault,
+                b"DecoyPw!1",
+                b"HiddenPw!2",
+                &opts,
+                Arc::new(|_, _| {}),
+                cancel,
+                |_| {},
+            )
+            .unwrap();
+        }
+        let mut reader_outer = BufReader::new(File::open(&vault).unwrap());
+        let outer_info = inspect_header_seekable(
+            &mut reader_outer,
+            Auth::Password {
+                password: b"DecoyPw!1",
+                keyfile_hash: None,
+            },
+        )
+        .unwrap();
+        assert!(!outer_info.is_hidden_compartment);
+        assert_eq!(outer_info.container_size, Some(container_size));
 
-    let mut reader_outer = BufReader::new(File::open(&vault).unwrap());
-    let outer_info = inspect_header_seekable(
-        &mut reader_outer,
-        Auth::Password {
-            password: b"DecoyPw!1",
-            keyfile_hash: None,
-        },
-    )
-    .unwrap();
-    assert!(!outer_info.is_hidden_compartment);
-    assert_eq!(outer_info.container_size, Some(container_size));
+        let mut reader_hidden = BufReader::new(File::open(&vault).unwrap());
+        let hidden_info = inspect_header_seekable(
+            &mut reader_hidden,
+            Auth::Password {
+                password: b"HiddenPw!2",
+                keyfile_hash: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(outer_info.is_stealth, stealth);
+        assert_eq!(hidden_info.is_stealth, stealth);
+        for lang in [AppLanguage::Tr, AppLanguage::En] {
+            let report = worker::format_inspect_report(&hidden_info, lang);
+            assert_eq!(report.contains(i18n::strings(lang).stealth_mode), stealth);
+            if stealth {
+                let prefix = match lang {
+                    AppLanguage::Tr => "Başlık Modu     : ",
+                    AppLanguage::En => "Header Mode    : ",
+                };
+                assert!(report.contains(prefix));
+            }
+        }
+        assert!(hidden_info.is_hidden_compartment);
+        assert_eq!(hidden_info.container_size, Some(container_size));
 
-    let mut reader_hidden = BufReader::new(File::open(&vault).unwrap());
-    let hidden_info = inspect_header_seekable(
-        &mut reader_hidden,
-        Auth::Password {
-            password: b"HiddenPw!2",
-            keyfile_hash: None,
-        },
-    )
-    .unwrap();
-    assert!(hidden_info.is_hidden_compartment);
-    assert_eq!(hidden_info.container_size, Some(container_size));
+        let hidden_tr = worker::format_inspect_report(&hidden_info, AppLanguage::Tr);
+        let hidden_en = worker::format_inspect_report(&hidden_info, AppLanguage::En);
+        assert!(hidden_tr.contains("Gizli Kasa"));
+        assert!(hidden_en.contains("Hidden Vault"));
+        assert!(hidden_tr.contains("Konteyner Boyutu"));
+        assert!(hidden_en.contains("Container Size"));
 
-    let hidden_tr = worker::format_inspect_report(&hidden_info, AppLanguage::Tr);
-    let hidden_en = worker::format_inspect_report(&hidden_info, AppLanguage::En);
-    assert!(hidden_tr.contains("Gizli Kasa"));
-    assert!(hidden_en.contains("Hidden Vault"));
-    assert!(hidden_tr.contains("Konteyner Boyutu"));
-    assert!(hidden_en.contains("Container Size"));
-
-    let diff = diff_metadata(&outer_info.metadata, &hidden_info.metadata).unwrap();
-    let diff_report = worker::format_diff_report(&diff, AppLanguage::En);
-    assert!(diff_report.contains("+1 added, -1 removed"));
-    assert!(diff_report.contains("private_keys.txt"));
-    assert!(diff_report.contains("public_readme.txt"));
+        let diff = diff_metadata(&outer_info.metadata, &hidden_info.metadata).unwrap();
+        let diff_report = worker::format_diff_report(&diff, AppLanguage::En);
+        assert!(diff_report.contains("+1 added, -1 removed"));
+        assert!(diff_report.contains("private_keys.txt"));
+        assert!(diff_report.contains("public_readme.txt"));
+    }
 }
 
 #[test]
@@ -1175,5 +1239,37 @@ fn preview_types_cleanup_and_localization() {
     for (tr, en) in labels(&i18n::TR).into_iter().zip(labels(&i18n::EN)) {
         assert!(!tr.is_empty() && !en.is_empty());
         assert_ne!(tr, en);
+    }
+}
+
+#[test]
+fn stealth_preferences_and_digest_only_reports_are_bilingual_and_neutral() {
+    assert!(!AppState::default().encrypt.stealth);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.dat");
+    fs::write(&path, b"example").unwrap();
+    let report = rpm_core::check_integrity(&path).unwrap();
+    assert!(report.sha256_only);
+    for (lang, size) in [
+        (AppLanguage::Tr, "Dosya boyutu"),
+        (AppLanguage::En, "File size"),
+    ] {
+        let s = i18n::strings(lang);
+        let text = worker::format_integrity_report(&report, lang);
+        assert_eq!(
+            text,
+            format!(
+                "{size}: 7 B\nSHA-256: {}\n{}",
+                report.sha256_hex, s.digest_computed
+            )
+        );
+        assert!(s.stealth_help.contains("64 MiB") && s.stealth_help.contains("SHA-256"));
+    }
+    for (tr, en) in [
+        (i18n::TR.stealth_mode, i18n::EN.stealth_mode),
+        (i18n::TR.stealth_help, i18n::EN.stealth_help),
+        (i18n::TR.digest_computed, i18n::EN.digest_computed),
+    ] {
+        assert!(!tr.is_empty() && !en.is_empty() && tr != en);
     }
 }

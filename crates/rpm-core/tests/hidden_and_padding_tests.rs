@@ -29,6 +29,7 @@ fn padded_container_enforces_exact_size_integrity_and_rejects_rekey() {
         .collect();
     let container_size = 128 * 1024;
     let opts = EncryptOptions {
+        stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: MIN_CHUNK_SIZE,
         recovery_key: None,
@@ -160,6 +161,7 @@ fn normal_padded_and_hidden_vault_share_indistinguishable_public_header() {
         &meta("normal.bin", decoy.len() as u64),
         b"OuterPw!1",
         &EncryptOptions {
+            stealth: false,
             kdf: KdfParams::fast_test(),
             chunk_size: MIN_CHUNK_SIZE,
             recovery_key: None,
@@ -182,6 +184,7 @@ fn normal_padded_and_hidden_vault_share_indistinguishable_public_header() {
         b"OuterPw!1",
         b"HiddenPw!2",
         &HiddenEncryptOptions {
+            stealth: false,
             kdf: KdfParams::fast_test(),
             chunk_size: MIN_CHUNK_SIZE,
             container_size_bytes: container_size,
@@ -263,6 +266,7 @@ fn hidden_vault_round_trip_keyfiles_recovery_and_security_negatives() {
         b"DecoyPass!1",
         b"HiddenPass!2",
         &HiddenEncryptOptions {
+            stealth: false,
             kdf: KdfParams::fast_test(),
             chunk_size: MIN_CHUNK_SIZE,
             container_size_bytes: container_size,
@@ -348,6 +352,7 @@ fn hidden_vault_round_trip_keyfiles_recovery_and_security_negatives() {
         b"OutPass!",
         b"HidPass!",
         &HiddenEncryptOptions {
+            stealth: false,
             kdf: KdfParams::fast_test(),
             chunk_size: MIN_CHUNK_SIZE,
             container_size_bytes: 128 * 1024,

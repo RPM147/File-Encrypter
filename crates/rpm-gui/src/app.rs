@@ -114,30 +114,23 @@ impl RpmApp {
                     self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
                 }
-                WorkerUpdate::IntegrityDone { text, ok } => {
+                WorkerUpdate::IntegrityDone {
+                    text,
+                    ok,
+                    sha256_only,
+                } => {
                     self.state.busy = false;
                     self.state.transfer = None;
                     self.state.inspect.results = text;
                     self.state.inspect.reset_manifest();
-                    let s = self.state.strings();
-                    let label = match self.state.config.language {
-                        AppLanguage::Tr => {
-                            if ok {
-                                "Bütünlük doğrulaması başarılı"
-                            } else {
-                                "Bütünlük doğrulaması başarısız"
-                            }
-                        }
-                        AppLanguage::En => {
-                            if ok {
-                                "Integrity check passed"
-                            } else {
-                                "Integrity check failed"
-                            }
-                        }
+                    let label = match (sha256_only, self.state.config.language, ok) {
+                        (true, ..) => self.state.strings().digest_computed,
+                        (false, AppLanguage::Tr, true) => "Bütünlük doğrulaması başarılı",
+                        (false, AppLanguage::Tr, false) => "Bütünlük doğrulaması başarısız",
+                        (false, AppLanguage::En, true) => "Integrity check passed",
+                        (false, AppLanguage::En, false) => "Integrity check failed",
                     };
-                    let _ = s;
-                    self.state.set_status(label, !ok);
+                    self.state.set_status(label, !sha256_only && !ok);
                 }
                 WorkerUpdate::DiffDone { text, status } => {
                     self.state.busy = false;
@@ -231,6 +224,7 @@ impl eframe::App for RpmApp {
         });
         if !dropped.is_empty() {
             let forced = match self.state.active_tab {
+                Tab::Decrypt if dropped.iter().all(|p| !p.is_dir()) => Some(Tab::Decrypt),
                 Tab::Inspect | Tab::Rekey => Some(self.state.active_tab),
                 _ => None,
             };

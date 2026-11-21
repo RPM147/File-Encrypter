@@ -27,7 +27,7 @@ impl Default for KdfParams {
 }
 
 impl KdfParams {
-    pub fn owasp_default() -> Self {
+    pub const fn owasp_default() -> Self {
         Self {
             memory_kib: DEFAULT_ARGON_MEMORY_KIB,
             iterations: DEFAULT_ARGON_ITERATIONS,
@@ -204,5 +204,53 @@ pub fn derive_hidden_frame_mask(
     let mut mask = [0u8; 5];
     hk.expand(&info, &mut mask)
         .map_err(|_| CryptoError::CryptoFailure)?;
+    Ok(mask)
+}
+
+pub fn derive_stealth_kek(
+    password: &[u8],
+    salt: &[u8; SALT_SIZE],
+    params: &KdfParams,
+    keyfile_hash: Option<&SecretKey>,
+) -> Result<SecretKey, CryptoError> {
+    let mut argon_salt: [u8; SALT_SIZE] = Sha256::new()
+        .chain_update(b"RPMV5-STEALTH-ARGON-SALT")
+        .chain_update(salt)
+        .finalize()
+        .into();
+    let res = derive_kek_with_domain(
+        password,
+        &argon_salt,
+        params,
+        keyfile_hash,
+        b"rpm-v5-stealth-kek",
+    );
+    argon_salt.zeroize();
+    res
+}
+
+pub fn derive_stealth_recovery_kek(
+    entropy: &SecretKey,
+    salt: &[u8; SALT_SIZE],
+) -> Result<SecretKey, CryptoError> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), entropy.as_bytes());
+    let mut key = Zeroizing::new([0; 32]);
+    hk.expand(b"rpm-v5-stealth-recovery-kek", key.as_mut())
+        .map_err(|_| CryptoError::CryptoFailure)?;
+    Ok(SecretKey::new(*key))
+}
+
+pub fn derive_stealth_frame_mask(
+    dek: &SecretKey,
+    ctx: &[u8; 32],
+    index: u32,
+) -> Result<[u8; 5], CryptoError> {
+    let hk = Hkdf::<Sha256>::new(Some(ctx), dek.as_bytes());
+    let mut mask = [0; 5];
+    hk.expand_multi_info(
+        &[b"rpm-v5-stealth-frame-mask", &index.to_be_bytes()],
+        &mut mask,
+    )
+    .map_err(|_| CryptoError::CryptoFailure)?;
     Ok(mask)
 }

@@ -1,5 +1,5 @@
 use flate2::read::GzDecoder;
-use rpm_core::{decrypt_unlocked_stream, unlock_seekable, Auth, CryptoError};
+use rpm_core::{decrypt_unlocked_stream, unlock_seekable_with_kdf, Auth, CryptoError};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -65,9 +65,29 @@ pub fn extract_entry_to_memory_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+    extract_entry_to_memory_v5_with_stealth_kdf(
+        vault_path,
+        auth,
+        target_path,
+        max_bytes,
+        &rpm_core::STEALTH_KDF_PARAMS,
+        progress,
+        cancel,
+    )
+}
+
+pub fn extract_entry_to_memory_v5_with_stealth_kdf(
+    vault_path: &Path,
+    auth: Auth<'_>,
+    target_path: &str,
+    max_bytes: usize,
+    stealth_kdf: &rpm_core::KdfParams,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Zeroizing<Vec<u8>>, StorageError> {
     let target = relative_path(target_path, UnpackLimits::default().max_path_depth)?;
     let mut vault = BufReader::new(File::open(vault_path)?);
-    let unlocked = unlock_seekable(&mut vault, auth)?;
+    let unlocked = unlock_seekable_with_kdf(&mut vault, auth, stealth_kdf)?;
     let compressed = unlocked.is_compressed();
     let total = unlocked.metadata().original_size;
     let (mut writer, mut reader) = bounded_pipe(2);

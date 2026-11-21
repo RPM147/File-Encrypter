@@ -43,6 +43,7 @@ use crate::vault::{
 
 #[derive(Clone, Debug)]
 pub struct HiddenEncryptOptions {
+    pub stealth: bool,
     pub kdf: KdfParams,
     pub chunk_size: u32,
     pub container_size_bytes: u64,
@@ -56,6 +57,7 @@ pub struct HiddenEncryptOptions {
 impl Default for HiddenEncryptOptions {
     fn default() -> Self {
         Self {
+            stealth: false,
             kdf: KdfParams::default(),
             chunk_size: crate::constants::DEFAULT_CHUNK_SIZE,
             container_size_bytes: MIN_CONTAINER_SIZE,
@@ -84,33 +86,35 @@ pub enum UnlockedVault {
         metadata: VaultMetadata,
         hdr_len: u64,
     },
+    Stealth {
+        info: VaultInfo,
+        dek: SecretKey,
+        ctx: [u8; 32],
+        payload_offset: u64,
+    },
     Hidden {
-        header: VaultHeader,
+        info: VaultInfo,
         hidden_dek: SecretKey,
         hidden_ctx: [u8; 32],
         chunk_size: u32,
-        compressed: bool,
-        has_keyfile: bool,
         hidden_data_offset: u64,
         hidden_data_len: u64,
         encrypted_meta_len: u32,
-        metadata: VaultMetadata,
     },
 }
 
 impl UnlockedVault {
     pub fn metadata(&self) -> &VaultMetadata {
         match self {
-            UnlockedVault::Outer { metadata, .. } | UnlockedVault::Hidden { metadata, .. } => {
-                metadata
-            }
+            Self::Outer { metadata, .. } => metadata,
+            Self::Stealth { info, .. } | Self::Hidden { info, .. } => &info.metadata,
         }
     }
 
     pub fn is_compressed(&self) -> bool {
         match self {
             UnlockedVault::Outer { header, .. } => header.is_compressed(),
-            UnlockedVault::Hidden { compressed, .. } => *compressed,
+            Self::Stealth { info, .. } | Self::Hidden { info, .. } => info.compressed,
         }
     }
 
@@ -123,6 +127,7 @@ impl UnlockedVault {
             UnlockedVault::Outer {
                 header, metadata, ..
             } => VaultInfo {
+                is_stealth: false,
                 version: header.version,
                 vault_id: header.vault_id.clone(),
                 cipher: header.cipher.clone(),
@@ -137,28 +142,7 @@ impl UnlockedVault {
                 is_hidden_compartment: false,
                 metadata: metadata.clone(),
             },
-            UnlockedVault::Hidden {
-                header,
-                chunk_size,
-                compressed,
-                has_keyfile,
-                metadata,
-                ..
-            } => VaultInfo {
-                version: VAULT_VERSION,
-                vault_id: header.vault_id.clone(),
-                cipher: header.cipher.clone(),
-                chunk_size: *chunk_size,
-                has_recovery: false,
-                has_keyfile: *has_keyfile,
-                compressed: *compressed,
-                argon_memory_kib: header.kdf.memory_kib,
-                argon_iterations: header.kdf.iterations,
-                argon_parallelism: header.kdf.parallelism,
-                container_size: header.container_size,
-                is_hidden_compartment: true,
-                metadata: metadata.clone(),
-            },
+            Self::Stealth { info, .. } | Self::Hidden { info, .. } => info.clone(),
         }
     }
 }
@@ -346,6 +330,7 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
     opts.kdf.validate()?;
 
     let outer_opts = EncryptOptions {
+        stealth: opts.stealth,
         kdf: opts.kdf,
         chunk_size: opts.chunk_size,
         recovery_key: opts.decoy_recovery_key.clone(),
@@ -545,20 +530,27 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
     })
 }
 
-fn try_unlock_hidden<R: Read + Seek>(
+pub(crate) struct HiddenContainer<'a> {
+    pub salt: [u8; SALT_SIZE],
+    pub size: u64,
+    pub kdf: KdfParams,
+    /// The public vault ID is available only for ordinary v5 containers.
+    pub public_id: Option<&'a str>,
+    pub min_offset: u64,
+}
+
+pub(crate) fn try_unlock_hidden<R: Read + Seek>(
     reader: &mut R,
-    header: &VaultHeader,
-    hdr_len: u64,
-    container_size: u64,
+    container: HiddenContainer<'_>,
     password: &[u8],
     keyfile_hash: Option<&SecretKey>,
 ) -> Result<UnlockedVault, CryptoError> {
+    let container_size = container.size;
+    let hdr_len = container.min_offset;
     if password.is_empty() || container_size < hdr_len + HIDDEN_MINI_HEADER_WIRE_SIZE as u64 {
         return Err(CryptoError::AuthenticationFailed);
     }
-    let container_salt = header
-        .container_salt_bytes()?
-        .ok_or(CryptoError::AuthenticationFailed)?;
+    let container_salt = container.salt;
 
     let mini_offset = container_size - HIDDEN_MINI_HEADER_WIRE_SIZE as u64;
     reader.seek(SeekFrom::Start(mini_offset))?;
@@ -571,12 +563,7 @@ fn try_unlock_hidden<R: Read + Seek>(
         }
     })?;
 
-    let mini_kek = derive_hidden_kek(
-        password,
-        &container_salt,
-        &header.kdf_params(),
-        keyfile_hash,
-    )?;
+    let mini_kek = derive_hidden_kek(password, &container_salt, &container.kdf, keyfile_hash)?;
     let mini_aad = mini_header_aad(container_size, &container_salt, keyfile_hash.is_some());
     let mini_cipher =
         Aes256Gcm::new_from_slice(mini_kek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
@@ -644,16 +631,32 @@ fn try_unlock_hidden<R: Read + Seek>(
         .map_err(|e| CryptoError::InvalidFormat(format!("invalid hidden metadata JSON: {e}")))?;
 
     Ok(UnlockedVault::Hidden {
-        header: header.clone(),
+        info: VaultInfo {
+            is_stealth: container.public_id.is_none(),
+            version: VAULT_VERSION,
+            vault_id: container.public_id.map_or_else(
+                || crate::stealth::id_string(&hidden_ctx[..16]),
+                str::to_owned,
+            ),
+            cipher: crate::constants::CHUNKED_CIPHER_NAME.into(),
+            chunk_size: decoded.chunk_size,
+            has_recovery: false,
+            has_keyfile: decoded.has_keyfile,
+            compressed: decoded.compressed,
+            argon_memory_kib: container.kdf.memory_kib,
+            argon_iterations: container.kdf.iterations,
+            argon_parallelism: container.kdf.parallelism,
+            container_size: Some(container_size),
+            is_hidden_compartment: true,
+            metadata,
+        },
+
         hidden_dek: decoded.hidden_dek,
         hidden_ctx,
         chunk_size: decoded.chunk_size,
-        compressed: decoded.compressed,
-        has_keyfile: decoded.has_keyfile,
         hidden_data_offset: decoded.hidden_data_offset,
         hidden_data_len: decoded.hidden_data_len,
         encrypted_meta_len: decoded.encrypted_meta_len,
-        metadata,
     })
 }
 
@@ -663,7 +666,23 @@ pub fn unlock_seekable<R: Read + Seek>(
     reader: &mut R,
     auth: Auth<'_>,
 ) -> Result<UnlockedVault, CryptoError> {
+    unlock_seekable_with_kdf(reader, auth, &crate::STEALTH_KDF_PARAMS)
+}
+
+pub fn unlock_seekable_with_kdf<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+) -> Result<UnlockedVault, CryptoError> {
     reader.seek(SeekFrom::Start(0))?;
+    let mut magic = [0; 4];
+    reader
+        .read_exact(&mut magic)
+        .map_err(crate::stealth::map_eof)?;
+    reader.seek(SeekFrom::Start(0))?;
+    if magic != crate::VAULT_MAGIC {
+        return crate::stealth::unlock(reader, auth, stealth_kdf);
+    }
     let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
     let stream_len = reader.seek(SeekFrom::End(0))?;
     if let Some(target_size) = header.container_size {
@@ -696,9 +715,15 @@ pub fn unlock_seekable<R: Read + Seek>(
     {
         if let Ok(hidden) = try_unlock_hidden(
             reader,
-            &header,
-            hdr_len,
-            target_size,
+            HiddenContainer {
+                salt: header
+                    .container_salt_bytes()?
+                    .ok_or(CryptoError::AuthenticationFailed)?,
+                size: target_size,
+                kdf: header.kdf_params(),
+                public_id: Some(&header.vault_id),
+                min_offset: hdr_len,
+            },
             password,
             keyfile_hash,
         ) {
@@ -714,7 +739,15 @@ pub fn inspect_header_seekable<R: Read + Seek>(
     reader: &mut R,
     auth: Auth<'_>,
 ) -> Result<VaultInfo, CryptoError> {
-    Ok(unlock_seekable(reader, auth)?.vault_info())
+    inspect_header_seekable_with_kdf(reader, auth, &crate::STEALTH_KDF_PARAMS)
+}
+
+pub fn inspect_header_seekable_with_kdf<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+) -> Result<VaultInfo, CryptoError> {
+    Ok(unlock_seekable_with_kdf(reader, auth, stealth_kdf)?.vault_info())
 }
 
 /// Decrypt the chunked payload of an already-unlocked outer or hidden compartment.
@@ -734,6 +767,26 @@ pub fn decrypt_unlocked_stream<R: Read + Seek, W: Write>(
         } => {
             reader.seek(SeekFrom::Start(*hdr_len))?;
             decrypt_chunks_with_key_at(reader, writer, header, *hdr_len, dek, progress_cb, cancel)
+        }
+        UnlockedVault::Stealth {
+            info,
+            dek,
+            ctx,
+            payload_offset,
+        } => {
+            reader.seek(SeekFrom::Start(*payload_offset))?;
+            crate::vault::decrypt_outer_chunks(
+                reader,
+                writer,
+                info.chunk_size,
+                info.container_size,
+                *payload_offset,
+                dek,
+                *ctx,
+                true,
+                progress_cb,
+                cancel,
+            )
         }
         UnlockedVault::Hidden {
             hidden_dek,
@@ -845,7 +898,25 @@ pub fn decrypt_stream_seekable<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
-    let unlocked = unlock_seekable(reader, auth)?;
+    decrypt_stream_seekable_with_kdf(
+        reader,
+        writer,
+        auth,
+        &crate::STEALTH_KDF_PARAMS,
+        progress_cb,
+        cancel,
+    )
+}
+
+pub fn decrypt_stream_seekable_with_kdf<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<VaultMetadata, CryptoError> {
+    let unlocked = unlock_seekable_with_kdf(reader, auth, stealth_kdf)?;
     decrypt_unlocked_stream(reader, writer, &unlocked, progress_cb, cancel)?;
     Ok(unlocked.metadata().clone())
 }

@@ -174,6 +174,7 @@ pub enum WorkerUpdate {
         vault_path: PathBuf,
     },
     IntegrityDone {
+        sha256_only: bool,
         text: String,
         ok: bool,
     },
@@ -200,6 +201,7 @@ impl Drop for RecoveryPrompt {
 }
 
 pub struct EncryptFields {
+    pub stealth: bool,
     pub sources: Vec<PathBuf>,
     pub keyfile: Option<PathBuf>,
     pub password: String,
@@ -526,6 +528,7 @@ impl Default for AppState {
             show_shell_install_modal: false,
             clipboard_deadline: None,
             encrypt: EncryptFields {
+                stealth: false,
                 sources: Vec::new(),
                 keyfile: None,
                 password: String::new(),
@@ -780,7 +783,7 @@ impl AppState {
                     let is_vault = p
                         .extension()
                         .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("vault"));
-                    if !is_vault {
+                    if !is_vault && !p.is_file() {
                         skipped += 1;
                         continue;
                     }
@@ -796,14 +799,14 @@ impl AppState {
                 }
                 if added > 0 {
                     let msg = match lang {
-                        AppLanguage::Tr => format!("Çözme için {added} .vault dosyası eklendi"),
+                        AppLanguage::Tr => format!("Çözme için {added} dosya eklendi"),
                         AppLanguage::En => format!("Loaded {added} vault(s) for decryption"),
                     };
                     self.set_status(msg, false);
                 } else if skipped > 0 {
                     let msg = match lang {
-                        AppLanguage::Tr => "Yalnızca .vault dosyaları çözülebilir",
-                        AppLanguage::En => "Only .vault files can be decrypted",
+                        AppLanguage::Tr => "Çözmek için mevcut bir dosya seçin",
+                        AppLanguage::En => "Select an existing file to decrypt",
                     };
                     self.set_status(msg, true);
                 }

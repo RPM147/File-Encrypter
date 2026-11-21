@@ -25,6 +25,7 @@ fn hidden_storage_end_to_end_full_and_selective_extract_with_tamper_rollback() {
     let vault = dir.path().join("archive.vault");
     let cancel = Arc::new(AtomicBool::new(false));
     let opts = HiddenEncryptOptions {
+        stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: MIN_CHUNK_SIZE,
         container_size_bytes: container_size,

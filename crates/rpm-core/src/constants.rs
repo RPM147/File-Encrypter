@@ -35,3 +35,6 @@ pub const FLAG_HAS_RECOVERY: u8 = 1 << 0;
 pub const FLAG_HAS_KEYFILE: u8 = 1 << 1;
 pub const FLAG_COMPRESSED: u8 = 1 << 2;
 pub const ALL_KNOWN_FLAGS: u8 = FLAG_HAS_RECOVERY | FLAG_HAS_KEYFILE | FLAG_COMPRESSED;
+
+/// The on-wire Stealth format carries no KDF parameters.
+pub const STEALTH_KDF_PARAMS: crate::KdfParams = crate::KdfParams::owasp_default();

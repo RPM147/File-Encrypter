@@ -1,5 +1,11 @@
 # Changelog
 
+## v4.3.0
+
+- **Optional Stealth Mode (Encrypted Outer Header):** Added `--stealth` in CLI and **Stealth Mode (Encrypted Header)** in GUI Encrypt across unpadded, padded, and hidden-vault containers. Stealth containers omit plaintext `RPMV` magic bytes and JSON headers cleanly, encrypting fixed-size outer password and 24-word recovery slots plus HKDF XOR-masked chunk frame headers with a fixed OWASP Argon2id profile (`64 MiB / 3 iterations / 4 lanes`).
+- **Indistinguishable Failures & Digest-Only Integrity Check:** Wrong passwords or missing/wrong keyfiles on Stealth containers uniformly return `CryptoError::AuthenticationFailed` without leaking `KeyfileRequired`. Passwordless integrity checks on non-`RPMV` files return size and SHA-256 digest only (`sha256_only: true`), and `rekey` uniformly refuses in-place rotation with `CryptoError::UnsupportedOperation`.
+- **Stealth Storage & UX Polish:** Stealth encryption streams directly to an exclusive new destination file (eliminating `.rpm_tmp_` sibling traces) while excluding any output path inside selected folders; GUI file pickers and Decrypt drag-and-drop accept arbitrary file extensions (`All Files`), and Inspect reports display aligned header mode details (`is_stealth`).
+
 ## v4.2.0
 
 - **RAM-Only Zero-Disk Preview:** Added in-memory file inspection (`extract_entry_to_memory_v5` in `rpm-storage` and the **Inspect → Preview** window in `rpm-gui`) across standard, padded, and hidden compartments. Previewed entries up to `16 MiB` are held in zeroized buffers without writing temporary plaintext files to disk, wait until full compartment AEAD authentication completes before display, support paginated UTF-8 text and bounded `PNG/JPEG/WebP/GIF/BMP` image rendering, and clear immediately on close, `Esc`, tab switch, or vault change.

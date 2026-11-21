@@ -30,6 +30,7 @@ use crate::mem::SecretKey;
 
 #[derive(Clone, Debug)]
 pub struct EncryptOptions {
+    pub stealth: bool,
     pub kdf: KdfParams,
     pub chunk_size: u32,
     pub recovery_key: Option<SecretKey>,
@@ -41,6 +42,7 @@ pub struct EncryptOptions {
 impl Default for EncryptOptions {
     fn default() -> Self {
         Self {
+            stealth: false,
             kdf: KdfParams::default(),
             chunk_size: DEFAULT_CHUNK_SIZE,
             recovery_key: None,
@@ -60,6 +62,7 @@ pub struct EncryptSummary {
 
 #[derive(Clone, Debug)]
 pub struct VaultInfo {
+    pub is_stealth: bool,
     pub version: u8,
     pub vault_id: String,
     pub cipher: String,
@@ -77,6 +80,7 @@ pub struct VaultInfo {
 
 #[derive(Clone, Debug)]
 pub struct IntegrityReport {
+    pub sha256_only: bool,
     pub ok: bool,
     pub version: u8,
     pub file_size: u64,
@@ -188,30 +192,15 @@ pub(crate) fn read_chunk_with_eof(
     }
 }
 
-pub(crate) fn encrypt_outer_stream_raw(
-    reader: &mut impl Read,
+pub(crate) type OuterHeaderContext = (String, [u8; 32], Option<[u8; SALT_SIZE]>);
+
+fn write_standard_header(
     writer: &mut impl Write,
     metadata: &VaultMetadata,
     password: &[u8],
     opts: &EncryptOptions,
-    mut progress_cb: impl FnMut(u64),
-    cancel: Option<&AtomicBool>,
-) -> Result<(EncryptSummary, Option<[u8; SALT_SIZE]>), CryptoError> {
-    if opts.chunk_size < MIN_CHUNK_SIZE || opts.chunk_size > MAX_CHUNK_SIZE {
-        return Err(CryptoError::InvalidFormat(format!(
-            "chunk_size {} outside [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]",
-            opts.chunk_size
-        )));
-    }
-    if let Some(sz) = opts.container_size_bytes {
-        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&sz) {
-            return Err(CryptoError::InvalidFormat(format!(
-                "container_size {sz} outside [{MIN_CONTAINER_SIZE}, {MAX_CONTAINER_SIZE}]"
-            )));
-        }
-    }
-    opts.kdf.validate()?;
-
+    dek: &SecretKey,
+) -> Result<OuterHeaderContext, CryptoError> {
     let container_salt_raw = if opts.container_size_bytes.is_some() {
         let mut s = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut s);
@@ -221,7 +210,6 @@ pub(crate) fn encrypt_outer_stream_raw(
     };
 
     let vault_id = random_vault_id();
-    let dek = random_dek();
     let payload_ctx = payload_context_with_container(
         VAULT_VERSION,
         CHUNKED_CIPHER_NAME,
@@ -233,7 +221,7 @@ pub(crate) fn encrypt_outer_stream_raw(
     );
 
     let (hdr_kdf, password_slot) = build_password_slot_and_kdf(
-        &dek,
+        dek,
         password,
         &opts.kdf,
         opts.keyfile_hash.as_ref(),
@@ -241,11 +229,11 @@ pub(crate) fn encrypt_outer_stream_raw(
     )?;
 
     let recovery_slot = match opts.recovery_key.as_ref() {
-        Some(entropy) => Some(build_recovery_slot(&dek, entropy, &payload_ctx)?),
+        Some(entropy) => Some(build_recovery_slot(dek, entropy, &payload_ctx)?),
         None => None,
     };
 
-    let (meta_nonce, enc_meta) = encrypt_metadata(&dek, metadata, &payload_ctx)?;
+    let (meta_nonce, enc_meta) = encrypt_metadata(dek, metadata, &payload_ctx)?;
 
     let mut flags = 0u8;
     if recovery_slot.is_some() {
@@ -273,6 +261,40 @@ pub(crate) fn encrypt_outer_stream_raw(
         container_salt: container_salt_raw.map(|s| B64.encode(s)),
     };
     write_header_and_meta(writer, &header, &enc_meta)?;
+
+    Ok((vault_id, payload_ctx, container_salt_raw))
+}
+
+pub(crate) fn encrypt_outer_stream_raw(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    metadata: &VaultMetadata,
+    password: &[u8],
+    opts: &EncryptOptions,
+    mut progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<(EncryptSummary, Option<[u8; SALT_SIZE]>), CryptoError> {
+    if opts.chunk_size < MIN_CHUNK_SIZE || opts.chunk_size > MAX_CHUNK_SIZE {
+        return Err(CryptoError::InvalidFormat(format!(
+            "chunk_size {} outside [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]",
+            opts.chunk_size
+        )));
+    }
+    if let Some(sz) = opts.container_size_bytes {
+        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&sz) {
+            return Err(CryptoError::InvalidFormat(format!(
+                "container_size {sz} outside [{MIN_CONTAINER_SIZE}, {MAX_CONTAINER_SIZE}]"
+            )));
+        }
+    }
+    opts.kdf.validate()?;
+
+    let dek = random_dek();
+    let (vault_id, payload_ctx, container_salt_raw) = if opts.stealth {
+        crate::stealth::write_header(writer, metadata, password, opts, &dek)?
+    } else {
+        write_standard_header(writer, metadata, password, opts, &dek)?
+    };
 
     let prefix = derive_stream_nonce_prefix(&dek, &payload_ctx)?;
     let cipher =
@@ -304,8 +326,13 @@ pub(crate) fn encrypt_outer_stream_raw(
             )
             .map_err(|_| CryptoError::CryptoFailure)?;
 
-        writer.write_all(&plain_len_u32.to_be_bytes())?;
-        writer.write_all(&[final_flag])?;
+        let mut frame = [0; 5];
+        frame[..4].copy_from_slice(&plain_len_u32.to_be_bytes());
+        frame[4] = final_flag;
+        if opts.stealth {
+            crate::stealth::mask_frame(&mut frame, &dek, &payload_ctx, chunk_idx)?;
+        }
+        writer.write_all(&frame)?;
         writer.write_all(&ct)?;
 
         plain_buf[..len].zeroize();
@@ -409,10 +436,37 @@ pub fn decrypt_chunks_with_key_at(
     header: &VaultHeader,
     hdr_bytes_read: u64,
     dek: &SecretKey,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, CryptoError> {
+    decrypt_outer_chunks(
+        reader,
+        writer,
+        header.chunk_size,
+        header.container_size,
+        hdr_bytes_read,
+        dek,
+        header.payload_context(),
+        false,
+        progress_cb,
+        cancel,
+    )
+}
+
+// Ordinary and Stealth outer compartments authenticate the same chunk AAD.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decrypt_outer_chunks(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    chunk_size: u32,
+    container_size: Option<u64>,
+    hdr_bytes_read: u64,
+    dek: &SecretKey,
+    payload_ctx: [u8; 32],
+    stealth: bool,
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
-    let payload_ctx = header.payload_context();
     let prefix = derive_stream_nonce_prefix(dek, &payload_ctx)?;
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
@@ -427,31 +481,20 @@ pub fn decrypt_chunks_with_key_at(
             return Err(CryptoError::Cancelled);
         }
 
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                CryptoError::AuthenticationFailed
-            } else {
-                CryptoError::Io(e)
-            }
-        })?;
-        let plain_len = u32::from_be_bytes(len_buf);
-        if plain_len > header.chunk_size {
+        let mut frame = [0; 5];
+        reader
+            .read_exact(&mut frame)
+            .map_err(crate::stealth::map_eof)?;
+        if stealth {
+            crate::stealth::mask_frame(&mut frame, dek, &payload_ctx, chunk_idx)?;
+        }
+        let plain_len = u32::from_be_bytes(frame[..4].try_into().unwrap());
+        if plain_len > chunk_size {
             return Err(CryptoError::InvalidFormat(format!(
-                "chunk length {plain_len} exceeds header chunk_size {}",
-                header.chunk_size
+                "chunk length {plain_len} exceeds header chunk_size {chunk_size}"
             )));
         }
-
-        let mut flag_buf = [0u8; 1];
-        reader.read_exact(&mut flag_buf).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                CryptoError::AuthenticationFailed
-            } else {
-                CryptoError::Io(e)
-            }
-        })?;
-        let final_flag = flag_buf[0];
+        let final_flag = frame[4];
         if final_flag > 1 {
             return Err(CryptoError::InvalidFormat(format!(
                 "invalid chunk final flag {final_flag}"
@@ -499,7 +542,7 @@ pub fn decrypt_chunks_with_key_at(
         progress_cb(total_bytes);
 
         if final_flag == 1 {
-            if let Some(target_size) = header.container_size {
+            if let Some(target_size) = container_size {
                 let total_consumed = hdr_bytes_read
                     .checked_add(payload_bytes_read)
                     .ok_or(CryptoError::AuthenticationFailed)?;
@@ -530,6 +573,7 @@ pub fn inspect_header(reader: &mut impl Read, auth: Auth<'_>) -> Result<VaultInf
     let dek = crate::header::unlock_dek(&header, auth)?;
     let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
     Ok(VaultInfo {
+        is_stealth: false,
         version: header.version,
         vault_id: header.vault_id.clone(),
         cipher: header.cipher.clone(),
@@ -702,8 +746,29 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
     let file_size = f.metadata()?.len();
     let mut hr = HashingReader::new(f);
 
+    let mut magic = [0; 4];
+    let sha256_only = match hr.read_exact(&mut magic) {
+        Ok(()) => magic != crate::VAULT_MAGIC,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => true,
+        Err(e) => return Err(e.into()),
+    };
+    if sha256_only {
+        let sha256_hex = hr.drain_and_finalize()?;
+        return Ok(IntegrityReport {
+            ok: true,
+            sha256_only: true,
+            version: 0,
+            file_size,
+            message: format!("File size: {file_size} B\nSHA-256: {sha256_hex}"),
+            sha256_hex,
+            has_keyfile: false,
+            has_recovery: false,
+            chunk_count: 0,
+        });
+    }
+
     let (ok, version, summary_msg, has_keyfile, has_recovery, chunk_count) =
-        match read_header_and_meta(&mut hr) {
+        match read_header_and_meta(&mut magic.as_slice().chain(&mut hr)) {
             Ok((hdr, _, hdr_len)) => {
                 match scan_chunk_frames(&mut hr, hdr.chunk_size, hdr_len, hdr.container_size) {
                     Ok(chunks) => {
@@ -750,6 +815,7 @@ pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
     let full_message = format!("{summary_msg}\nSHA-256: {sha256_hex}");
 
     Ok(IntegrityReport {
+        sha256_only: false,
         ok,
         version,
         file_size,
@@ -781,11 +847,26 @@ pub fn rekey_stream(
         return Err(CryptoError::Cancelled);
     }
 
-    let (mut header, enc_meta, _hdr_len) = read_header_and_meta(reader)?;
+    let unsupported = || {
+        CryptoError::UnsupportedOperation(
+        "in-place re-key is not available for this vault; decrypt and re-encrypt to change credentials".into(),
+    )
+    };
+    let mut magic = [0; 4];
+    if let Err(e) = reader.read_exact(&mut magic) {
+        return Err(if e.kind() == io::ErrorKind::UnexpectedEof {
+            unsupported()
+        } else {
+            e.into()
+        });
+    }
+    if magic != crate::VAULT_MAGIC {
+        return Err(unsupported());
+    }
+    let (mut header, enc_meta, _hdr_len) =
+        read_header_and_meta(&mut magic.as_slice().chain(&mut *reader))?;
     if header.container_size.is_some() {
-        return Err(CryptoError::UnsupportedOperation(
-            "in-place re-key is not available for this vault; decrypt and re-encrypt to change credentials".into(),
-        ));
+        return Err(unsupported());
     }
     let dek = crate::header::unlock_dek(
         &header,

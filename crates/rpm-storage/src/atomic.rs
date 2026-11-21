@@ -53,3 +53,30 @@ where
     }
     res
 }
+
+/// Stealth encryption streams directly to a fresh destination. Exclusive creation
+/// preserves existing files, including a destination claimed by another writer.
+pub(crate) fn write_vault(
+    target: &Path,
+    stealth: bool,
+    write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    if !stealth {
+        return atomic_write(target, write_fn);
+    }
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create_new(target)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    let result = write_fn(&mut writer).and_then(|()| {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        Ok(())
+    });
+    drop(writer);
+    if result.is_err() {
+        let _ = fs::remove_file(target);
+    }
+    result
+}

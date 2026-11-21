@@ -20,6 +20,7 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 - **Selective File Extraction & RAM-Only Preview:** Restore individual files or subfolders using the GUI **Inspect** tab checklist or repeatable `decrypt --only <PATH>` flags in the CLI (guarded by stage-and-swap authentication), or preview UTF-8 text and image files up to `16 MiB` purely in RAM without touching disk.
 - **Headless CLI (`rpm-encrypter-cli`):** Scriptable encryption, decryption, inspection, re-keying, password generation, and Windows shell integration without passing passwords on the command line.
 - **Container Padding & Hidden Vault (Plausible Deniability):** Pad vaults to fixed MiB container sizes with `OsRng` random bytes (`--container-mb` or GUI Container Size selector) and optionally embed an indistinguishable secondary hidden compartment (`--hidden` or GUI Hidden Vault panel) with independent credentials.
+- **Optional Stealth Mode (Encrypted Header):** Encrypt the outer password/recovery slots and frame prefixes with no plaintext `RPMV` header (`--stealth` or GUI Encrypt checkbox), using a fixed OWASP Argon2id profile (`64 MiB / 3 / 4`) so the entire file appears indistinguishable from uniform random bytes regardless of extension.
 - **Header-Only Vault Diff:** Compare two vaults' authenticated file manifests (added, removed, changed, unchanged) from headers alone in GUI **Inspect** or CLI `diff`.
 - **Windows Shell Integration (User-Scoped HKCU):** Optional right-click **"Encrypt with RPM Encrypter"** menu and `.vault` double-click opening (reversible, zero administrator rights required).
 
@@ -53,6 +54,7 @@ Passwords are never accepted as CLI flags; interactive secure prompts or `--pass
 
 ```bash
 cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-out recovery.txt
+cargo run -p rpm-cli -- encrypt ./folder --stealth --container-mb 50
 cargo run -p rpm-cli -- encrypt ./decoy --container-mb 50 --hidden ./secret --hidden-keyfile ./hidden.key
 cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored
 cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json

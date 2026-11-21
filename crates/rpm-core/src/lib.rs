@@ -8,15 +8,19 @@ pub mod hidden;
 pub mod kdf;
 pub mod mem;
 pub mod recovery;
+mod stealth;
 pub mod vault;
 
-pub use constants::{MAX_CONTAINER_SIZE, MIN_CONTAINER_SIZE, VAULT_MAGIC, VAULT_VERSION};
+pub use constants::{
+    MAX_CONTAINER_SIZE, MIN_CONTAINER_SIZE, STEALTH_KDF_PARAMS, VAULT_MAGIC, VAULT_VERSION,
+};
 pub use diff::{diff_metadata, ChangedEntry, VaultDiff};
 pub use error::CryptoError;
 pub use header::{Auth, FileManifestEntry, VaultHeader, VaultMetadata};
 pub use hidden::{
-    decrypt_stream_seekable, decrypt_unlocked_stream, encrypt_hidden_stream,
-    inspect_header_seekable, unlock_seekable, HiddenEncryptOptions, HiddenEncryptSummary,
+    decrypt_stream_seekable, decrypt_stream_seekable_with_kdf, decrypt_unlocked_stream,
+    encrypt_hidden_stream, inspect_header_seekable, inspect_header_seekable_with_kdf,
+    unlock_seekable, unlock_seekable_with_kdf, HiddenEncryptOptions, HiddenEncryptSummary,
     UnlockedVault,
 };
 pub use kdf::{hash_keyfile_reader, KdfParams};

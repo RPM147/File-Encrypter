@@ -27,6 +27,7 @@ fn sample_metadata() -> VaultMetadata {
 
 fn fast_opts() -> EncryptOptions {
     EncryptOptions {
+        stealth: false,
         kdf: KdfParams::fast_test(),
         chunk_size: 16 * 1024, // 16 KiB minimum to exercise multi-chunk logic with small data
         recovery_key: None,
@@ -528,6 +529,7 @@ fn kdf_and_recovery_validation_bounds() {
     for kdf in invalid_kdfs {
         assert!(kdf.validate().is_err());
         let opts = EncryptOptions {
+            stealth: false,
             kdf,
             chunk_size: MIN_CHUNK_SIZE,
             recovery_key: None,

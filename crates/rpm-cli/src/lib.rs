@@ -14,12 +14,12 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use rpm_core::{
     check_integrity, entropy_to_mnemonic, generate_recovery_entropy, hash_keyfile_reader,
-    inspect_header_seekable, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
+    inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
     HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
 };
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_hidden_sources_v5, encrypt_sources_v5,
+    decrypt_vault_v5_with_stealth_kdf, encrypt_hidden_sources_v5, encrypt_sources_v5,
     rekey_vault_v5, unique_path, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
@@ -46,6 +46,9 @@ pub enum Commands {
     Encrypt {
         #[arg(required = true)]
         sources: Vec<PathBuf>,
+        /// Encrypt the header as well as the payload, using the fixed Stealth KDF profile.
+        #[arg(long)]
+        stealth: bool,
         /// Pad the output container to this exact size in MiB.
         #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
         container_mb: Option<u64>,
@@ -331,10 +334,10 @@ where
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let kdf = kdf_override.unwrap_or_default();
+    let kdf = kdf_override.unwrap_or(rpm_core::STEALTH_KDF_PARAMS);
 
     match parsed.command {
-        Commands::Diff(args) => match args.run(stdin, stdout) {
+        Commands::Diff(args) => match args.run(stdin, stdout, &kdf) {
             Ok(()) => 0,
             Err(err) => {
                 let _ = writeln!(stderr, "Error comparing vaults: {err}");
@@ -344,6 +347,7 @@ where
         Commands::Encrypt {
             sources,
             container_mb,
+            stealth,
             hidden,
             hidden_keyfile,
             hidden_no_compress,
@@ -435,6 +439,7 @@ where
             let container_size_bytes = container_mb.map(|mb| mb * MIB);
             let enc_res = if hidden.is_empty() {
                 let opts = EncryptOptions {
+                    stealth,
                     kdf,
                     recovery_key: Some(rec_entropy),
                     keyfile_hash,
@@ -473,6 +478,7 @@ where
                     }
                 };
                 let opts = HiddenEncryptOptions {
+                    stealth,
                     kdf,
                     container_size_bytes: container_size_bytes
                         .expect("--hidden requires --container-mb"),
@@ -651,24 +657,15 @@ where
                     "Decrypting".to_string()
                 };
                 let reporter = CliProgressReporter::new(progress, stderr_is_tty, label);
-                let dec_res = if only.is_empty() {
-                    decrypt_vault_v5(
-                        v,
-                        target_root,
-                        auth_for_vault,
-                        reporter.callback(),
-                        Arc::clone(&cancel),
-                    )
-                } else {
-                    decrypt_vault_selected_v5(
-                        v,
-                        target_root,
-                        auth_for_vault,
-                        &only,
-                        reporter.callback(),
-                        Arc::clone(&cancel),
-                    )
-                };
+                let dec_res = decrypt_vault_v5_with_stealth_kdf(
+                    v,
+                    target_root,
+                    auth_for_vault,
+                    (!only.is_empty()).then_some(only.as_slice()),
+                    &kdf,
+                    reporter.callback(),
+                    Arc::clone(&cancel),
+                );
                 reporter.finish(stderr);
                 match dec_res {
                     Ok(summary) => {
@@ -712,6 +709,7 @@ where
                                 "version": rep.version,
                                 "file_size": rep.file_size,
                                 "sha256": rep.sha256_hex,
+                                "sha256_only": rep.sha256_only,
                                 "has_keyfile": rep.has_keyfile,
                                 "has_recovery": rep.has_recovery,
                                 "chunk_count": rep.chunk_count,
@@ -791,7 +789,7 @@ where
                     return 1;
                 }
             };
-            match inspect_header_seekable(&mut reader, auth) {
+            match inspect_header_seekable_with_kdf(&mut reader, auth, &kdf) {
                 Ok(info) => {
                     if json {
                         let val = serde_json::json!({
@@ -801,6 +799,7 @@ where
                             "chunk_size": info.chunk_size,
                             "container_size": info.container_size,
                             "is_hidden_compartment": info.is_hidden_compartment,
+                            "is_stealth": info.is_stealth,
                             "has_keyfile": info.has_keyfile,
                             "has_recovery": info.has_recovery,
                             "metadata": info.metadata,
@@ -809,12 +808,13 @@ where
                     } else {
                         let _ = writeln!(
                             stdout,
-                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\n{}",
+                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\nis_stealth: {}\n{}",
                             info.version,
                             info.cipher,
                             info.chunk_size / 1024,
                             info.container_size.map_or_else(|| "none".into(), |n| format!("{n} bytes")),
                             info.is_hidden_compartment,
+                            info.is_stealth,
                             format_metadata_plain(&info.metadata)
                         );
                     }

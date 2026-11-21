@@ -42,6 +42,7 @@ fn diff_vault_side_ui(
             if ui.button(s.btn_browse).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("RPM Vault", &["vault"])
+                    .add_filter("All Files", &["*"])
                     .pick_file()
                 {
                     *vault_path = p.display().to_string();
@@ -115,6 +116,7 @@ pub fn ui(
             if ui.button(s.btn_browse).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("RPM Vault", &["vault"])
+                    .add_filter("All Files", &["*"])
                     .pick_file()
                 {
                     state.inspect.vault_path = p.display().to_string();

@@ -45,6 +45,10 @@ The design targets an observer who has one offline copy of a padded container an
 
 Padded containers disallow `rekey` on both forms so command behavior never reveals whether a hidden compartment exists. As inherent operational limits outside `.vault` byte authentication, multiple container snapshots over time can reveal deltas, and OS recent-file lists, thumbnails, backups, swap/hibernation files, or residual SSD blocks can independently reveal activity.
 
+## Stealth Mode (Encrypted Header / 1st-Layer Deniability)
+
+Stealth Mode omits plaintext `RPMV` magic bytes and JSON headers altogether: bytes `[0..32]` hold a random salt, followed by fixed 108-byte AES-GCM password and recovery slots (or uniform random noise when recovery entropy is omitted), encrypted metadata, HKDF-masked 5-byte frame prefixes, and encrypted chunk payloads. Unpadded, padded, and hidden Stealth files use a fixed OWASP Argon2id baseline (`64 MiB`, `3` iterations, `4` lanes), uniformly return `AuthenticationFailed` when either a password or a required keyfile is wrong/missing, refuse `rekey` with `UnsupportedOperation`, and report only file size + SHA-256 on passwordless integrity checks so non-vault files and Stealth containers look identical without credentials. To avoid `.rpm_tmp_` sibling temp-file traces on disk during Stealth creation, Stealth writes directly to an exclusive new destination file (`create_new`), deleting partial output on returned errors — as an explicit trade-off, sudden power loss or `SIGKILL` mid-write may leave a partial encrypted file at the destination path.
+
 ## Reporting a vulnerability
 
 If you find a security issue, please open an issue without posting sensitive exploit details in public, or contact the maintainer.

@@ -25,6 +25,7 @@ Gerçek içerik boyutunu gizlemek veya tek bir `.vault` dosyası içine ikinci, 
 
 - **Konteyner Boyutu (Padding):** **Şifrele** sekmesinde `Otomatik (İçerik Boyutu)` yerine `10 MiB`, `50 MiB`, `100 MiB`, `500 MiB` veya `Özel (MiB)` (1–65536 MiB arası) bir hedef boyut seçin; ya da CLI’da `--container-mb <MiB>` bayrağını verin. İçerikten kalan boşluk `OsRng` rastgele baytlarıyla doldurulur.
 - **Gizli Kasa (Makul İnkâr Edilebilirlik):** **Şifrele → Gizli Kasa (Makul İnkâr Edilebilirlik)** panelini açıp onay kutusunu işaretleyin. Gizli kaynakları, dış paroladan **farklı** bir gizli parolayı ve isterseniz ayrı bir gizli anahtar dosyasını seçin. Dış parola yalnızca sahte (decoy) kasayı, gizli parola yalnızca gizli kasayı açar; dışarıdan bakıldığında dosyanın normal dolgulu bir kasadan ayırt edilmesi mümkün değildir.
+- **Stealth Modu (Şifreli Başlık):** **Şifrele** sekmesinde **Stealth Modu (Şifreli Başlık)** kutucuğunu işaretleyerek (veya CLI’da `--stealth` vererek) baştaki düz metin `RPMV` imzasını ve JSON başlığı kaldırabilirsiniz. Dosya ilk bayttan son bayta kadar rastgele gürültü gibi görünür, herhangi bir uzantıyla (`.bin`, `.dat` vb.) yeniden adlandırılabilir; her zaman sabit OWASP Argon2id profilini (`64 MiB / 3 yineleme / 4 paralellik`) kullanır ve parolasız kontrolde yalnızca dosya boyutu ile SHA-256 özetini gösterir. Sabit boyut, Gizli Kasa ve dış kasa için 24 kelimelik kurtarma cümlesi ile birlikte kullanılabilir.
 - **Önemli kısıtlar:**
   - Gizli kasa için sabit bir konteyner boyutu zorunludur (`Otomatik` kullanılamaz).
   - **24 kelimelik kurtarma cümlesi yalnızca dış (sahte) kasayı açar;** makul inkâr edilebilirlik gereği gizli kasa için kurtarma cümlesi oluşturulmaz.
@@ -85,6 +86,9 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 # Sabit 25 MiB konteyner olarak şifrele
 ./rpm-encrypter-cli encrypt ./Belgeler --container-mb 25
 
+# Şifreli başlıkla (Stealth Modu) sabit 25 MiB konteyner oluştur
+./rpm-encrypter-cli encrypt ./Belgeler --stealth --container-mb 25
+
 # Dış + gizli bölme oluştur (sıkıştırmasız gizli bölme + gizli keyfile)
 ./rpm-encrypter-cli encrypt ./Sahte --container-mb 50 --hidden ./Gizli --hidden-keyfile ./gizli.key --hidden-no-compress
 
@@ -112,11 +116,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.2.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.3.0/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.2.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.2.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.3.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.3.0
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)

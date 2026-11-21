@@ -3,6 +3,9 @@
 use rpm_storage::config::AppLanguage;
 
 pub struct Strings {
+    pub stealth_mode: &'static str,
+    pub stealth_help: &'static str,
+    pub digest_computed: &'static str,
     pub btn_preview: &'static str,
     pub preview_title: &'static str,
     pub preview_ram: &'static str,
@@ -218,6 +221,9 @@ pub struct Strings {
 }
 
 pub const TR: Strings = Strings {
+    stealth_mode: "Stealth Modu (Şifreli Başlık)",
+    stealth_help: "Sabit Argon2id profili: 64 MiB / 3 yineleme / 4 paralellik. Düz metin başlık yoktur. Parolasız kontrol yalnızca SHA-256 özetini hesaplar.",
+    digest_computed: "SHA-256 özeti hesaplandı",
     btn_preview: "Önizle",
     preview_title: "Dosya önizlemesi",
     preview_ram: "Yalnızca RAM (Diske yazılmadı)",
@@ -313,26 +319,26 @@ pub const TR: Strings = Strings {
     status_enc_hidden_running: "Dış ve gizli kasalar şifreleniyor (Argon2id + rastgele dolgu)...",
 
     dec_heading: "Çöz (.vault v5)",
-    btn_add_vaults: ".vault Dosyası Ekle...",
-    dec_no_vaults: "Seçili .vault dosyası yok (pencereye sürükleyip bırakabilirsiniz).",
+    btn_add_vaults: "Kasa Dosyası Ekle...",
+    dec_no_vaults: "Seçili kasa dosyası yok (pencereye sürükleyip bırakabilirsiniz).",
     chk_use_recovery: "Parola yerine 24 kelimelik kurtarma cümlesi kullan",
     lbl_rec_phrase: "Kurtarma cümlesi (24 kelime):",
     lbl_keyfile_if_bound: "Anahtar Dosyası (bağlıysa):",
     lbl_output_folder: "Çıktı klasörü:",
     btn_decrypt_now: "Şimdi Çöz",
-    err_select_vaults: "Bir veya daha fazla .vault dosyası seçin",
+    err_select_vaults: "Bir veya daha fazla kasa dosyası seçin",
     err_enter_pw_or_rec: "Parola veya kurtarma cümlesini girin",
     status_dec_running: "Doğrulayarak çözülüyor ve çıkarılıyor...",
 
     ins_heading: "İncele ve Bütünlük Denetimi",
-    lbl_vault: "Kasa (.vault):",
+    lbl_vault: "Kasa:",
     chk_unlock_rec: "24 kelimelik kurtarma cümlesiyle aç",
     btn_integrity_check: "Bütünlük Kontrolü (Parolasız)",
     btn_inspect_meta: "Meta Veriyi İncele",
-    err_select_vault: "Mevcut bir .vault dosyası seçin",
+    err_select_vault: "Mevcut bir kasa dosyası seçin",
     status_checking_integrity: "SHA-256 ve başlık/parça yapısı doğrulanıyor...",
     status_inspecting: "Şifreli kasa başlığı inceleniyor...",
-    ins_default_results: "Bir .vault dosyası seçip Bütünlük Kontrolü veya Meta Veriyi İncele düğmesine tıklayın.",
+    ins_default_results: "Bir dosya seçip Bütünlük Kontrolü veya Meta Veriyi İncele düğmesine tıklayın.",
     ins_selective_heading: "Seçici Dosya Çıkarma",
     ins_filter_hint: "Dosya ara...",
     btn_select_all: "Tümünü Seç",
@@ -344,11 +350,11 @@ pub const TR: Strings = Strings {
 
     diff_heading: "Kasa Karşılaştırma (Vault Diff)",
     diff_subtitle: "İki kasanın şifreli dosya listesini yalnızca başlıkları açarak karşılaştırır (veri çözülmez).",
-    lbl_vault_a: "Kasa A (.vault):",
-    lbl_vault_b: "Kasa B (.vault):",
+    lbl_vault_a: "Kasa A:",
+    lbl_vault_b: "Kasa B:",
     btn_compare_vaults: "Kasaları Karşılaştır",
-    diff_default_results: "İki .vault dosyası seçip kimlik bilgilerini girerek Kasaları Karşılaştır düğmesine tıklayın.",
-    err_diff_select_vaults: "Mevcut iki .vault dosyası (Kasa A ve Kasa B) seçin",
+    diff_default_results: "İki kasa dosyası seçip kimlik bilgilerini girerek Kasaları Karşılaştır düğmesine tıklayın.",
+    err_diff_select_vaults: "Mevcut iki kasa dosyası (Kasa A ve Kasa B) seçin",
     err_diff_enter_creds: "Her iki kasa için parola veya kurtarma cümlesini girin",
     status_comparing_vaults: "Kasa başlıkları açılıyor ve karşılaştırılıyor...",
 
@@ -422,6 +428,9 @@ pub const TR: Strings = Strings {
 };
 
 pub const EN: Strings = Strings {
+    stealth_mode: "Stealth Mode (Encrypted Header)",
+    stealth_help: "Fixed Argon2id profile: 64 MiB / 3 iterations / 4 lanes. The header is encrypted. A passwordless check only computes SHA-256.",
+    digest_computed: "SHA-256 digest computed",
     btn_preview: "Preview",
     preview_title: "File preview",
     preview_ram: "RAM-Only (Zero-Disk)",
@@ -517,14 +526,14 @@ pub const EN: Strings = Strings {
     status_enc_hidden_running: "Encrypting outer & hidden vaults (Argon2id + random padding)...",
 
     dec_heading: "Decrypt (.vault v5)",
-    btn_add_vaults: "Add .vault Files...",
-    dec_no_vaults: "No .vault files selected (or drop .vault files onto window).",
+    btn_add_vaults: "Add Vault Files...",
+    dec_no_vaults: "No vault files selected (or drop .vault files onto window).",
     chk_use_recovery: "Use 24-word recovery phrase instead of password",
     lbl_rec_phrase: "Recovery phrase (24 words):",
     lbl_keyfile_if_bound: "Keyfile (if bound):",
     lbl_output_folder: "Output folder:",
     btn_decrypt_now: "Decrypt Now",
-    err_select_vaults: "Select one or more .vault files",
+    err_select_vaults: "Select one or more vault files",
     err_enter_pw_or_rec: "Enter password or recovery phrase",
     status_dec_running: "Verifying & decrypting chunks...",
 
@@ -533,10 +542,10 @@ pub const EN: Strings = Strings {
     chk_unlock_rec: "Unlock with 24-word recovery phrase",
     btn_integrity_check: "Integrity Check (No Password)",
     btn_inspect_meta: "Inspect Metadata",
-    err_select_vault: "Select an existing .vault file",
+    err_select_vault: "Select an existing file",
     status_checking_integrity: "Computing SHA-256 & header check...",
     status_inspecting: "Inspecting encrypted header...",
-    ins_default_results: "Select a .vault file and click Integrity Check or Inspect Metadata.",
+    ins_default_results: "Select a file and click Integrity Check or Inspect Metadata.",
     ins_selective_heading: "Selective File Extraction",
     ins_filter_hint: "Filter files...",
     btn_select_all: "Select All",
@@ -548,11 +557,11 @@ pub const EN: Strings = Strings {
 
     diff_heading: "Vault Comparison (Vault Diff)",
     diff_subtitle: "Compares two vaults' encrypted manifests from headers only (no payload decrypted).",
-    lbl_vault_a: "Vault A (.vault):",
-    lbl_vault_b: "Vault B (.vault):",
+    lbl_vault_a: "Vault A:",
+    lbl_vault_b: "Vault B:",
     btn_compare_vaults: "Compare Vaults",
-    diff_default_results: "Select two .vault files, enter their credentials, and click Compare Vaults.",
-    err_diff_select_vaults: "Select two existing .vault files (Vault A and Vault B)",
+    diff_default_results: "Select two vault files, enter their credentials, and click Compare Vaults.",
+    err_diff_select_vaults: "Select two existing vault files (Vault A and Vault B)",
     err_diff_enter_creds: "Enter password or recovery phrase for both vaults",
     status_comparing_vaults: "Unlocking vault headers and comparing manifests...",
 

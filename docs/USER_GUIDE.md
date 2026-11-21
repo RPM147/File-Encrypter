@@ -25,6 +25,7 @@ Use a fixed-size padded container to hide the true size of your payload or to em
 
 - **Container Size (Padding):** In the **Encrypt** tab, change **Container Size (Padding)** from `Auto (Content Size)` to `10 MiB`, `50 MiB`, `100 MiB`, `500 MiB`, or `Custom (MiB)` (1–65536 MiB), or pass `--container-mb <MiB>` in the CLI. Unused space is filled with random `OsRng` bytes, while keeping the exact same public header format.
 - **Hidden Vault (Plausible Deniability):** Expand **Hidden Vault (Plausible Deniability)** on the **Encrypt** tab and enable embedding a secondary hidden vault. Select separate hidden sources, a hidden password that **differs** from the outer password, and an optional hidden keyfile. Unlocking with the outer password reveals only the decoy vault; unlocking with the hidden password transparently reveals only the hidden vault.
+- **Stealth Mode (Encrypted Header):** Check **Stealth Mode (Encrypted Header)** on the **Encrypt** tab (or pass `--stealth` in CLI) to omit the plaintext `RPMV` magic bytes and JSON header so the entire file looks like uniform random data and can be renamed to any extension (`.bin`, `.dat`, etc.). Stealth containers always use a fixed OWASP Argon2id profile (`64 MiB / 3 iterations / 4 lanes`) regardless of Settings, report only file size and SHA-256 on passwordless integrity checks, and still support padding, Hidden Vault, and the 24-word recovery phrase for the outer vault.
 - **Important constraints:**
   - Hidden vaults require a fixed container size (`Auto` cannot be used).
   - **The 24-word recovery phrase unlocks only the outer (decoy) vault;** by design, no recovery phrase is generated for the hidden compartment.
@@ -84,6 +85,9 @@ Examples below assume a terminal opened in the extracted release folder with `./
 # Pad to a fixed 25 MiB container
 ./rpm-encrypter-cli encrypt ./Docs --container-mb 25
 
+# Encrypt a folder with encrypted header (Stealth Mode) + 25 MiB padding
+./rpm-encrypter-cli encrypt ./Docs --stealth --container-mb 25
+
 # Create an outer + hidden vault (uncompressed hidden compartment + hidden keyfile)
 ./rpm-encrypter-cli encrypt ./Decoy --container-mb 50 --hidden ./Secret --hidden-keyfile ./hidden.key --hidden-no-compress
 
@@ -111,11 +115,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.2.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.3.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.2.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.2.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.3.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.3.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.

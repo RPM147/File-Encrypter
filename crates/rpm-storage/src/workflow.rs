@@ -10,15 +10,15 @@ use std::thread;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rpm_core::{
-    decrypt_unlocked_stream, encrypt_hidden_stream, encrypt_stream, rekey_stream, unlock_seekable,
-    Auth, EncryptOptions, EncryptSummary, HiddenEncryptOptions, HiddenEncryptSummary, KdfParams,
-    RekeyOptions, SecretKey, VaultMetadata,
+    decrypt_unlocked_stream, encrypt_hidden_stream, encrypt_stream, rekey_stream,
+    unlock_seekable_with_kdf, Auth, EncryptOptions, EncryptSummary, HiddenEncryptOptions,
+    HiddenEncryptSummary, KdfParams, RekeyOptions, SecretKey, VaultMetadata,
 };
 
-use crate::atomic::atomic_write;
+use crate::atomic::{atomic_write, write_vault};
 use crate::error::StorageError;
 use crate::packager::{
-    collect_manifest, normalize_archive_selector, pack_sources, unpack_vault_stream,
+    collect_manifest, normalize_archive_selector, pack_sources_excluding, unpack_vault_stream,
     unpack_vault_stream_selected, UnpackLimits,
 };
 use crate::pipe::bounded_pipe;
@@ -78,12 +78,14 @@ pub fn encrypt_sources_v5(
     let sources_owned = sources.to_vec();
     let compress = opts.compressed;
     let cancel_pack = Arc::clone(&cancel);
+    let output = opts.stealth.then(|| out_vault.to_path_buf());
     let packer_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources(
+        pack_sources_excluding(
             &sources_owned,
             writer,
             compress,
             Some(&cancel_pack),
+            output.as_deref(),
             |msg| {
                 on_skip(msg);
             },
@@ -94,7 +96,7 @@ pub fn encrypt_sources_v5(
     let mut packer_opt = Some(packer_handle);
     let mut summary_out: Option<EncryptSummary> = None;
 
-    let enc_res = atomic_write(out_vault, |vault_writer| {
+    let enc_res = write_vault(out_vault, opts.stealth, |vault_writer| {
         let mut reader = reader_opt.take().expect("reader taken once");
         let enc_attempt = encrypt_stream(
             &mut reader,
@@ -156,12 +158,14 @@ pub fn encrypt_hidden_sources_v5(
     let decoy_compress = opts.decoy_compressed;
     let cancel_decoy = Arc::clone(&cancel);
     let skip_decoy = Arc::clone(&on_skip);
+    let output = opts.stealth.then(|| out_vault.to_path_buf());
     let decoy_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources(
+        pack_sources_excluding(
             &decoy_owned,
             decoy_writer,
             decoy_compress,
             Some(&cancel_decoy),
+            output.as_deref(),
             |msg| {
                 if let Ok(mut cb) = skip_decoy.lock() {
                     cb(msg);
@@ -174,12 +178,14 @@ pub fn encrypt_hidden_sources_v5(
     let hidden_compress = opts.hidden_compressed;
     let cancel_hidden = Arc::clone(&cancel);
     let skip_hidden = Arc::clone(&on_skip);
+    let output = opts.stealth.then(|| out_vault.to_path_buf());
     let hidden_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources(
+        pack_sources_excluding(
             &hidden_owned,
             hidden_writer,
             hidden_compress,
             Some(&cancel_hidden),
+            output.as_deref(),
             |msg| {
                 if let Ok(mut cb) = skip_hidden.lock() {
                     cb(msg);
@@ -197,7 +203,7 @@ pub fn encrypt_hidden_sources_v5(
     let decoy_done = Arc::new(AtomicU64::new(0));
     let hidden_done = Arc::new(AtomicU64::new(0));
 
-    let enc_res = atomic_write(out_vault, |vault_writer| {
+    let enc_res = write_vault(out_vault, opts.stealth, |vault_writer| {
         let mut d_reader = decoy_reader_opt.take().expect("decoy reader taken once");
         let mut h_reader = hidden_reader_opt.take().expect("hidden reader taken once");
 
@@ -285,7 +291,15 @@ pub fn decrypt_vault_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DecryptSummary, StorageError> {
-    decrypt_vault_v5_inner(vault_path, output_root, auth, None, progress, cancel)
+    decrypt_vault_v5_with_stealth_kdf(
+        vault_path,
+        output_root,
+        auth,
+        None,
+        &rpm_core::STEALTH_KDF_PARAMS,
+        progress,
+        cancel,
+    )
 }
 
 /// Stream-decrypt an entire Vault v5 archive (authenticating every AEAD chunk through EOF)
@@ -298,21 +312,23 @@ pub fn decrypt_vault_selected_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DecryptSummary, StorageError> {
-    decrypt_vault_v5_inner(
+    decrypt_vault_v5_with_stealth_kdf(
         vault_path,
         output_root,
         auth,
         Some(selected_paths),
+        &rpm_core::STEALTH_KDF_PARAMS,
         progress,
         cancel,
     )
 }
 
-fn decrypt_vault_v5_inner(
+pub fn decrypt_vault_v5_with_stealth_kdf(
     vault_path: &Path,
     output_root: &Path,
     auth: Auth<'_>,
     selected_paths: Option<&[String]>,
+    stealth_kdf: &KdfParams,
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DecryptSummary, StorageError> {
@@ -334,7 +350,7 @@ fn decrypt_vault_v5_inner(
     };
 
     let mut reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
-    let unlocked = unlock_seekable(&mut reader, auth)?;
+    let unlocked = unlock_seekable_with_kdf(&mut reader, auth, stealth_kdf)?;
     let metadata = unlocked.metadata().clone();
 
     let total_expected = metadata.original_size;

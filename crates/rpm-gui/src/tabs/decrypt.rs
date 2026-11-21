@@ -26,6 +26,7 @@ pub fn ui(
             if ui.button(s.btn_add_vaults).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
                     .add_filter("RPM Vault", &["vault"])
+                    .add_filter("All Files", &["*"])
                     .pick_files()
                 {
                     state.add_dropped_paths(files, Some(Tab::Decrypt));
