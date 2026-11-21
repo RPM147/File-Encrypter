@@ -57,20 +57,25 @@ try {
 
     $extraProfileArgs = if ($Release) { @('--release') } else { @() }
     $suites = @(
-        @{ Label = 'rpm-core combinatorial_core_matrix'; Args = @('test') + $extraProfileArgs + @('-p', 'rpm-core', '--test', 'combinatorial_core_matrix') },
-        @{ Label = 'rpm-storage combinatorial_storage_matrix'; Args = @('test') + $extraProfileArgs + @('-p', 'rpm-storage', '--test', 'combinatorial_storage_matrix') },
-        @{ Label = 'rpm-cli combinatorial_cli_matrix'; Args = @('test') + $extraProfileArgs + @('-p', 'rpm-cli', '--test', 'combinatorial_cli_matrix') },
-        @{ Label = 'rpm-gui combinatorial_gui_matrix'; Args = @('test') + $extraProfileArgs + @('-p', 'rpm-gui', '--test', 'combinatorial_gui_matrix') }
+        @{ Label = 'rpm-core combinatorial_core_matrix'; Args = @('test', '--locked') + $extraProfileArgs + @('-p', 'rpm-core', '--test', 'combinatorial_core_matrix') },
+        @{ Label = 'rpm-storage combinatorial_storage_matrix'; Args = @('test', '--locked') + $extraProfileArgs + @('-p', 'rpm-storage', '--test', 'combinatorial_storage_matrix') },
+        @{ Label = 'rpm-cli combinatorial_cli_matrix'; Args = @('test', '--locked') + $extraProfileArgs + @('-p', 'rpm-cli', '--test', 'combinatorial_cli_matrix') },
+        @{ Label = 'rpm-gui combinatorial_gui_matrix'; Args = @('test', '--locked') + $extraProfileArgs + @('-p', 'rpm-gui', '--test', 'combinatorial_gui_matrix') }
     )
 
-    foreach ($s in $suites) {
-        $results += Invoke-Checked -Label $s.Label -CommandArgs $s.Args
+    if (-not $FullWorkspace -or $Release) {
+        foreach ($s in $suites) {
+            $results += Invoke-Checked -Label $s.Label -CommandArgs $s.Args
+        }
     }
 
     if ($FullWorkspace) {
         $results += Invoke-Checked -Label 'cargo fmt --check' -CommandArgs @('fmt', '--all', '--', '--check')
-        $results += Invoke-Checked -Label 'cargo clippy --workspace --all-targets' -CommandArgs @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
-        $results += Invoke-Checked -Label 'cargo test --workspace' -CommandArgs @('test', '--workspace')
+        $results += Invoke-Checked -Label 'cargo clippy --workspace --all-targets' -CommandArgs @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings')
+        if (-not $Release) {
+            $results += Invoke-Checked -Label 'cargo test --workspace --lib (fast)' -CommandArgs @('test', '--locked', '--workspace', '--lib')
+        }
+        $results += Invoke-Checked -Label 'cargo test --workspace' -CommandArgs @('test', '--locked', '--workspace')
     }
 
     Write-Host "`nCombinatorial Test Kit Summary:" -ForegroundColor Green

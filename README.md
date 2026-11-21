@@ -77,8 +77,10 @@ cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./selected 
 
 ## Architecture & Security
 
-- Architecture overview and module boundaries: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Architecture overview and wire formats: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Non-negotiable design invariants: [docs/DESIGN_INVARIANTS.md](docs/DESIGN_INVARIANTS.md) ([Türkçe](docs/DESIGN_INVARIANTS.tr.md))
 - Threat model, swap/OS limitations, and SSD wipe caveats: [SECURITY.md](SECURITY.md)
+- Combinatorial valid-feature test kit: [docs/TEST_KIT.md](docs/TEST_KIT.md) ([Türkçe](docs/TEST_KIT.tr.md))
 
 ## License
 
