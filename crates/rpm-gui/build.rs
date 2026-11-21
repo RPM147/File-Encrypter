@@ -6,6 +6,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -22,12 +23,23 @@ fn main() {
     let rc_path = out_dir.join("rpm_gui.rc");
     let ico_norm = ico_path.to_string_lossy().replace('\\', "/");
 
+    let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let parse_part = |key: &str| -> u16 {
+        env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(0)
+    };
+    let ver_major = parse_part("CARGO_PKG_VERSION_MAJOR");
+    let ver_minor = parse_part("CARGO_PKG_VERSION_MINOR");
+    let ver_patch = parse_part("CARGO_PKG_VERSION_PATCH");
+
     let rc_content = format!(
         r#"1 ICON "{ico_norm}"
 
 1 VERSIONINFO
-FILEVERSION 4,0,0,0
-PRODUCTVERSION 4,0,0,0
+FILEVERSION {ver_major},{ver_minor},{ver_patch},0
+PRODUCTVERSION {ver_major},{ver_minor},{ver_patch},0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -40,12 +52,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "RPM Encrypter"
             VALUE "FileDescription", "RPM Encrypter (Vault Format v5)"
-            VALUE "FileVersion", "4.0.0"
+            VALUE "FileVersion", "{pkg_ver}"
             VALUE "InternalName", "rpm-encrypter"
             VALUE "LegalCopyright", "AGPL-3.0-or-later"
             VALUE "OriginalFilename", "rpm-encrypter.exe"
             VALUE "ProductName", "RPM Encrypter"
-            VALUE "ProductVersion", "4.0.0"
+            VALUE "ProductVersion", "{pkg_ver}"
         END
     END
     BLOCK "VarFileInfo"

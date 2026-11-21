@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "rpm-cli"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "clap",
  "rand 0.8.8",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "rpm-core"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3194,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "rpm-gui"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "eframe",
  "rand 0.8.8",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "rpm-storage"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "directories",
  "flate2",
