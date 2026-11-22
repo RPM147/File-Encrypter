@@ -306,6 +306,17 @@ pub(crate) fn sanitize_archive_path(
     max_depth: usize,
 ) -> Result<PathBuf, StorageError> {
     let raw = entry_path.to_string_lossy();
+    // Apply portable archive path rules even when host Path::components
+    // would treat a Windows prefix or backslash as ordinary filename bytes.
+    if raw.starts_with('\\')
+        || (raw.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && raw.as_bytes().get(1) == Some(&b':'))
+        || raw.split(['/', '\\']).any(|part| part == "..")
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "unsafe archive entry path: {raw}"
+        )));
+    }
     if raw.contains('\0') {
         return Err(StorageError::InvalidPath(
             "archive entry path contains NUL byte".into(),
@@ -480,6 +491,36 @@ pub(crate) fn visit_tar_entries<R: Read>(
     Ok(())
 }
 
+/// Tar iteration stops at its first end marker. Finish reading the gzip member
+/// before publishing the result, so its CRC32 and original length are checked.
+pub(crate) fn with_tar_reader<R: Read, T>(
+    mut input: R,
+    compressed: bool,
+    limits: UnpackLimits,
+    cancel: Option<&AtomicBool>,
+    parse: impl FnOnce(&mut dyn Read) -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    if !compressed {
+        return parse(&mut input);
+    }
+    let mut gzip = GzDecoder::new(input);
+    let result = parse(&mut gzip)?;
+    let mut buf = zeroize::Zeroizing::new([0; 8192]);
+    // Permit tar record padding even with tiny caller-supplied file limits.
+    let mut remaining = limits.max_total_bytes.max(10 * 1024);
+    loop {
+        check_cancelled(cancel)?;
+        let n = gzip.read(&mut buf[..])?;
+        if n == 0 {
+            break;
+        }
+        remaining = remaining.checked_sub(n as u64).ok_or_else(|| {
+            StorageError::LimitExceeded("excessive data after tar end marker".into())
+        })?;
+    }
+    Ok(result)
+}
+
 /// Safely unpack only the entries matching `selected_paths` (exact file or folder prefix)
 /// while still validating every entry header for Tar-Slip, symlinks, and bomb limits.
 pub fn unpack_vault_stream_selected<R: Read>(
@@ -491,17 +532,9 @@ pub fn unpack_vault_stream_selected<R: Read>(
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
     let filter = build_selector_set(selected_paths)?;
-    if compressed {
-        unpack_tar_stream(
-            GzDecoder::new(reader),
-            dest_dir,
-            limits,
-            Some(&filter),
-            cancel,
-        )
-    } else {
-        unpack_tar_stream(reader, dest_dir, limits, Some(&filter), cancel)
-    }
+    with_tar_reader(reader, compressed, limits, cancel, |tar| {
+        unpack_tar_stream(tar, dest_dir, limits, Some(&filter), cancel)
+    })
 }
 
 /// Safely unpack a tar (or tar.gz) stream into `dest_dir` with explicit safety bounds.
@@ -512,11 +545,9 @@ pub fn unpack_vault_stream_with_limits<R: Read>(
     limits: UnpackLimits,
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, StorageError> {
-    if compressed {
-        unpack_tar_stream(GzDecoder::new(reader), dest_dir, limits, None, cancel)
-    } else {
-        unpack_tar_stream(reader, dest_dir, limits, None, cancel)
-    }
+    with_tar_reader(reader, compressed, limits, cancel, |tar| {
+        unpack_tar_stream(tar, dest_dir, limits, None, cancel)
+    })
 }
 
 /// Safely unpack a tar (or tar.gz) stream into `dest_dir`, blocking symlinks, Tar-Slip paths, and tar bombs.

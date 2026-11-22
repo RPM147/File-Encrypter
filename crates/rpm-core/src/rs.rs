@@ -295,7 +295,7 @@ impl Block {
 /// Recognize redundant headers even when the first magic is damaged. A sector
 /// overwrite may destroy all three: corroborate the exact physical geometry
 /// with a decodable first block carrying the inner v5 magic.
-pub(crate) fn probe(r: &mut (impl Read + Seek)) -> io::Result<bool> {
+pub fn probe_rs_header(r: &mut (impl Read + Seek)) -> io::Result<bool> {
     let size = r.seek(SeekFrom::End(0))?;
     r.rewind()?;
     let mut h = [0; HEADER];
@@ -396,7 +396,7 @@ pub struct RsSeekableReader<R> {
 }
 impl<R: Read + Seek> RsSeekableReader<R> {
     pub fn new(mut inner: R) -> io::Result<Self> {
-        if !probe(&mut inner)? {
+        if !probe_rs_header(&mut inner)? {
             return Err(invalid());
         }
         let blocks = block_count(inner.seek(SeekFrom::End(0))?)?;
@@ -579,7 +579,7 @@ pub fn repair_vault_stream<R: Read + Seek, W: Write>(
     if crate::vault::is_cancelled(cancel) {
         return Err(CryptoError::Cancelled);
     }
-    if !probe(reader)? {
+    if !probe_rs_header(reader)? {
         return Err(CryptoError::UnsupportedOperation(
             "Reed-Solomon protection is required for repair".into(),
         ));

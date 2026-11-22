@@ -10,7 +10,9 @@ pub mod mem;
 pub mod recovery;
 pub mod rs;
 mod stealth;
-pub use rs::{repair_vault_stream, RepairReport, RsEncoderWriter, RsSeekableReader};
+pub use rs::{
+    probe_rs_header, repair_vault_stream, RepairReport, RsEncoderWriter, RsSeekableReader,
+};
 pub mod vault;
 
 pub use constants::{
@@ -29,7 +31,7 @@ pub use kdf::{hash_keyfile_reader, KdfParams};
 pub use mem::{SecretBuf, SecretKey};
 pub use recovery::{entropy_to_mnemonic, generate_recovery_entropy, mnemonic_to_entropy};
 pub use vault::{
-    check_integrity, decrypt_chunks_with_key, decrypt_chunks_with_key_at, decrypt_stream,
-    encrypt_stream, inspect_header, rekey_stream, EncryptOptions, EncryptSummary, IntegrityReport,
-    RekeyOptions, VaultInfo,
+    check_integrity, check_integrity_reader, decrypt_chunks_with_key, decrypt_chunks_with_key_at,
+    decrypt_stream, encrypt_stream, inspect_header, rekey_stream, EncryptOptions, EncryptSummary,
+    IntegrityReport, RekeyOptions, VaultInfo,
 };

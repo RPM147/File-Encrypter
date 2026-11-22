@@ -786,10 +786,15 @@ fn scan_chunk_frames(
 
 /// Passwordless single-pass structural check (header + chunk frames) + SHA-256 hash.
 pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
-    let mut f = File::open(path)?;
-    let file_size = f.metadata()?.len();
-    use std::io::Seek;
-    let rs = crate::rs::probe(&mut f)?;
+    check_integrity_reader(&mut File::open(path)?)
+}
+
+/// Stream the on-disk digest and structural checks from any seekable source.
+pub fn check_integrity_reader(
+    f: &mut (impl Read + std::io::Seek),
+) -> Result<IntegrityReport, CryptoError> {
+    let file_size = f.seek(std::io::SeekFrom::End(0))?;
+    let rs = crate::rs::probe_rs_header(f)?;
     f.rewind()?;
     let mut hr = HashingReader::new(f);
     if rs {

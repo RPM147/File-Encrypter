@@ -52,6 +52,15 @@ RPM Encrypter kombinasyonel test kiti, dört workspace paketindeki (`rpm-core`, 
 - **`gui_workers_all_10_operations_and_bilingual_reports_matrix`:**
   Tüm `10` arka plan işçisini (`spawn_encrypt`, `spawn_encrypt_hidden`, `spawn_integrity_check`, `spawn_repair`, `spawn_inspect`, `spawn_preview`, `spawn_selective_extract`, `spawn_decrypt`, `spawn_vault_diff`, `spawn_rekey`) Standart, Dolgulu, Gizli, hasarlı Reed-Solomon ve üretim-KDF Stealth kasalar üzerinde TR/EN rapor hizalama denetimiyle çalıştırır.
 
+## Temel Sağlamlaştırma Kalkanları (`cargo test --workspace` içinde)
+
+- **Dondurulmuş `v4.4.0` Altın Kasa Uyumluluğu ([golden_compatibility_tests.rs](../crates/rpm-core/tests/golden_compatibility_tests.rs), [golden_storage_compatibility_tests.rs](../crates/rpm-storage/tests/golden_storage_compatibility_tests.rs)):**
+  [crates/rpm-core/tests/fixtures/v4_4_0/](../crates/rpm-core/tests/fixtures/v4_4_0/) altındaki 8 değiştirilmez `v4.4.0` müze kasasını (`golden.key` ve `fixtures_manifest.json` dahil toplam `304.231` bayt) okuyarak SHA-256 doğruluğunu, parola + 24 kelimelik kurtarma açılışını, gizli bölmeleri, RAM önizlemeyi, kasalar arası `diff` ve `512 B` RS onarımını doğrular.
+- **Deterministik Bozuk Girdi Fuzzing ve Tar/Gzip Geri Alma ([fuzz_malformed_inputs.rs](../crates/rpm-core/tests/fuzz_malformed_inputs.rs), [fuzz_storage_inputs.rs](../crates/rpm-storage/tests/fuzz_storage_inputs.rs)):**
+  `RPM_FUZZ_SEED` / `RPM_FUZZ_ITERS` ile tekrar üretilebilir `SplitMix64` mutasyon testleri çekirdek başlık/Stealth/RS/diff ve depolama açma/önizleme/onarım yollarını bombalar; ayrıca kötü niyetli arşivlerin (Tar-Slip `..`/`\`/sürücü önekleri, symlink/hardlink, bozuk gzip CRC32 sonluğu) temizce reddedildiğini doğrular.
+- **Tepe RAM ve Tek-Geçiş I/O Regresyon Kilidi ([perf_and_memory_guard.rs](../crates/rpm-core/tests/perf_and_memory_guard.rs)):**
+  `16 MiB` Standart, RS ve Stealth akışlarında sınırlı O(1) heap belleği ile `~1×` tek okuma geçişi I/O sınırını korur; ayrıca `.\scripts\run-benchmarks.ps1` üzerinden `--release` hız tablosunu üretir.
+
 ## Yerel Çalıştırma
 
 ```powershell
@@ -63,4 +72,7 @@ RPM Encrypter kombinasyonel test kiti, dört workspace paketindeki (`rpm-core`, 
 
 # Kombinasyonel kit + rustfmt, Clippy (-D warnings) ve tüm workspace testlerini çalıştır
 .\scripts\run-combinatorial-tests.ps1 -FullWorkspace
+
+# 16 MiB --release aktarım hızı ve RAM benchmarkını çalıştır
+.\scripts\run-benchmarks.ps1
 ```

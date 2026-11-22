@@ -1,0 +1,99 @@
+{
+  "recovery_phrase": "clay eyebrow melody february pencil bench post earn clay eyebrow melody february pencil bench post earn clay eyebrow melody february pencil bench post enhance",
+  "vaults": {
+    "hidden_64k.vault": {
+      "size": 65536,
+      "sha256": "6b1d76858c59b36459032e069d96e759d8876217dc6fa66d43049b082eda585d",
+      "recovery": false,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {
+        "secret.txt": "9809d70025c5025b454b5aa88ddd12b5f77a31624e1bf1c371fa553ce187fa23"
+      }
+    },
+    "padded_64k.vault": {
+      "size": 65536,
+      "sha256": "e85e7efbed6e99ce55258a2438f3154c2e5c44e620437aea586614193a59c9ca",
+      "recovery": true,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {}
+    },
+    "rs_hidden_64k.vault": {
+      "size": 81648,
+      "sha256": "e93131e06cad4c43f81fa568614c38219bd9496e1406fa87930537a4ff05df08",
+      "recovery": false,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {
+        "secret.txt": "9809d70025c5025b454b5aa88ddd12b5f77a31624e1bf1c371fa553ce187fa23"
+      }
+    },
+    "rs_standard.vault": {
+      "size": 16368,
+      "sha256": "fdf2fec0f0d86f2c713eec76fa60fd6096d123ab9562180a9ddcff181b15d133",
+      "recovery": false,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {}
+    },
+    "standard_compressed_keyfile.vault": {
+      "size": 1067,
+      "sha256": "dc15f9ddb858abad48705230d55a2bf8c2f7869e2b4ad0056bc02235224a25ee",
+      "recovery": true,
+      "keyfile": true,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {}
+    },
+    "standard_uncompressed.vault": {
+      "size": 3992,
+      "sha256": "1548b1ba430f1b4de9add8e6f49ea482acc13aed9b61130f310a4b52427d2b16",
+      "recovery": true,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {}
+    },
+    "stealth_hidden_64k.vault": {
+      "size": 65536,
+      "sha256": "bd3122ea552e25d3665d002aac0bdd07ec13e5bab8d4d2a5abf77a9a3dfc2fc9",
+      "recovery": false,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {
+        "secret.txt": "9809d70025c5025b454b5aa88ddd12b5f77a31624e1bf1c371fa553ce187fa23"
+      }
+    },
+    "stealth_standard.vault": {
+      "size": 700,
+      "sha256": "2ac326cb4d5c3d34a1247530aa545a80af29876a168d8f5e9b6baf4398337b87",
+      "recovery": true,
+      "keyfile": false,
+      "outer": {
+        "note.txt": "2c2be703f4f75ad3c3aec3638fdf50f03295e6c9e618cbcec8c249302c475f7c",
+        "tiny.bin": "27fd62d4d888c29fff7887c58d468a4e6b2815ff7edd2dfdfe92341c2ee9fef7"
+      },
+      "hidden": {}
+    }
+  }
+}

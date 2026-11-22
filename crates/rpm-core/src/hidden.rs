@@ -746,7 +746,7 @@ pub fn unlock_seekable_with_kdf<R: Read + Seek>(
     auth: Auth<'_>,
     stealth_kdf: &KdfParams,
 ) -> Result<UnlockedVault, CryptoError> {
-    if crate::rs::probe(reader)? {
+    if crate::rs::probe_rs_header(reader)? {
         let mut rs = crate::RsSeekableReader::new(reader)?;
         let inner = unlock_inner(&mut rs, auth, stealth_kdf, true)?;
         Ok(UnlockedVault::ReedSolomon {

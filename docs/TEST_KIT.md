@@ -52,6 +52,15 @@ The RPM Encrypter combinatorial test kit systematically validates every **valid 
 - **`gui_workers_all_10_operations_and_bilingual_reports_matrix`:**
   Drives all `10` asynchronous GUI workers (`spawn_encrypt`, `spawn_encrypt_hidden`, `spawn_integrity_check`, `spawn_repair`, `spawn_inspect`, `spawn_preview`, `spawn_selective_extract`, `spawn_decrypt`, `spawn_vault_diff`, `spawn_rekey`) across Standard, Padded, Hidden, damaged Reed-Solomon, and production-KDF Stealth containers with TR/EN colon-alignment verification.
 
+## Foundation Safety Nets (Included in `cargo test --workspace`)
+
+- **Frozen `v4.4.0` Golden Vault Compatibility ([golden_compatibility_tests.rs](../crates/rpm-core/tests/golden_compatibility_tests.rs), [golden_storage_compatibility_tests.rs](../crates/rpm-storage/tests/golden_storage_compatibility_tests.rs)):**
+  Reads 8 immutable `v4.4.0` fixtures in [crates/rpm-core/tests/fixtures/v4_4_0/](../crates/rpm-core/tests/fixtures/v4_4_0/) (`304,231` bytes total including `golden.key` and `fixtures_manifest.json`), verifying SHA-256 fixture integrity, password + 24-word recovery unlock, hidden compartments, RAM preview, cross-vault `diff`, and 512-byte RS damage repair.
+- **Deterministic Malformed-Input Fuzzing & Tar/Gzip Rollback ([fuzz_malformed_inputs.rs](../crates/rpm-core/tests/fuzz_malformed_inputs.rs), [fuzz_storage_inputs.rs](../crates/rpm-storage/tests/fuzz_storage_inputs.rs)):**
+  Reproducible `SplitMix64` fuzzing (`RPM_FUZZ_SEED`, `RPM_FUZZ_ITERS`) over core header/stealth/RS/diff parsers and storage unpack/preview/repair flows, plus authenticated malicious archive rollback tests (Tar-Slip `..`/`\`/drive prefixes, symlinks/hardlinks, corrupted gzip CRC32 trailers).
+- **Peak Heap & Single-Pass I/O Regression Guard ([perf_and_memory_guard.rs](../crates/rpm-core/tests/perf_and_memory_guard.rs)):**
+  Validates O(1) bounded streaming heap usage and `~1x` single-pass read I/O across `16 MiB` Standard, RS, and Stealth operations, plus an `#[ignore]` release benchmark invoked via `.\scripts\run-benchmarks.ps1`.
+
 ## Running Locally
 
 ```powershell
@@ -63,4 +72,7 @@ The RPM Encrypter combinatorial test kit systematically validates every **valid 
 
 # Run combinatorial matrices + rustfmt, Clippy (-D warnings), and full workspace tests
 .\scripts\run-combinatorial-tests.ps1 -FullWorkspace
+
+# Run the --release 16 MiB throughput & heap benchmark
+.\scripts\run-benchmarks.ps1
 ```

@@ -1,4 +1,3 @@
-use flate2::read::GzDecoder;
 use rpm_core::{decrypt_unlocked_stream, unlock_seekable_with_kdf, Auth, CryptoError};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -93,11 +92,13 @@ pub fn extract_entry_to_memory_v5_with_stealth_kdf(
     let (mut writer, mut reader) = bounded_pipe(2);
     let stop = Arc::clone(&cancel);
     let worker = std::thread::spawn(move || {
-        let bytes = if compressed {
-            read_member(GzDecoder::new(&mut reader), &target, max_bytes, &stop)
-        } else {
-            read_member(&mut reader, &target, max_bytes, &stop)
-        }?;
+        let bytes = crate::packager::with_tar_reader(
+            &mut reader,
+            compressed,
+            UnpackLimits::default(),
+            Some(&stop),
+            |tar| read_member(tar, &target, max_bytes, &stop),
+        )?;
         // A tar end marker can precede the final authenticated frame.
         let mut scratch = Zeroizing::new([0u8; 8192]);
         while reader.read(&mut *scratch)? != 0 {}
