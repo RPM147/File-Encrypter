@@ -58,6 +58,8 @@ pub fn ui(
         if let Some(idx) = remove_idx {
             state.decrypt.vaults.remove(idx);
         }
+        ui.add_space(4.0);
+        ui.weak(s.dec_stealth_drop_hint);
     });
 
     ui.add_space(10.0);
@@ -71,6 +73,7 @@ pub fn ui(
                     .desired_rows(3)
                     .font(egui::TextStyle::Monospace),
             );
+            ui.weak(s.dec_recovery_hidden_note);
         } else {
             ui.horizontal(|ui| {
                 ui.label(s.lbl_password);

@@ -20,6 +20,7 @@ pub fn ui(
     let s = state.strings();
     ui.heading(s.rek_heading);
     ui.weak(s.rek_subtitle);
+    ui.weak(s.rek_limits_note);
     ui.add_space(8.0);
 
     theme::card_frame(ui.visuals()).show(ui, |ui| {

@@ -111,6 +111,7 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
                 format!("{}: {e}", s.err_invalid_kdf),
             );
         }
+        ui.weak(s.set_argon_scope_note);
 
         ui.checkbox(
             &mut state.config.compress_by_default,
@@ -121,6 +122,7 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
             ui.label(s.lbl_wipe_passes);
             ui.add(egui::Slider::new(&mut state.config.wipe_passes, 1..=5));
         });
+        ui.weak(s.wipe_warning_note);
 
         ui.add_space(4.0);
         if ui

@@ -1356,3 +1356,110 @@ fn rs_and_stealth_are_mutually_exclusive_and_localized() {
         assert!(!tr.is_empty() && !en.is_empty() && tr != en);
     }
 }
+
+#[test]
+fn upfront_gui_constraint_hints_parity_and_preview_limit_render() {
+    let tr = i18n::strings(AppLanguage::Tr);
+    let en = i18n::strings(AppLanguage::En);
+
+    let pairs = [
+        (tr.stealth_disabled_tip, en.stealth_disabled_tip),
+        (tr.rs_disabled_tip, en.rs_disabled_tip),
+        (tr.wipe_warning_note, en.wipe_warning_note),
+        (tr.hidden_limits_note, en.hidden_limits_note),
+        (tr.dec_stealth_drop_hint, en.dec_stealth_drop_hint),
+        (tr.dec_recovery_hidden_note, en.dec_recovery_hidden_note),
+        (tr.ins_actions_note, en.ins_actions_note),
+        (tr.ins_preview_limits_note, en.ins_preview_limits_note),
+        (tr.preview_too_large_tip, en.preview_too_large_tip),
+        (tr.rek_limits_note, en.rek_limits_note),
+        (tr.set_argon_scope_note, en.set_argon_scope_note),
+        (tr.stealth_help, en.stealth_help),
+        (tr.rs_help, en.rs_help),
+        (tr.ins_reenter_creds_hint, en.ins_reenter_creds_hint),
+    ];
+    for (t, e) in pairs {
+        assert!(!t.trim().is_empty());
+        assert!(!e.trim().is_empty());
+        assert_ne!(t, e);
+    }
+
+    for s in [tr, en] {
+        assert!(s.stealth_help.contains("Re-Key"));
+        assert!(s.rs_help.contains("Re-Key"));
+        assert!(s.hidden_limits_note.contains("Re-Key"));
+        assert!(s.rek_limits_note.contains("Stealth") && s.rek_limits_note.contains("24"));
+        assert!(s.ins_preview_limits_note.contains("16 MiB"));
+        assert!(s.preview_too_large_tip.contains("16 MiB"));
+        assert!(s.wipe_warning_note.contains("SSD"));
+        assert!(s.set_argon_scope_note.contains("64 MiB"));
+    }
+    assert!(tr.rek_limits_note.contains("standart"));
+    assert!(en.rek_limits_note.contains("standard"));
+
+    let ctx = egui::Context::default();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut st = AppState::default();
+    st.encrypt.secure_wipe = true;
+    st.encrypt.set_stealth(true);
+    st.encrypt.set_hidden_enabled(true);
+    st.decrypt.use_recovery = true;
+    st.inspect.set_manifest(
+        PathBuf::from("sample.vault"),
+        vec![
+            FileManifestEntry {
+                path: "small.txt".into(),
+                size: 1024,
+                modified_unix: 0,
+            },
+            FileManifestEntry {
+                path: "large.bin".into(),
+                size: (rpm_storage::DEFAULT_PREVIEW_MAX_BYTES as u64) + 1,
+                modified_unix: 0,
+            },
+        ],
+    );
+
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        st.config.language = lang;
+
+        st.encrypt.set_stealth(true);
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::encrypt::ui(ui, &ctx, &mut st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+
+        st.encrypt.set_reed_solomon(true);
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::encrypt::ui(ui, &ctx, &mut st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::decrypt::ui(ui, &ctx, &mut st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::inspect::ui(ui, &ctx, &mut st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::rekey::ui(ui, &ctx, &mut st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::settings::ui(ui, &ctx, &mut st);
+        })
+        .textures_delta
+        .clear();
+    }
+}

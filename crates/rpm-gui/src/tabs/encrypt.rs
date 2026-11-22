@@ -191,16 +191,31 @@ pub fn ui(
             ui.checkbox(&mut state.encrypt.compress, s.chk_compress);
             ui.checkbox(&mut state.encrypt.secure_wipe, s.chk_secure_wipe);
         });
+        if state.encrypt.secure_wipe {
+            ui.weak(s.wipe_warning_note);
+        }
 
         let mut stealth = state.encrypt.stealth;
-        if ui.checkbox(&mut stealth, s.stealth_mode).changed() {
+        let stealth_resp = ui
+            .add_enabled(
+                !state.encrypt.reed_solomon,
+                egui::Checkbox::new(&mut stealth, s.stealth_mode),
+            )
+            .on_disabled_hover_text(s.stealth_disabled_tip);
+        if stealth_resp.changed() {
             state.encrypt.set_stealth(stealth);
         }
         if state.encrypt.stealth {
             ui.weak(s.stealth_help);
         }
         let mut rs = state.encrypt.reed_solomon;
-        if ui.checkbox(&mut rs, s.rs_mode).changed() {
+        let rs_resp = ui
+            .add_enabled(
+                !state.encrypt.stealth,
+                egui::Checkbox::new(&mut rs, s.rs_mode),
+            )
+            .on_disabled_hover_text(s.rs_disabled_tip);
+        if rs_resp.changed() {
             state.encrypt.set_reed_solomon(rs);
         }
         ui.weak(s.rs_help);
@@ -352,6 +367,7 @@ pub fn ui(
 
                     ui.checkbox(&mut state.encrypt.hidden_compress, s.chk_hidden_compress);
                     ui.weak(s.hidden_recovery_note);
+                    ui.weak(s.hidden_limits_note);
                 }
             });
     });

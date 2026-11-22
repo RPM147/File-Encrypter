@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
+use rpm_storage::DEFAULT_PREVIEW_MAX_BYTES;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::i18n::Strings;
@@ -242,6 +243,8 @@ pub fn ui(
                 }
             });
         });
+        ui.add_space(4.0);
+        ui.weak(s.ins_actions_note);
     });
 
     ui.add_space(10.0);
@@ -264,6 +267,7 @@ pub fn ui(
         ui.add_space(10.0);
         theme::card_frame(ui.visuals()).show(ui, |ui| {
             ui.strong(s.ins_selective_heading);
+            ui.weak(s.ins_preview_limits_note);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add(
@@ -301,13 +305,17 @@ pub fn ui(
                                         state.inspect.selected_paths.remove(&entry.path);
                                     }
                                 }
-                                if ui
-                                    .add_enabled(
-                                        !state.busy,
-                                        egui::Button::new(s.btn_preview).small(),
-                                    )
-                                    .clicked()
-                                {
+                                let too_large = entry.size > DEFAULT_PREVIEW_MAX_BYTES as u64;
+                                let preview_btn = ui.add_enabled(
+                                    !state.busy && !too_large,
+                                    egui::Button::new(s.btn_preview).small(),
+                                );
+                                let preview_btn = if too_large {
+                                    preview_btn.on_disabled_hover_text(s.preview_too_large_tip)
+                                } else {
+                                    preview_btn
+                                };
+                                if preview_btn.clicked() {
                                     requested = Some(entry.path.clone());
                                 }
                                 ui.label(&entry.path);
