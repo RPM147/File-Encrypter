@@ -4,10 +4,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
-use rpm_core::{Auth, EncryptOptions, KdfParams};
+use rpm_core::constants::MIN_CHUNK_SIZE;
+use rpm_core::{encrypt_stream, Auth, CryptoError, EncryptOptions, KdfParams, VaultMetadata};
 use rpm_storage::packager::unpack_vault_stream_selected;
 use rpm_storage::{
-    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, StorageError, UnpackLimits,
+    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_sources_v5, extract_entry_to_memory_v5,
+    StorageError, UnpackLimits,
 };
 
 fn only_entry(dir: &Path) -> std::path::PathBuf {
@@ -129,4 +131,126 @@ fn selected_extraction_counts_skipped_members_toward_the_stream_limit() {
     );
     assert!(matches!(result, Err(StorageError::LimitExceeded(_))));
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn uncompressed_tar_trailing_chunks_drain_and_authenticate_through_eof() {
+    // Build a valid uncompressed tar archive followed by > 8 chunks of zero record padding
+    // after the tar EOF marker so `unpack_vault_stream` returns before the final AEAD chunk.
+    let mut builder = tar::Builder::new(Vec::new());
+    let payload = b"authenticated trailing padding test";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(payload.len() as u64);
+    header.set_mode(0o600);
+    builder
+        .append_data(&mut header, "note.txt", &payload[..])
+        .unwrap();
+    let mut archive = builder.into_inner().unwrap();
+    archive.resize(archive.len() + 12 * MIN_CHUNK_SIZE as usize, 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("padded_tar.vault");
+    let meta = VaultMetadata {
+        filename: "note.txt".into(),
+        source_type: "file".into(),
+        original_size: payload.len() as u64,
+        file_count: 1,
+        created_at: String::new(),
+        compressed: false,
+        files: vec![],
+    };
+    let summary = encrypt_stream(
+        &mut archive.as_slice(),
+        &mut fs::File::create(&vault).unwrap(),
+        &meta,
+        b"DrainPw!1",
+        &EncryptOptions {
+            kdf: KdfParams::fast_test(),
+            chunk_size: MIN_CHUNK_SIZE,
+            compressed: false,
+            ..Default::default()
+        },
+        |_| {},
+        None,
+    )
+    .unwrap();
+    assert!(summary.chunks_written > 10);
+
+    let auth = || Auth::Password {
+        password: b"DrainPw!1",
+        keyfile_hash: None,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // 1. Valid vault: drain loop must prevent BrokenPipe on full, selective, and RAM preview.
+    let out_full = dir.path().join("full");
+    let dec = decrypt_vault_v5(
+        &vault,
+        &out_full,
+        auth(),
+        Arc::new(|_, _| {}),
+        cancel.clone(),
+    )
+    .expect("valid uncompressed tar with trailing zero chunks must succeed");
+    assert_eq!(fs::read(&dec.output_path).unwrap(), payload);
+
+    let out_sel = dir.path().join("sel");
+    let sel = decrypt_vault_selected_v5(
+        &vault,
+        &out_sel,
+        auth(),
+        &["note.txt".into()],
+        Arc::new(|_, _| {}),
+        cancel.clone(),
+    )
+    .expect("selective extract with trailing zero chunks must succeed");
+    assert_eq!(fs::read(&sel.output_path).unwrap(), payload);
+
+    let mem = extract_entry_to_memory_v5(
+        &vault,
+        auth(),
+        "note.txt",
+        256,
+        Arc::new(|_, _| {}),
+        cancel.clone(),
+    )
+    .expect("RAM preview with trailing zero chunks must succeed");
+    assert_eq!(mem.as_slice(), payload);
+
+    // 2. Tamper final chunk tag: drain loop must keep pipe open so AEAD failure wins & rolls back.
+    let mut tampered = fs::read(&vault).unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(&vault, tampered).unwrap();
+
+    let bad_full = dir.path().join("bad_full");
+    assert!(matches!(
+        decrypt_vault_v5(
+            &vault,
+            &bad_full,
+            auth(),
+            Arc::new(|_, _| {}),
+            cancel.clone()
+        ),
+        Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+    ));
+    assert!(!bad_full.exists());
+
+    let bad_sel = dir.path().join("bad_sel");
+    assert!(matches!(
+        decrypt_vault_selected_v5(
+            &vault,
+            &bad_sel,
+            auth(),
+            &["note.txt".into()],
+            Arc::new(|_, _| {}),
+            cancel.clone(),
+        ),
+        Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+    ));
+    assert!(!bad_sel.exists());
+
+    assert!(matches!(
+        extract_entry_to_memory_v5(&vault, auth(), "note.txt", 256, Arc::new(|_, _| {}), cancel),
+        Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+    ));
 }

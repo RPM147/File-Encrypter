@@ -611,11 +611,13 @@ fn kdf_and_recovery_validation_bounds() {
         Err(CryptoError::InvalidFormat(_))
     ));
     let mut bad_words: Vec<&str> = phrase.split_whitespace().collect();
-    bad_words[23] = if bad_words[23] == "abandon" {
-        "ability"
-    } else {
-        "abandon"
-    };
+    // Word 23 carries the last 3 entropy bits (bits 10..8) + 8 checksum bits (bits 7..0).
+    // Flipping only bit 0 preserves the exact 256-bit entropy while guaranteeing a checksum
+    // mismatch (100% deterministic, avoiding the ~1/256 collision when swapping to "abandon").
+    let last_idx = bip39::Language::English
+        .find_word(bad_words[23])
+        .expect("valid BIP-39 word");
+    bad_words[23] = bip39::Language::English.word_list()[usize::from(last_idx ^ 1)];
     assert!(matches!(
         mnemonic_to_entropy(&bad_words.join(" ")),
         Err(CryptoError::InvalidFormat(_))

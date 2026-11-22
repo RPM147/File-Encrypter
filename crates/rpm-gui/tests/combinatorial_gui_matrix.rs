@@ -48,15 +48,14 @@ fn recv_done(rx: &mpsc::Receiver<WorkerUpdate>) -> WorkerUpdate {
 }
 
 fn isolated_state(tmp: &tempfile::TempDir) -> AppState {
-    let mut st = AppState {
-        config_path: Some(tmp.path().join("config.json")),
-        config: AppConfig::default(),
-        ..AppState::default()
+    let fast = KdfParams::fast_test();
+    let cfg = AppConfig {
+        argon_memory_kib: fast.memory_kib,
+        argon_iterations: fast.iterations,
+        argon_parallelism: fast.parallelism,
+        ..AppConfig::default()
     };
-    st.config.argon_memory_kib = KdfParams::fast_test().memory_kib;
-    st.config.argon_iterations = KdfParams::fast_test().iterations;
-    st.config.argon_parallelism = KdfParams::fast_test().parallelism;
-    st
+    AppState::from_config(cfg, Some(tmp.path().join("config.json")))
 }
 
 #[test]
@@ -118,14 +117,17 @@ fn gui_settings_theme_lang_scale_and_all_tabs_headless_render_matrix() {
     let mut st = isolated_state(&tmp);
 
     // Exhaustive settings matrix + disk config persistence in isolated tempdir
+    let mut seen_mem = std::collections::BTreeSet::new();
     for &theme in &[ThemeMode::Dark, ThemeMode::Light] {
         for &lang in &[AppLanguage::Tr, AppLanguage::En] {
             for &scale in &UI_SCALE_PRESETS {
-                let compress = (scale / 10).is_multiple_of(2);
-                let passes = ((scale / 10) % 5 + 1) as u8;
-                let mem = [16_384, 65_536, 131_072, 262_144][usize::from(scale) % 4];
+                let scale_step = usize::from(scale / 10);
+                let compress = scale_step.is_multiple_of(2);
+                let passes = (scale_step % 5 + 1) as u8;
+                let mem = [16_384, 65_536, 131_072, 262_144][scale_step % 4];
+                seen_mem.insert(mem);
                 let iters = [1, 3, 10][usize::from(passes) % 3];
-                let par = [1, 4, 16][usize::from(scale) % 3];
+                let par = [1, 4, 16][scale_step % 3];
 
                 st.config.theme = theme;
                 st.config.language = lang;
@@ -143,6 +145,7 @@ fn gui_settings_theme_lang_scale_and_all_tabs_headless_render_matrix() {
             }
         }
     }
+    assert_eq!(seen_mem.len(), 4);
 
     // Re-save explicitly through save_config_to and confirm valid load
     let cfg_copy = st.config.clone();

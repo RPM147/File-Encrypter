@@ -85,10 +85,15 @@ pub fn load_config_from(path: &Path) -> AppConfig {
     }
 }
 
-pub fn save_config_to(path: &Path, cfg: &AppConfig) -> Result<(), StorageError> {
-    if let Some(parent) = path.parent() {
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+pub fn save_config_to(path: &Path, cfg: &AppConfig) -> Result<(), StorageError> {
+    ensure_parent_dir(path)?;
     let data = serde_json::to_vec_pretty(cfg)?;
     crate::atomic::atomic_write(path, |w| {
         std::io::Write::write_all(w, &data)?;
@@ -99,6 +104,11 @@ pub fn save_config_to(path: &Path, cfg: &AppConfig) -> Result<(), StorageError> 
 #[cfg(test)]
 mod config_loading_tests {
     use super::*;
+
+    #[test]
+    fn ensure_parent_dir_accepts_bare_relative_filename() {
+        ensure_parent_dir(Path::new("config.json")).unwrap();
+    }
 
     #[test]
     fn legacy_preferences_and_invalid_numeric_values() {

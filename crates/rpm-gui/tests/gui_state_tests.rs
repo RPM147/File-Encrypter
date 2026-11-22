@@ -24,12 +24,16 @@ use rpm_gui::state::{
     UI_SCALE_DEFAULT, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_PRESETS,
 };
 use rpm_gui::{fonts, i18n, load_app_icon, worker};
-use rpm_storage::config::{load_config_from, AppLanguage, ThemeMode};
+use rpm_storage::config::{load_config_from, AppConfig, AppLanguage, ThemeMode};
 use rpm_storage::{encrypt_hidden_sources_v5, GuiLaunchIntent, LaunchTab};
+
+fn fresh_state() -> AppState {
+    AppState::from_config(AppConfig::default(), None)
+}
 
 #[test]
 fn dropped_files_route_vaults_to_decrypt_and_regular_to_encrypt() {
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.add_dropped_paths(vec![PathBuf::from("a.txt"), PathBuf::from("folder")], None);
     assert_eq!(st.active_tab, Tab::Encrypt);
     assert_eq!(st.encrypt.sources.len(), 2);
@@ -45,7 +49,8 @@ fn dropped_files_route_vaults_to_decrypt_and_regular_to_encrypt() {
     st.add_dropped_paths(vec![opaque.clone()], Some(Tab::Decrypt));
     assert!(st.decrypt.vaults.contains(&opaque));
     // Missing non-vault paths and directories are rejected on Decrypt.
-    st.add_dropped_paths(vec![PathBuf::from("plain.txt")], Some(Tab::Decrypt));
+    let missing = dir.path().join("missing.txt");
+    st.add_dropped_paths(vec![missing], Some(Tab::Decrypt));
     assert!(st.is_error);
     let sub = dir.path().join("folder");
     fs::create_dir(&sub).unwrap();
@@ -56,7 +61,7 @@ fn dropped_files_route_vaults_to_decrypt_and_regular_to_encrypt() {
 
 #[test]
 fn launch_intent_and_password_gen_and_secret_clearing() {
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.apply_launch_intent(GuiLaunchIntent {
         tab: Some(LaunchTab::Decrypt),
         paths: vec!["one.vault".into()],
@@ -101,7 +106,7 @@ fn bilingual_tr_en_strings_and_keyboard_shortcuts_and_modals() {
     assert_eq!(en.tab_settings, "Settings");
     assert_ne!(tr.enc_heading, en.enc_heading);
 
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     for (idx, tab) in Tab::ALL.into_iter().enumerate() {
         assert!(st.handle_shortcut_tab((idx + 1) as u8));
         assert_eq!(st.active_tab, tab);
@@ -155,7 +160,7 @@ fn config_backward_compat_and_strength_meter() {
 
 #[test]
 fn inspect_manifest_selection_filtering_and_vault_change_reset() {
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     let entries = vec![
         FileManifestEntry {
             path: "docs/rapor.pdf".into(),
@@ -374,17 +379,15 @@ fn transfer_meter_and_bilingual_formatting_handle_edge_cases() {
     assert!(tip.contains("MiB/s"));
 
     // 4. AppState::begin_transfer clears stale snapshot
-    let mut st = AppState {
-        transfer: Some(TransferSnapshot {
-            fraction: 0.5,
-            bytes_done: 100,
-            bytes_total: 200,
-            bytes_per_sec: Some(1024.0),
-            eta: Some(Duration::from_secs(1)),
-            item_index: None,
-        }),
-        ..Default::default()
-    };
+    let mut st = fresh_state();
+    st.transfer = Some(TransferSnapshot {
+        fraction: 0.5,
+        bytes_done: 100,
+        bytes_total: 200,
+        bytes_per_sec: Some(1024.0),
+        eta: Some(Duration::from_secs(1)),
+        item_index: None,
+    });
     st.begin_transfer("Starting");
     assert!(st.busy);
     assert_eq!(st.progress, 0.0);
@@ -430,7 +433,7 @@ fn password_generator_character_classes_ambiguous_exclusion_and_guard() {
     }
 
     // 2. Single-class combinations (with & without ambiguous exclusion)
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.pwgen.length = 64;
 
     // Uppercase only, exclude ambiguous
@@ -554,10 +557,7 @@ fn argon2id_settings_validation_and_persistence() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("prefs.json");
 
-    let mut st = AppState {
-        config_path: Some(cfg_path.clone()),
-        ..Default::default()
-    };
+    let mut st = AppState::from_config(AppConfig::default(), Some(cfg_path.clone()));
     st.config.language = AppLanguage::En;
 
     // Every UI slider endpoint for iterations (1..=10) & parallelism (1..=16) is valid
@@ -664,7 +664,7 @@ fn ui_scale_clamping_zoom_factor_and_context_application() {
     }
 
     // AppState config binding and egui::Context integration
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.config.ui_scale_percent = UI_SCALE_DEFAULT;
     assert_eq!(st.config.ui_scale_percent, 100);
     assert!((st.ui_scale_zoom_factor() - 1.0).abs() < 1e-6);
@@ -825,7 +825,7 @@ fn vault_diff_report_formatting_and_secret_clearing() {
     assert!(worker::format_diff_report(&many_added, AppLanguage::En).contains("... and 5 more"));
 
     // clear_diff_secrets wipes all 4 secret fields cleanly
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.diff.password_a = "SecretA!".into();
     st.diff.recovery_phrase_a = "alpha beta gamma".into();
     st.diff.password_b = "SecretB!".into();
@@ -940,7 +940,7 @@ fn container_size_preset_resolution_and_hidden_validation() {
     );
 
     // Hidden mode auto-switches preset away from Auto and requires fixed container size
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     assert_eq!(st.encrypt.container_preset, ContainerSizePreset::Auto);
     assert_eq!(st.encrypt.resolve_container_size(), Ok(None));
 
@@ -972,7 +972,7 @@ fn container_size_preset_resolution_and_hidden_validation() {
 
 #[test]
 fn clear_encrypt_secrets_wipes_outer_and_hidden_passwords() {
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.encrypt.password = "OuterSecret!1".into();
     st.encrypt.confirm_password = "OuterSecret!1".into();
     st.encrypt.hidden_password = "HiddenSecret!2".into();
@@ -1256,7 +1256,7 @@ fn preview_types_cleanup_and_localization() {
             Zeroizing::new(b"secret".to_vec()),
         ))
     };
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.inspect.preview = preview();
     st.inspect.clear_preview();
     assert!(st.inspect.preview.is_none());
@@ -1295,7 +1295,7 @@ fn preview_types_cleanup_and_localization() {
 
 #[test]
 fn stealth_preferences_and_digest_only_reports_are_bilingual_and_neutral() {
-    assert!(!AppState::default().encrypt.stealth);
+    assert!(!fresh_state().encrypt.stealth);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("notes.dat");
     fs::write(&path, b"example").unwrap();
@@ -1327,7 +1327,7 @@ fn stealth_preferences_and_digest_only_reports_are_bilingual_and_neutral() {
 
 #[test]
 fn rs_and_stealth_are_mutually_exclusive_and_localized() {
-    let mut state = AppState::default();
+    let mut state = fresh_state();
     let fields = &mut state.encrypt;
     assert!(!fields.reed_solomon);
     fields.set_stealth(true);
@@ -1400,7 +1400,7 @@ fn upfront_gui_constraint_hints_parity_and_preview_limit_render() {
     let ctx = egui::Context::default();
     let (tx, _rx) = std::sync::mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut st = AppState::default();
+    let mut st = fresh_state();
     st.encrypt.secure_wipe = true;
     st.encrypt.set_stealth(true);
     st.encrypt.set_hidden_enabled(true);

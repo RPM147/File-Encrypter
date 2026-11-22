@@ -95,7 +95,7 @@ pub(crate) fn write_header(
     let mut salt = [0; SALT_SIZE];
     loop {
         OsRng.fill_bytes(&mut salt);
-        if !salt.starts_with(&VAULT_MAGIC) {
+        if !salt.starts_with(&VAULT_MAGIC) && !salt.starts_with(b"RPMR") {
             break;
         }
     }

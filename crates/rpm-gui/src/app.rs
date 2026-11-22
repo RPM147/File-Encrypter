@@ -44,19 +44,21 @@ impl RpmApp {
                     bytes,
                     status,
                 } => {
-                    if self
-                        .state
-                        .inspect
-                        .preview_pending
-                        .as_ref()
-                        .is_some_and(|(g, c)| *g == gen && !c.load(Ordering::Relaxed))
-                    {
-                        self.state.inspect.preview_pending = None;
-                        self.state.busy = false;
-                        self.state.transfer = None;
-                        self.state.inspect.preview =
-                            Some(crate::preview::PreviewState::new(ctx, path, bytes));
-                        self.state.set_status(status, false);
+                    if let Some((g, c)) = self.state.inspect.preview_pending.as_ref() {
+                        if *g == gen {
+                            let cancelled = c.load(Ordering::Relaxed);
+                            self.state.inspect.preview_pending = None;
+                            self.state.busy = false;
+                            self.state.transfer = None;
+                            if cancelled {
+                                let msg = self.state.strings().preview_cancelled;
+                                self.state.set_status(msg, false);
+                            } else {
+                                self.state.inspect.preview =
+                                    Some(crate::preview::PreviewState::new(ctx, path, bytes));
+                                self.state.set_status(status, false);
+                            }
+                        }
                     }
                 }
                 WorkerUpdate::PreviewError {
@@ -81,8 +83,10 @@ impl RpmApp {
                     }
                 }
                 WorkerUpdate::Progress(snap) => {
-                    self.state.progress = snap.fraction;
-                    self.state.transfer = Some(snap);
+                    if self.state.busy {
+                        self.state.progress = snap.fraction;
+                        self.state.transfer = Some(snap);
+                    }
                 }
                 WorkerUpdate::Log(line) => self.state.push_log(line),
                 WorkerUpdate::EncryptDone { status } => {
@@ -386,19 +390,29 @@ impl eframe::App for RpmApp {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+    use rpm_storage::config::AppConfig;
     use zeroize::Zeroizing;
+
+    fn isolated_app() -> RpmApp {
+        let (tx, rx) = mpsc::channel();
+        RpmApp {
+            state: AppState::from_config(AppConfig::default(), None),
+            tx,
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            theme_initialized: false,
+        }
+    }
 
     #[test]
     fn late_preview_after_escape_is_discarded() {
-        let mut app = RpmApp::new(GuiLaunchIntent {
-            tab: None,
-            paths: vec![],
-        });
+        let mut app = isolated_app();
         app.state.select_tab(Tab::Inspect);
         app.state.busy = true;
         let (gen, cancel) = app.state.inspect.begin_preview();
         assert!(app.state.dismiss_modals());
         assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.state.busy, "Esc during preview must release busy lock");
         app.tx
             .send(WorkerUpdate::PreviewDone {
                 gen,
@@ -409,14 +423,66 @@ mod preview_tests {
             .unwrap();
         app.drain_updates(&egui::Context::default());
         assert!(app.state.inspect.preview.is_none());
+        assert!(!app.state.busy);
+        assert!(app.state.transfer.is_none());
+    }
+
+    #[test]
+    fn cancel_button_and_tab_switch_during_pending_preview_release_busy_lock() {
+        // 1. Cancel button sets preview_cancel while worker finishes with PreviewDone.
+        let mut app = isolated_app();
+        app.state.select_tab(Tab::Inspect);
+        app.state.begin_transfer("loading");
+        let (gen, cancel) = app.state.inspect.begin_preview();
+        cancel.store(true, Ordering::Relaxed);
+        app.tx
+            .send(WorkerUpdate::PreviewDone {
+                gen,
+                path: "note".into(),
+                bytes: Zeroizing::new(b"private".to_vec()),
+                status: "ready".into(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(app.state.inspect.preview.is_none());
+        assert!(app.state.inspect.preview_pending.is_none());
+        assert!(!app.state.busy);
+
+        // 2. Switching away from Inspect during pending preview cancels & releases busy lock,
+        //    and stale late Progress/PreviewDone updates do not re-pollute transfer/preview.
+        app.state.select_tab(Tab::Inspect);
+        app.state.begin_transfer("loading");
+        let (gen2, cancel2) = app.state.inspect.begin_preview();
+        app.state.select_tab(Tab::Encrypt);
+        assert!(cancel2.load(Ordering::Relaxed));
+        assert!(!app.state.busy);
+        app.tx
+            .send(WorkerUpdate::Progress(crate::progress::TransferSnapshot {
+                fraction: 0.5,
+                bytes_done: 50,
+                bytes_total: 100,
+                bytes_per_sec: None,
+                eta: None,
+                item_index: None,
+            }))
+            .unwrap();
+        app.tx
+            .send(WorkerUpdate::PreviewDone {
+                gen: gen2,
+                path: "note".into(),
+                bytes: Zeroizing::new(b"private".to_vec()),
+                status: "ready".into(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(app.state.inspect.preview.is_none());
+        assert!(app.state.transfer.is_none());
+        assert!(!app.state.busy);
     }
 
     #[test]
     fn stale_preview_generation_does_not_overwrite_newer_request() {
-        let mut app = RpmApp::new(GuiLaunchIntent {
-            tab: None,
-            paths: vec![],
-        });
+        let mut app = isolated_app();
         app.state.select_tab(Tab::Inspect);
         let (gen1, cancel1) = app.state.inspect.begin_preview();
         let (gen2, cancel2) = app.state.inspect.begin_preview();

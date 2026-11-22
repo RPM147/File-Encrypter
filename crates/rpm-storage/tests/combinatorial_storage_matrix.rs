@@ -791,14 +791,17 @@ fn storage_config_launch_and_shell_integration_matrix() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.json");
 
+    let mut seen_mem = std::collections::BTreeSet::new();
     for (idx, theme) in [ThemeMode::Dark, ThemeMode::Light].into_iter().enumerate() {
         for language in [AppLanguage::Tr, AppLanguage::En] {
             for &scale in &[80u16, 90, 100, 110, 120, 130, 150] {
-                let compress = (idx + usize::from(scale)) % 2 == 0;
-                let wipe = ((scale / 10) % 5 + 1) as u8;
-                let mem = [16_384, 65_536, 131_072, 262_144][usize::from(scale) % 4];
+                let scale_step = usize::from(scale / 10);
+                let compress = (idx + scale_step) % 2 == 0;
+                let wipe = (scale_step % 5 + 1) as u8;
+                let mem = [16_384, 65_536, 131_072, 262_144][scale_step % 4];
+                seen_mem.insert(mem);
                 let iters = [1, 3, 10][usize::from(wipe) % 3];
-                let par = [1, 4, 16][usize::from(scale) % 3];
+                let par = [1, 4, 16][scale_step % 3];
 
                 let cfg = AppConfig {
                     ui_scale_percent: scale,
@@ -817,6 +820,7 @@ fn storage_config_launch_and_shell_integration_matrix() {
             }
         }
     }
+    assert_eq!(seen_mem.len(), 4);
 
     // Launch intent matrix
     let launch_cases: &[(&[&str], Option<LaunchTab>, usize)] = &[

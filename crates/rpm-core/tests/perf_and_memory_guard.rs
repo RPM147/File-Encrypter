@@ -129,9 +129,9 @@ fn scenario(name: &str, size: usize, guards: bool) {
     let stream_limit = if rs { 12 * MIB } else { 10 * MIB };
     let stealth_encrypt_limit = 64 * MIB + 10 * MIB;
     let record = |op: &str, start: Instant, baseline: usize, limit: usize| {
-        let delta = PEAK.load(SeqCst) - baseline;
+        let delta = PEAK.load(SeqCst).saturating_sub(baseline);
         let secs = start.elapsed().as_secs_f64();
-        let mib_s = size as f64 / MIB as f64 / secs;
+        let mib_s = size as f64 / MIB as f64 / secs.max(1e-9);
         let peak_mib = delta as f64 / MIB as f64;
         println!(
             "{name:<10} | {op:<8} | {:>8.2} | {:>11.2} | {:>8.4} MiB ({delta} B)",
@@ -169,6 +169,7 @@ fn scenario(name: &str, size: usize, guards: bool) {
 
     let len = file.metadata().unwrap().len();
     let hash = disk_hash(&mut file);
+    let expected_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     let mut reader = CountingSeekReader { file, bytes: 0 };
     let auth = Auth::Password {
         password: b"test",
@@ -178,7 +179,18 @@ fn scenario(name: &str, size: usize, guards: bool) {
     let baseline = reset_peak();
     let start = Instant::now();
     let unlocked = unlock_seekable(&mut reader, auth).unwrap();
-    let baseline = if stealth { reset_peak() } else { baseline };
+    let baseline = if stealth {
+        if guards {
+            let unlock_delta = PEAK.load(SeqCst).saturating_sub(baseline);
+            assert!(
+                unlock_delta < stealth_encrypt_limit,
+                "{name} unlock: {unlock_delta} >= {stealth_encrypt_limit}"
+            );
+        }
+        reset_peak()
+    } else {
+        baseline
+    };
     let mut output = Sha256Sink::default();
     decrypt_unlocked_stream(&mut reader, &mut output, &unlocked, |_| {}, None).unwrap();
     record("decrypt", start, baseline, stream_limit);
@@ -198,20 +210,27 @@ fn scenario(name: &str, size: usize, guards: bool) {
         if guards {
             io_guard("RS repair", reader.bytes, len);
         }
-    } else if stealth && guards {
+    }
+    if guards {
+        reader.bytes = 0;
+        let baseline = reset_peak();
         let report = rpm_core::vault::check_integrity_reader(&mut reader).unwrap();
-        assert!(report.sha256_only);
-        assert_eq!(
-            report.sha256_hex,
-            hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        let verify_delta = PEAK.load(SeqCst).saturating_sub(baseline);
+        assert!(
+            verify_delta < stream_limit,
+            "{name} verify: {verify_delta} >= {stream_limit}"
         );
-        io_guard("Stealth verify", reader.bytes, len);
+        assert!(report.ok);
+        assert_eq!(report.sha256_only, stealth);
+        assert_eq!(report.has_reed_solomon, rs);
+        assert_eq!(report.sha256_hex, expected_hex);
+        io_guard(&format!("{name} verify"), reader.bytes, len);
     }
 }
 
 #[test]
 fn peak_heap_and_single_pass_io() {
-    let _guard = MEASUREMENT.lock().unwrap();
+    let _guard = MEASUREMENT.lock().unwrap_or_else(|e| e.into_inner());
     println!("Mode       | Op       |  Time ms |       MiB/s | Peak Heap");
     for mode in ["Standard", "RS", "Stealth"] {
         scenario(mode, 16 * MIB, true);
@@ -221,7 +240,7 @@ fn peak_heap_and_single_pass_io() {
 #[test]
 #[ignore = "release throughput benchmark"]
 fn bench_throughput_summary() {
-    let _guard = MEASUREMENT.lock().unwrap();
+    let _guard = MEASUREMENT.lock().unwrap_or_else(|e| e.into_inner());
     println!("Mode       | Op       |  Time ms |       MiB/s | Peak Heap");
     println!("-----------+----------+----------+-------------+----------------------------");
     for mode in ["Standard", "RS", "Stealth"] {

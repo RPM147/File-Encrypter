@@ -515,10 +515,20 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         let cfg_path = default_config_path();
-        let mut config = cfg_path
+        let config = cfg_path
             .as_deref()
             .map(load_config_from)
             .unwrap_or_default();
+        let mut state = Self::from_config(config, cfg_path);
+        state.shell_status = shell_integration::get_status();
+        state
+    }
+}
+
+impl AppState {
+    /// Construct an `AppState` directly from an in-memory `AppConfig` and optional
+    /// config path without reading host `%APPDATA%` preferences or querying the OS registry.
+    pub fn from_config(mut config: AppConfig, config_path: Option<PathBuf>) -> Self {
         config.ui_scale_percent = clamp_ui_scale_percent(config.ui_scale_percent);
         if config.kdf_params().validate().is_err() {
             let defaults = KdfParams::owasp_default();
@@ -538,8 +548,14 @@ impl Default for AppState {
             is_error: false,
             logs: Vec::new(),
             config,
-            config_path: cfg_path,
-            shell_status: shell_integration::get_status(),
+            config_path,
+            shell_status: ShellIntegrationStatus {
+                supported: cfg!(windows),
+                installed: false,
+                context_menu_installed: false,
+                vault_association_installed: false,
+                command_preview: String::new(),
+            },
             show_shell_install_modal: false,
             clipboard_deadline: None,
             encrypt: EncryptFields {
@@ -619,9 +635,7 @@ impl Default for AppState {
             pwgen: PasswordGenFields::default(),
         }
     }
-}
 
-impl AppState {
     pub fn strings(&self) -> &'static Strings {
         i18n::strings(self.config.language)
     }
@@ -739,9 +753,21 @@ impl AppState {
         self.rekey.confirm_password.zeroize();
     }
 
+    pub fn clear_preview_and_busy(&mut self) -> bool {
+        let had_pending = self.inspect.preview_pending.is_some();
+        let had_any = had_pending || self.inspect.preview.is_some();
+        self.inspect.clear_preview();
+        if had_pending {
+            self.busy = false;
+            self.transfer = None;
+            self.progress = 0.0;
+        }
+        had_any
+    }
+
     pub fn select_tab(&mut self, tab: Tab) {
         if tab != Tab::Inspect {
-            self.inspect.clear_preview();
+            self.clear_preview_and_busy();
         }
         self.active_tab = tab;
     }
@@ -759,8 +785,12 @@ impl AppState {
     }
 
     pub fn dismiss_modals(&mut self) -> bool {
-        let mut closed = self.inspect.preview.is_some() || self.inspect.preview_pending.is_some();
-        self.inspect.clear_preview();
+        let had_pending = self.inspect.preview_pending.is_some();
+        let mut closed = self.clear_preview_and_busy();
+        if had_pending {
+            let msg = self.strings().preview_cancelled;
+            self.set_status(msg, false);
+        }
         if self.show_shell_install_modal {
             self.show_shell_install_modal = false;
             closed = true;
@@ -831,6 +861,7 @@ impl AppState {
                 if let Some(first) = paths.into_iter().next() {
                     self.select_tab(Tab::Inspect);
                     self.inspect.vault_path = first.display().to_string();
+                    self.clear_preview_and_busy();
                     self.inspect.reset_manifest();
                 }
             }

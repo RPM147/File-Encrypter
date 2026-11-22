@@ -128,6 +128,7 @@ pub fn ui(
         if vault_changed {
             let current = PathBuf::from(state.inspect.vault_path.trim());
             if state.inspect.manifest_vault.as_ref() != Some(&current) {
+                state.clear_preview_and_busy();
                 state.inspect.reset_manifest();
             }
         }

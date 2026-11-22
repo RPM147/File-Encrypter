@@ -51,12 +51,18 @@ fn compare(dir: &Path, args: &[&str], credentials: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
+    if let Err(err) = child
         .stdin
         .take()
         .unwrap()
         .write_all(credentials.as_bytes())
-        .unwrap();
+    {
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected stdin write error: {err}"
+        );
+    }
     child.wait_with_output().unwrap()
 }
 

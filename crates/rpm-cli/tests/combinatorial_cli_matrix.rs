@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EnvelopeMode {
@@ -87,6 +88,7 @@ fn build_fixture(root: &Path) -> (String, String, String, String, String) {
 fn run_cli_24_configs(mode: EnvelopeMode) {
     let progress_modes = ["auto", "always", "never"];
     let mut configs_run = 0usize;
+    let mut wipes_run = 0usize;
 
     for layout in [
         ContainerLayout::Unpadded,
@@ -116,7 +118,9 @@ fn run_cli_24_configs(mode: EnvelopeMode) {
                     let progress = progress_modes[configs_run % progress_modes.len()];
                     let use_rec_out = configs_run.is_multiple_of(2);
                     let use_out_dir = !configs_run.is_multiple_of(3);
-                    let use_wipe = configs_run.is_multiple_of(12) && use_out_dir;
+                    // Configs 4 (Unpadded), 8 (Padded), and 20 (Hidden) all write to `-o` so
+                    // `--wipe` is genuinely exercised across all 3 container layouts.
+                    let use_wipe = matches!(configs_run, 4 | 8 | 20) && use_out_dir;
 
                     let mut args = vec![
                         "encrypt",
@@ -164,6 +168,7 @@ fn run_cli_24_configs(mode: EnvelopeMode) {
 
                     let enc_stdout = ok(&args, secrets);
                     if use_wipe {
+                        wipes_run += 1;
                         assert!(!Path::new(&outer_src).exists());
                         if layout == ContainerLayout::Hidden {
                             assert!(!Path::new(&hidden_src).exists());
@@ -452,6 +457,7 @@ fn run_cli_24_configs(mode: EnvelopeMode) {
     }
 
     assert_eq!(configs_run, 24);
+    assert_eq!(wipes_run, 3);
 }
 
 #[test]
@@ -478,13 +484,27 @@ fn cli_batch_decrypt_diff_password_and_shell_status_matrix() {
     fs::create_dir_all(&dir_a).unwrap();
     fs::create_dir_all(&dir_b).unwrap();
 
-    fs::write(dir_a.join("unchanged.txt"), b"same bytes").unwrap();
+    let unchanged_a = dir_a.join("unchanged.txt");
+    let unchanged_b = dir_b.join("unchanged.txt");
+    fs::write(&unchanged_a, b"same bytes").unwrap();
     fs::write(dir_a.join("changed.txt"), b"before").unwrap();
     fs::write(dir_a.join("removed.txt"), b"only in A").unwrap();
 
-    fs::write(dir_b.join("unchanged.txt"), b"same bytes").unwrap();
+    fs::write(&unchanged_b, b"same bytes").unwrap();
     fs::write(dir_b.join("changed.txt"), b"after-expanded").unwrap();
     fs::write(dir_b.join("added.txt"), b"only in B").unwrap();
+
+    // Pin identical mtime so a wall-clock second tick between the two writes
+    // cannot reclassify `unchanged.txt` as `changed`.
+    let pinned_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for path in [&unchanged_a, &unchanged_b] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(pinned_mtime)
+            .unwrap();
+    }
 
     let kf = root.join("diff.key");
     fs::write(&kf, b"diff-key-material").unwrap();

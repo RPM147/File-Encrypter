@@ -1,7 +1,7 @@
 //! High-level zero-temp-plaintext workflows uniting `rpm-core` v5 and `rpm-storage`.
 
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rpm_core::{
     decrypt_unlocked_stream, encrypt_hidden_stream, encrypt_stream, rekey_stream,
-    unlock_seekable_with_kdf, Auth, EncryptOptions, EncryptSummary, HiddenEncryptOptions,
-    HiddenEncryptSummary, KdfParams, RekeyOptions, SecretKey, VaultMetadata,
+    unlock_seekable_with_kdf, Auth, CryptoError, EncryptOptions, EncryptSummary,
+    HiddenEncryptOptions, HiddenEncryptSummary, KdfParams, RekeyOptions, SecretKey, VaultMetadata,
 };
+use zeroize::Zeroizing;
 
 use crate::atomic::{atomic_write, write_vault};
 use crate::error::StorageError;
@@ -362,23 +363,39 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
     let staging_dir = output_root.join(format!(".rpm_unpack_{}.part", random_hex_6()));
     fs::create_dir(&staging_dir)?;
 
-    let (mut pipe_tx, pipe_rx) = bounded_pipe(8);
+    let (mut pipe_tx, mut pipe_rx) = bounded_pipe(8);
     let staging_owned = staging_dir.clone();
     let cancel_unpack = Arc::clone(&cancel);
     let is_selective = selected_owned.is_some();
     let unpack_handle = thread::spawn(move || -> Result<u64, StorageError> {
-        if let Some(paths) = selected_owned {
+        let count = if let Some(paths) = selected_owned {
             unpack_vault_stream_selected(
-                pipe_rx,
+                &mut pipe_rx,
                 &staging_owned,
                 compressed,
                 &paths,
                 UnpackLimits::default(),
                 Some(&cancel_unpack),
-            )
+            )?
         } else {
-            unpack_vault_stream(pipe_rx, &staging_owned, compressed, Some(&cancel_unpack))
+            unpack_vault_stream(
+                &mut pipe_rx,
+                &staging_owned,
+                compressed,
+                Some(&cancel_unpack),
+            )?
+        };
+        // A tar end marker can precede the final authenticated chunk frame.
+        let mut scratch = Zeroizing::new([0u8; 8192]);
+        loop {
+            if cancel_unpack.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            if pipe_rx.read(&mut *scratch)? == 0 {
+                break;
+            }
         }
+        Ok(count)
     });
 
     let dec_res = decrypt_unlocked_stream(
@@ -392,9 +409,19 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
 
     let unpack_res = unpack_handle
         .join()
-        .map_err(|_| StorageError::Io(std::io::Error::other("unpacker thread panicked")))?;
+        .map_err(|_| StorageError::Io(io::Error::other("unpacker thread panicked")))?;
 
     let verified_count = match (dec_res, unpack_res) {
+        // Early archive/path/limit rejection closes the pipe while the decryptor is writing.
+        (Err(CryptoError::Io(io_err)), Err(unpack_err))
+            if io_err.kind() == io::ErrorKind::BrokenPipe =>
+        {
+            let _ = fs::remove_dir_all(&staging_dir);
+            if created_root {
+                let _ = fs::remove_dir(output_root);
+            }
+            return Err(unpack_err);
+        }
         (Err(e), _) => {
             let _ = fs::remove_dir_all(&staging_dir);
             if created_root {

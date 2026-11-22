@@ -8,6 +8,7 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
     pub fn index(&mut self, n: usize) -> usize {
+        assert!(n > 0, "SplitMix64::index requires non-zero bound");
         (self.next() % n as u64) as usize
     }
     pub fn fill(&mut self, b: &mut [u8]) {
@@ -18,20 +19,33 @@ impl SplitMix64 {
 }
 pub fn corpus(mut run: impl FnMut(usize, &mut SplitMix64)) {
     fn env(name: &str, default: u64) -> u64 {
-        std::env::var(name).map_or(default, |s| {
-            if let Some(hex) = s.strip_prefix("0x") {
-                u64::from_str_radix(hex, 16).unwrap()
-            } else {
-                s.parse().unwrap()
+        match std::env::var(name) {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    default
+                } else if let Some(hex) = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                {
+                    u64::from_str_radix(hex, 16)
+                        .unwrap_or_else(|e| panic!("invalid hex env {name}={trimmed:?}: {e}"))
+                } else {
+                    trimmed
+                        .parse()
+                        .unwrap_or_else(|e| panic!("invalid integer env {name}={trimmed:?}: {e}"))
+                }
             }
-        })
+            Err(_) => default,
+        }
     }
     let seed = env("RPM_FUZZ_SEED", 0x52fe2026);
-    let iters = env("RPM_FUZZ_ITERS", 300);
-    assert!(iters > 0);
+    let iters = usize::try_from(env("RPM_FUZZ_ITERS", 300))
+        .expect("RPM_FUZZ_ITERS exceeds platform usize::MAX");
+    assert!(iters > 0, "RPM_FUZZ_ITERS must be greater than zero");
     println!("seed={seed} iterations={iters}");
     let mut rng = SplitMix64(seed);
-    for iter in 0..iters as usize {
+    for iter in 0..iters {
         if let Err(err) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(iter, &mut rng)))
         {
