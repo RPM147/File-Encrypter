@@ -48,7 +48,7 @@ This document records the **non-negotiable architectural, cryptographic, and gov
 ### `INV-08` — Hostile Archive Extraction Bounds
 - Both disk extraction and RAM-only preview **must** sanitize every tar entry path against traversal (`..`, root prefixes, Windows drive letters, NUL bytes), skip or reject symlinks and hardlinks, skip the target vault file if nested in source paths, and enforce `UnpackLimits` (`max_path_depth = 128`, `max_file_count = 500_000`, `max_total_bytes = 64 GiB`).
 
-### `INV-09` — CI Gates, Dependabot & Solo-Dev `main` Safe Mode
+### `INV-09` — CI Gates, Dependency Auditing & Solo-Dev `main` Safe Mode
 - CI runs `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace --lib`, `cargo test --locked --workspace` (Windows + Linux), and `cargo-deny`.
-- Weekly Dependabot PRs track Cargo and GitHub Actions updates in grouped PRs without bypassing `deny.toml`.
+- Dependency updates are applied explicitly on `main` via `cargo update` (no automated Dependabot PR branches), with `cargo-deny` enforcing RustSec advisory, license, and source checks on every push.
 - **GitHub `main` Branch Ruleset (Solo-Dev Safe Mode):** Configured under **Repository Settings -> Rules -> Rulesets** targeting the **Default branch (`main`)** with **Restrict deletions** and **Block force pushes** enabled (enforcement **Active**), keeping direct fast-forward pushes ergonomic for solo releases while preventing accidental history loss.

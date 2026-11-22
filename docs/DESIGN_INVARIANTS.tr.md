@@ -48,7 +48,7 @@ Bu belge, RPM Encrypter (`v4.4.0+`) için **taviz verilemez mimari, kriptografik
 ### `INV-08` — Kötü Niyetli Arşiv Çıkarma Sınırları
 - Hem diske çıkarma hem RAM-içi önizleme her tar girdisini yol atlamasına (`..`, kök yol, Windows sürücü harfi, NUL baytı) karşı temizlemeli, sembolik/sabit bağlantıları atlamalı/reddetmeli, hedef kasa dosyasının kendi içine paketlenmesini engellemeli ve `UnpackLimits` sınırlarını (`max_path_depth = 128`, `max_file_count = 500_000`, `max_total_bytes = 64 GiB`) zorunlu kılmalıdır.
 
-### `INV-09` — CI Kapıları, Dependabot ve Tek Geliştirici `main` Güvenli Modu
+### `INV-09` — CI Kapıları, Bağımlılık Denetimi ve Tek Geliştirici `main` Güvenli Modu
 - CI; `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace --lib`, `cargo test --locked --workspace` (Windows + Linux) ve `cargo-deny` denetimlerini koşar.
-- Haftalık Dependabot, Cargo ve GitHub Actions güncellemelerini gruplu PR olarak açar; `deny.toml` denetiminden muaf tutulamaz.
+- Bağımlılık güncellemeleri otomatik Dependabot PR dalları açılmadan doğrudan `main` üzerinde `cargo update` ile yapılır; her gönderimde `cargo-deny` güvenlik açığı, lisans ve kaynak denetimini zorunlu kılar.
 - **GitHub `main` Dal Koruması (Tek Geliştirici Güvenli Mod):** **Repository Settings -> Rules -> Rulesets** altında **Default branch (`main`)** için **Restrict deletions** ve **Block force pushes** kuralları **Active** tutulur; böylece normal push akışı yavaşlamadan geçmiş silme/ezme kazaları önlenir.
