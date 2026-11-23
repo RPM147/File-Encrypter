@@ -162,6 +162,7 @@ fn gui_settings_theme_lang_scale_and_all_tabs_headless_render_matrix() {
                 phrase: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
                 entropy: SecretKey::new([7u8; 32]),
                 confirmed: true,
+                queue_after_confirm: false,
             });
             st.show_shell_install_modal = true;
 
@@ -408,6 +409,7 @@ fn gui_drag_drop_shortcuts_launch_and_manifest_filter_matrix() {
         phrase: "one two".into(),
         entropy: SecretKey::new([1u8; 32]),
         confirmed: false,
+        queue_after_confirm: false,
     });
     assert!(st.dismiss_modals());
     assert!(!st.show_shell_install_modal);
@@ -839,7 +841,7 @@ fn gui_workers_all_10_operations_and_bilingual_reports_matrix() {
         AppLanguage::Tr,
     );
     match recv_done(&rx) {
-        WorkerUpdate::RepairDone(msg) => assert!(msg.contains("512")),
+        WorkerUpdate::RepairDone { text: msg, .. } => assert!(msg.contains("512")),
         other => panic!("unexpected: {other:?}"),
     }
     assert_eq!(fs::read(&rs_vault).unwrap(), rs_clean);

@@ -1,8 +1,10 @@
 //! GUI state, launch routing, drag-and-drop triage, and zeroizing field management.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -11,14 +13,17 @@ use rand::Rng;
 use rpm_core::constants::{MAX_CONTAINER_SIZE, MIN_CONTAINER_SIZE};
 use rpm_core::{CryptoError, FileManifestEntry, KdfParams, SecretKey};
 use rpm_storage::config::{
-    default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode,
+    default_config_path, load_config_from, save_config_to, AppConfig, AppLanguage, EncryptProfile,
+    ThemeMode, MAX_ENCRYPT_PROFILES, MAX_IDLE_CLEAR_MINUTES,
 };
 use rpm_storage::shell_integration::{self, ShellIntegrationStatus};
 use rpm_storage::{GuiLaunchIntent, LaunchTab};
 use zeroize::Zeroize;
 
+use crate::estimator::{estimate_encrypt_preflight, EncryptPreflightEstimate, SourceSizeSummary};
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
+use crate::queue::{format_job_label, QueuedJob, QueuedJobKind};
 
 pub const CONTAINER_MIB: u64 = 1024 * 1024;
 pub const CONTAINER_MAX_MIB: u64 = MAX_CONTAINER_SIZE / CONTAINER_MIB;
@@ -93,6 +98,82 @@ pub const UI_SCALE_MIN: u16 = 80;
 pub const UI_SCALE_MAX: u16 = 150;
 pub const UI_SCALE_DEFAULT: u16 = 100;
 
+pub const IDLE_CLEAR_PRESET_MINUTES: [u16; 5] = [0, 1, 5, 15, 30];
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SessionClearReason {
+    ManualPanic,
+    IdleTimeout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCompletedAction {
+    pub summary: String,
+    pub reveal_path: PathBuf,
+    pub verify_vault: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BuiltinEncryptPreset {
+    DailyBackup,
+    LongTermArchiveRs,
+    MaximumPrivacyStealth,
+}
+
+impl BuiltinEncryptPreset {
+    pub const ALL: [BuiltinEncryptPreset; 3] = [
+        Self::DailyBackup,
+        Self::LongTermArchiveRs,
+        Self::MaximumPrivacyStealth,
+    ];
+
+    pub fn localized_label(self, s: &'static Strings) -> &'static str {
+        match self {
+            Self::DailyBackup => s.profile_builtin_daily,
+            Self::LongTermArchiveRs => s.profile_builtin_archive_rs,
+            Self::MaximumPrivacyStealth => s.profile_builtin_stealth,
+        }
+    }
+
+    pub fn to_profile(self, s: &'static Strings) -> EncryptProfile {
+        match self {
+            Self::DailyBackup => EncryptProfile {
+                name: self.localized_label(s).to_owned(),
+                compress: true,
+                stealth: false,
+                reed_solomon: false,
+                secure_wipe: false,
+                container_size_mib: None,
+                save_next_to_source: true,
+                output_dir: String::new(),
+                keyfile_path: None,
+            },
+            Self::LongTermArchiveRs => EncryptProfile {
+                name: self.localized_label(s).to_owned(),
+                compress: true,
+                stealth: false,
+                reed_solomon: true,
+                secure_wipe: false,
+                container_size_mib: None,
+                save_next_to_source: true,
+                output_dir: String::new(),
+                keyfile_path: None,
+            },
+            Self::MaximumPrivacyStealth => EncryptProfile {
+                name: self.localized_label(s).to_owned(),
+                compress: true,
+                stealth: true,
+                reed_solomon: false,
+                secure_wipe: false,
+                container_size_mib: Some(100),
+                save_next_to_source: true,
+                output_dir: String::new(),
+                keyfile_path: None,
+            },
+        }
+    }
+}
+
 pub const ARGON_ITERATIONS_RANGE: RangeInclusive<u32> = 1..=10;
 pub const ARGON_PARALLELISM_RANGE: RangeInclusive<u32> = 1..=16;
 
@@ -163,9 +244,11 @@ pub enum WorkerUpdate {
     Log(String),
     EncryptDone {
         status: String,
+        output_path: PathBuf,
     },
     DecryptDone {
         status: String,
+        output_path: Option<PathBuf>,
     },
     InspectDone {
         text: String,
@@ -173,7 +256,10 @@ pub enum WorkerUpdate {
         manifest: Vec<FileManifestEntry>,
         vault_path: PathBuf,
     },
-    RepairDone(String),
+    RepairDone {
+        text: String,
+        vault_path: PathBuf,
+    },
     IntegrityDone {
         sha256_only: bool,
         text: String,
@@ -185,6 +271,12 @@ pub enum WorkerUpdate {
     },
     RekeyDone {
         status: String,
+        vault_path: PathBuf,
+    },
+    SourceScanDone {
+        gen: u64,
+        outer: SourceSizeSummary,
+        hidden: SourceSizeSummary,
     },
     Error(String),
 }
@@ -193,6 +285,7 @@ pub struct RecoveryPrompt {
     pub phrase: String,
     pub entropy: SecretKey,
     pub confirmed: bool,
+    pub queue_after_confirm: bool,
 }
 
 impl Drop for RecoveryPrompt {
@@ -223,6 +316,14 @@ pub struct EncryptFields {
     pub hidden_confirm_password: String,
     pub show_hidden_password: bool,
     pub hidden_compress: bool,
+    pub profile_name_input: String,
+    pub selected_profile_name: Option<String>,
+    pub preflight_outer: SourceSizeSummary,
+    pub preflight_hidden: SourceSizeSummary,
+    pub preflight_scanning: bool,
+    pub(crate) preflight_scan_gen: u64,
+    pub(crate) preflight_scan_cancel: Option<Arc<AtomicBool>>,
+    pub(crate) preflight_scanned_key: (Vec<PathBuf>, Vec<PathBuf>),
 }
 
 impl EncryptFields {
@@ -266,10 +367,52 @@ impl EncryptFields {
         }
         added
     }
+
+    pub fn current_profile_snapshot(
+        &self,
+        name: String,
+    ) -> Result<EncryptProfile, ContainerSizeError> {
+        let container_size_mib = self
+            .container_preset
+            .resolve_bytes(&self.container_custom_mb)?
+            .map(|bytes| bytes / CONTAINER_MIB);
+        Ok(EncryptProfile {
+            name,
+            compress: self.compress,
+            stealth: self.stealth,
+            reed_solomon: self.reed_solomon,
+            secure_wipe: self.secure_wipe,
+            container_size_mib,
+            save_next_to_source: self.save_next_to_source,
+            output_dir: self.output_dir.clone(),
+            keyfile_path: self.keyfile.clone(),
+        })
+    }
+
+    pub fn preflight_estimate(&self) -> EncryptPreflightEstimate {
+        estimate_encrypt_preflight(
+            &self.preflight_outer,
+            &self.preflight_hidden,
+            self.enable_hidden,
+            self.compress,
+            self.hidden_compress,
+            self.reed_solomon,
+            self.container_preset,
+            &self.container_custom_mb,
+        )
+    }
+
+    pub fn cancel_preflight_scan(&mut self) {
+        if let Some(flag) = self.preflight_scan_cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.preflight_scanning = false;
+    }
 }
 
 impl Drop for EncryptFields {
     fn drop(&mut self) {
+        self.cancel_preflight_scan();
         self.password.zeroize();
         self.confirm_password.zeroize();
         self.hidden_password.zeroize();
@@ -504,6 +647,14 @@ pub struct AppState {
     pub shell_status: ShellIntegrationStatus,
     pub show_shell_install_modal: bool,
     pub clipboard_deadline: Option<Instant>,
+    pub last_activity: Instant,
+    pub last_action: Option<LastCompletedAction>,
+    pub job_queue: VecDeque<QueuedJob>,
+    pub queue_paused: bool,
+    pub active_queue_job: Option<String>,
+    pub queue_completed: usize,
+    pub queue_failed: usize,
+    next_queue_id: u64,
     pub encrypt: EncryptFields,
     pub decrypt: DecryptFields,
     pub inspect: InspectFields,
@@ -530,6 +681,7 @@ impl AppState {
     /// config path without reading host `%APPDATA%` preferences or querying the OS registry.
     pub fn from_config(mut config: AppConfig, config_path: Option<PathBuf>) -> Self {
         config.ui_scale_percent = clamp_ui_scale_percent(config.ui_scale_percent);
+        config.idle_clear_minutes = config.idle_clear_minutes.min(MAX_IDLE_CLEAR_MINUTES);
         if config.kdf_params().validate().is_err() {
             let defaults = KdfParams::owasp_default();
             config.argon_memory_kib = defaults.memory_kib;
@@ -558,6 +710,14 @@ impl AppState {
             },
             show_shell_install_modal: false,
             clipboard_deadline: None,
+            last_activity: Instant::now(),
+            last_action: None,
+            job_queue: VecDeque::new(),
+            queue_paused: false,
+            active_queue_job: None,
+            queue_completed: 0,
+            queue_failed: 0,
+            next_queue_id: 1,
             encrypt: EncryptFields {
                 reed_solomon: false,
                 stealth: false,
@@ -580,6 +740,14 @@ impl AppState {
                 hidden_confirm_password: String::new(),
                 show_hidden_password: false,
                 hidden_compress: compress,
+                profile_name_input: String::new(),
+                selected_profile_name: None,
+                preflight_outer: SourceSizeSummary::default(),
+                preflight_hidden: SourceSizeSummary::default(),
+                preflight_scanning: false,
+                preflight_scan_gen: 0,
+                preflight_scan_cancel: None,
+                preflight_scanned_key: (Vec::new(), Vec::new()),
             },
             decrypt: DecryptFields {
                 vaults: Vec::new(),
@@ -714,6 +882,7 @@ impl AppState {
             return Err(msg);
         }
         self.config.ui_scale_percent = clamp_ui_scale_percent(self.config.ui_scale_percent);
+        self.config.idle_clear_minutes = self.config.idle_clear_minutes.min(MAX_IDLE_CLEAR_MINUTES);
         if let Some(ref p) = self.config_path {
             match save_config_to(p, &self.config) {
                 Ok(()) => self.set_status(s.status_prefs_saved, false),
@@ -751,6 +920,294 @@ impl AppState {
         self.rekey.current_password.zeroize();
         self.rekey.new_password.zeroize();
         self.rekey.confirm_password.zeroize();
+    }
+
+    pub fn clear_inspect_secrets(&mut self) {
+        self.inspect.password.zeroize();
+        self.inspect.recovery_phrase.zeroize();
+    }
+
+    pub fn has_sensitive_session_data(&self) -> bool {
+        let inspect_non_default = !self.inspect.results.is_empty()
+            && self.inspect.results != i18n::TR.ins_default_results
+            && self.inspect.results != i18n::EN.ins_default_results;
+        let diff_non_default = !self.diff.results.is_empty()
+            && self.diff.results != i18n::TR.diff_default_results
+            && self.diff.results != i18n::EN.diff_default_results;
+
+        !self.encrypt.password.is_empty()
+            || !self.encrypt.confirm_password.is_empty()
+            || !self.encrypt.hidden_password.is_empty()
+            || !self.encrypt.hidden_confirm_password.is_empty()
+            || self.encrypt.recovery_prompt.is_some()
+            || !self.decrypt.password.is_empty()
+            || !self.decrypt.recovery_phrase.is_empty()
+            || !self.inspect.password.is_empty()
+            || !self.inspect.recovery_phrase.is_empty()
+            || self.inspect.preview.is_some()
+            || self.inspect.preview_pending.is_some()
+            || !self.inspect.manifest.is_empty()
+            || self.inspect.manifest_vault.is_some()
+            || inspect_non_default
+            || !self.diff.password_a.is_empty()
+            || !self.diff.recovery_phrase_a.is_empty()
+            || !self.diff.password_b.is_empty()
+            || !self.diff.recovery_phrase_b.is_empty()
+            || diff_non_default
+            || !self.rekey.current_password.is_empty()
+            || !self.rekey.new_password.is_empty()
+            || !self.rekey.confirm_password.is_empty()
+            || !self.pwgen.generated.is_empty()
+            || !self.logs.is_empty()
+            || !self.job_queue.is_empty()
+            || self.last_action.is_some()
+    }
+
+    /// Clear all in-app secrets, previews, loaded manifests, logs, pending queue, and quick action
+    /// banners. Never alters `clipboard_deadline` or overwrites the OS clipboard.
+    pub fn clear_sensitive_session(&mut self, reason: SessionClearReason) {
+        self.clear_encrypt_secrets();
+        self.clear_decrypt_secrets();
+        self.clear_inspect_secrets();
+        self.clear_diff_secrets();
+        self.clear_rekey_secrets();
+        self.pwgen.generated.zeroize();
+        self.clear_preview_and_busy();
+        self.show_shell_install_modal = false;
+        let s = self.strings();
+        self.inspect.reset_manifest();
+        self.inspect.results = s.ins_default_results.into();
+        self.diff.results = s.diff_default_results.into();
+        self.logs.clear();
+        self.job_queue.clear();
+        self.queue_paused = false;
+        self.queue_completed = 0;
+        self.queue_failed = 0;
+        self.last_action = None;
+        self.last_activity = Instant::now();
+        let msg = match reason {
+            SessionClearReason::ManualPanic => s.status_session_cleared_panic,
+            SessionClearReason::IdleTimeout => s.status_session_cleared_idle,
+        };
+        self.set_status(msg, false);
+    }
+
+    pub fn note_activity(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    pub fn check_idle_timeout(&mut self, now: Instant) -> bool {
+        if self.config.idle_clear_minutes == 0 {
+            return false;
+        }
+        if self.busy && self.inspect.preview_pending.is_none() {
+            self.last_activity = now;
+            return false;
+        }
+        if !self.has_sensitive_session_data() {
+            return false;
+        }
+        let limit = Duration::from_secs(u64::from(self.config.idle_clear_minutes) * 60);
+        if now.saturating_duration_since(self.last_activity) >= limit {
+            self.clear_sensitive_session(SessionClearReason::IdleTimeout);
+            return true;
+        }
+        false
+    }
+
+    pub fn apply_encrypt_profile(&mut self, profile: &EncryptProfile) {
+        self.encrypt.compress = profile.compress;
+        if profile.stealth {
+            self.encrypt.set_stealth(true);
+        } else if profile.reed_solomon {
+            self.encrypt.set_reed_solomon(true);
+        } else {
+            self.encrypt.stealth = false;
+            self.encrypt.reed_solomon = false;
+        }
+        self.encrypt.secure_wipe = profile.secure_wipe;
+        self.encrypt.save_next_to_source = profile.save_next_to_source;
+        self.encrypt.output_dir = profile.output_dir.clone();
+        self.encrypt.keyfile = profile.keyfile_path.clone();
+
+        match profile.container_size_mib {
+            None => {
+                if self.encrypt.enable_hidden {
+                    self.encrypt.container_preset = ContainerSizePreset::MiB50;
+                } else {
+                    self.encrypt.container_preset = ContainerSizePreset::Auto;
+                }
+            }
+            Some(10) => self.encrypt.container_preset = ContainerSizePreset::MiB10,
+            Some(50) => self.encrypt.container_preset = ContainerSizePreset::MiB50,
+            Some(100) => self.encrypt.container_preset = ContainerSizePreset::MiB100,
+            Some(500) => self.encrypt.container_preset = ContainerSizePreset::MiB500,
+            Some(mib) => {
+                self.encrypt.container_preset = ContainerSizePreset::Custom;
+                self.encrypt.container_custom_mb = mib.to_string();
+            }
+        }
+
+        self.encrypt.selected_profile_name = Some(profile.name.clone());
+        let msg = self.strings().status_profile_applied;
+        self.set_status(msg, false);
+    }
+
+    pub fn save_current_encrypt_profile(&mut self, name: &str) -> Result<(), &'static str> {
+        let s = self.strings();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.set_status(s.err_profile_empty_name, true);
+            return Err(s.err_profile_empty_name);
+        }
+        let mut profile = self
+            .encrypt
+            .current_profile_snapshot(trimmed.to_owned())
+            .map_err(|err| {
+                let msg = match err {
+                    ContainerSizeError::InvalidCustomValue => s.err_container_invalid_mb,
+                    ContainerSizeError::OutOfRange => s.err_container_out_of_range,
+                    ContainerSizeError::RequiredForHidden => s.err_hidden_requires_container,
+                };
+                self.set_status(msg, true);
+                msg
+            })?;
+        profile.sanitize();
+
+        if let Some(pos) = self
+            .config
+            .encrypt_profiles
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(trimmed))
+        {
+            self.config.encrypt_profiles[pos] = profile;
+        } else if self.config.encrypt_profiles.len() >= MAX_ENCRYPT_PROFILES {
+            self.set_status(s.err_profile_limit, true);
+            return Err(s.err_profile_limit);
+        } else {
+            self.config.encrypt_profiles.push(profile);
+        }
+
+        self.encrypt.selected_profile_name = Some(trimmed.to_owned());
+        self.encrypt.profile_name_input.clear();
+        self.persist_config_best_effort();
+        self.set_status(s.status_profile_saved, false);
+        Ok(())
+    }
+
+    pub fn delete_encrypt_profile(&mut self, name: &str) -> bool {
+        let before = self.config.encrypt_profiles.len();
+        self.config
+            .encrypt_profiles
+            .retain(|p| !p.name.eq_ignore_ascii_case(name));
+        if self.config.encrypt_profiles.len() == before {
+            return false;
+        }
+        if self
+            .encrypt
+            .selected_profile_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            self.encrypt.selected_profile_name = None;
+        }
+        self.persist_config_best_effort();
+        let msg = self.strings().status_profile_deleted;
+        self.set_status(msg, false);
+        true
+    }
+
+    pub fn enqueue_job(&mut self, kind: QueuedJobKind) -> u64 {
+        if self.job_queue.is_empty() && self.active_queue_job.is_none() {
+            self.queue_completed = 0;
+            self.queue_failed = 0;
+        }
+        let id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.wrapping_add(1).max(1);
+        let label = format_job_label(&kind, self.config.language);
+        self.job_queue.push_back(QueuedJob {
+            id,
+            label: label.clone(),
+            kind,
+        });
+        let s = self.strings();
+        self.push_log(format!("{}: {label}", s.status_job_enqueued));
+        self.set_status(s.status_job_enqueued, false);
+        id
+    }
+
+    pub fn pop_next_queued_job(&mut self) -> Option<QueuedJob> {
+        self.job_queue.pop_front()
+    }
+
+    pub fn remove_queued_job(&mut self, id: u64) -> bool {
+        let Some(pos) = self.job_queue.iter().position(|j| j.id == id) else {
+            return false;
+        };
+        self.job_queue.remove(pos);
+        true
+    }
+
+    pub fn move_queued_job_up(&mut self, idx: usize) -> bool {
+        if idx == 0 || idx >= self.job_queue.len() {
+            return false;
+        }
+        self.job_queue.swap(idx - 1, idx);
+        true
+    }
+
+    pub fn move_queued_job_down(&mut self, idx: usize) -> bool {
+        if idx + 1 >= self.job_queue.len() {
+            return false;
+        }
+        self.job_queue.swap(idx, idx + 1);
+        true
+    }
+
+    pub fn clear_pending_queue(&mut self) -> usize {
+        let n = self.job_queue.len();
+        self.job_queue.clear();
+        if self.active_queue_job.is_none() {
+            self.queue_paused = false;
+        }
+        n
+    }
+
+    pub fn trigger_preflight_scan_if_needed(
+        &mut self,
+        ctx: &egui::Context,
+        tx: &mpsc::Sender<WorkerUpdate>,
+    ) {
+        let current_key = (
+            self.encrypt.sources.clone(),
+            self.encrypt.hidden_sources.clone(),
+        );
+        if current_key == self.encrypt.preflight_scanned_key {
+            return;
+        }
+        self.encrypt.preflight_scanned_key = current_key.clone();
+        self.encrypt.cancel_preflight_scan();
+        self.encrypt.preflight_scan_gen = self.encrypt.preflight_scan_gen.wrapping_add(1);
+
+        if current_key.0.is_empty() && current_key.1.is_empty() {
+            self.encrypt.preflight_outer = SourceSizeSummary::default();
+            self.encrypt.preflight_hidden = SourceSizeSummary::default();
+            self.encrypt.preflight_scanning = false;
+            return;
+        }
+
+        let gen = self.encrypt.preflight_scan_gen;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.encrypt.preflight_scan_cancel = Some(Arc::clone(&cancel));
+        self.encrypt.preflight_scanning = true;
+        crate::worker::spawn_source_scan(
+            ctx.clone(),
+            tx.clone(),
+            cancel,
+            gen,
+            current_key.0,
+            current_key.1,
+        );
     }
 
     pub fn clear_preview_and_busy(&mut self) -> bool {

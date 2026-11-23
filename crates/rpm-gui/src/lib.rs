@@ -1,7 +1,10 @@
 pub mod app;
+pub mod estimator;
 pub mod fonts;
 pub mod i18n;
 pub mod progress;
+pub mod queue;
+pub mod reveal;
 pub mod state;
 pub mod tabs;
 pub mod theme;

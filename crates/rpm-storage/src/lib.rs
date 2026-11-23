@@ -16,7 +16,7 @@ pub mod wiper;
 pub mod workflow;
 
 pub use atomic::atomic_write;
-pub use config::{load_config_from, save_config_to, AppConfig, ThemeMode};
+pub use config::{load_config_from, save_config_to, AppConfig, EncryptProfile, ThemeMode};
 pub use error::StorageError;
 pub use launch::{parse_gui_launch_args, GuiLaunchIntent, LaunchTab};
 pub use packager::UnpackLimits;

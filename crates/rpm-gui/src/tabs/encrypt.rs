@@ -6,12 +6,16 @@ use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 use rpm_core::{entropy_to_mnemonic, generate_recovery_entropy};
+use rpm_storage::config::AppLanguage;
 use zeroize::Zeroizing;
 
+use crate::estimator::ContainerFitStatus;
 use crate::i18n::Strings;
+use crate::progress::format_bytes;
+use crate::queue::QueuedJobKind;
 use crate::state::{
-    strength_label_and_color_for, AppState, ContainerSizeError, ContainerSizePreset,
-    RecoveryPrompt, Tab, WorkerUpdate,
+    strength_label_and_color_for, AppState, BuiltinEncryptPreset, ContainerSizeError,
+    ContainerSizePreset, RecoveryPrompt, Tab, WorkerUpdate,
 };
 use crate::{theme, worker};
 
@@ -94,6 +98,273 @@ fn render_source_list(
     }
 }
 
+fn open_recovery_prompt(state: &mut AppState, s: &'static Strings, queue_after_confirm: bool) {
+    if let Err(err_msg) = validate_encrypt_inputs(state, s) {
+        state.set_status(err_msg, true);
+        return;
+    }
+    let entropy = generate_recovery_entropy();
+    match entropy_to_mnemonic(&entropy) {
+        Ok(phrase) => {
+            state.encrypt.recovery_prompt = Some(RecoveryPrompt {
+                phrase: phrase.to_string(),
+                entropy,
+                confirmed: false,
+                queue_after_confirm,
+            });
+        }
+        Err(e) => state.set_status(e.to_string(), true),
+    }
+}
+
+fn format_scan_summary(
+    count: u64,
+    bytes: u64,
+    lang: AppLanguage,
+    label_tr: &str,
+    label_en: &str,
+) -> String {
+    match lang {
+        AppLanguage::Tr => format!("{label_tr}: {count} dosya ({})", format_bytes(bytes)),
+        AppLanguage::En => format!("{label_en}: {count} file(s) ({})", format_bytes(bytes)),
+    }
+}
+
+fn render_profile_card(ui: &mut egui::Ui, state: &mut AppState, s: &'static Strings) {
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.lbl_profile);
+            let selected_text = state
+                .encrypt
+                .selected_profile_name
+                .as_deref()
+                .unwrap_or(s.profile_custom_none);
+            let mut apply_profile = None;
+            egui::ComboBox::from_id_salt("enc_profile_combo")
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    for preset in BuiltinEncryptPreset::ALL {
+                        let label = preset.localized_label(s);
+                        let is_selected =
+                            state.encrypt.selected_profile_name.as_deref() == Some(label);
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            apply_profile = Some(preset.to_profile(s));
+                        }
+                    }
+                    if !state.config.encrypt_profiles.is_empty() {
+                        ui.separator();
+                        for prof in &state.config.encrypt_profiles {
+                            let is_selected = state
+                                .encrypt
+                                .selected_profile_name
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&prof.name));
+                            if ui.selectable_label(is_selected, &prof.name).clicked() {
+                                apply_profile = Some(prof.clone());
+                            }
+                        }
+                    }
+                });
+            if let Some(prof) = apply_profile {
+                state.apply_encrypt_profile(&prof);
+            }
+
+            ui.add(
+                egui::TextEdit::singleline(&mut state.encrypt.profile_name_input)
+                    .hint_text(s.profile_name_hint)
+                    .desired_width(150.0),
+            );
+            if ui.button(s.btn_save_profile).clicked() {
+                let name = state.encrypt.profile_name_input.clone();
+                let _ = state.save_current_encrypt_profile(&name);
+            }
+            let selected_is_user =
+                state
+                    .encrypt
+                    .selected_profile_name
+                    .as_deref()
+                    .is_some_and(|sel| {
+                        state
+                            .config
+                            .encrypt_profiles
+                            .iter()
+                            .any(|p| p.name.eq_ignore_ascii_case(sel))
+                    });
+            if selected_is_user && ui.button(s.btn_delete_profile).clicked() {
+                if let Some(name) = state.encrypt.selected_profile_name.clone() {
+                    state.delete_encrypt_profile(&name);
+                }
+            }
+        });
+        ui.weak(s.profile_note);
+    });
+}
+
+fn render_preflight_card(ui: &mut egui::Ui, state: &AppState, s: &'static Strings) {
+    if state.encrypt.sources.is_empty()
+        && !(state.encrypt.enable_hidden && !state.encrypt.hidden_sources.is_empty())
+    {
+        return;
+    }
+    ui.add_space(10.0);
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        ui.strong(s.preflight_heading);
+        if state.encrypt.preflight_scanning {
+            ui.weak(s.preflight_scanning);
+            return;
+        }
+        let est = state.encrypt.preflight_estimate();
+        let lang = state.config.language;
+        let outer_summary = format_scan_summary(
+            est.outer.file_count,
+            est.outer.raw_bytes,
+            lang,
+            "Dış kaynak",
+            "Outer sources",
+        );
+        if state.encrypt.enable_hidden {
+            let hidden_summary = format_scan_summary(
+                est.hidden.file_count,
+                est.hidden.raw_bytes,
+                lang,
+                "Gizli kaynak",
+                "Hidden sources",
+            );
+            ui.label(format!("{outer_summary}  •  {hidden_summary}"));
+        } else {
+            ui.label(outer_summary);
+        }
+
+        if est.outer.truncated
+            || est.hidden.truncated
+            || est.outer.skipped_symlinks > 0
+            || est.hidden.skipped_symlinks > 0
+            || est.outer.unreadable_entries > 0
+            || est.hidden.unreadable_entries > 0
+        {
+            let skipped = est.outer.skipped_symlinks + est.hidden.skipped_symlinks;
+            let unreadable = est.outer.unreadable_entries + est.hidden.unreadable_entries;
+            let truncated = est.outer.truncated || est.hidden.truncated;
+            let note = match lang {
+                AppLanguage::Tr => format!(
+                    "Tarama notu: atlanan sembolik bağ={skipped}, okunamayan={unreadable}{}",
+                    if truncated { ", sınırda kesildi" } else { "" }
+                ),
+                AppLanguage::En => format!(
+                    "Scan note: skipped symlinks={skipped}, unreadable={unreadable}{}",
+                    if truncated {
+                        ", truncated at limit"
+                    } else {
+                        ""
+                    }
+                ),
+            };
+            ui.weak(note);
+        }
+
+        let output_line = if state.encrypt.reed_solomon {
+            format!(
+                "{} ~{}  ({} +{})",
+                s.preflight_est_output,
+                format_bytes(est.estimated_disk_bytes),
+                s.preflight_rs_overhead,
+                format_bytes(est.rs_overhead_bytes)
+            )
+        } else {
+            format!(
+                "{} ~{}",
+                s.preflight_est_output,
+                format_bytes(est.estimated_disk_bytes)
+            )
+        };
+        ui.label(output_line);
+
+        match est.fit {
+            ContainerFitStatus::NoContainer => {}
+            ContainerFitStatus::InvalidContainer(err) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 80, 80),
+                    container_size_error_msg(err, s),
+                );
+            }
+            ContainerFitStatus::Fits {
+                used_bytes,
+                container_bytes,
+                free_bytes,
+            } => {
+                let frac = (used_bytes as f32 / container_bytes.max(1) as f32).clamp(0.0, 1.0);
+                let fill = egui::Color32::from_rgb(20, 184, 166);
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(frac).desired_width(180.0).fill(fill));
+                    let msg = match lang {
+                        AppLanguage::Tr => {
+                            format!("{} (~{} boş)", s.preflight_fit_ok, format_bytes(free_bytes))
+                        }
+                        AppLanguage::En => {
+                            format!(
+                                "{} (~{} free)",
+                                s.preflight_fit_ok,
+                                format_bytes(free_bytes)
+                            )
+                        }
+                    };
+                    ui.colored_label(fill, msg);
+                });
+            }
+            ContainerFitStatus::CompressionDependent {
+                required_uncompressed,
+                container_bytes,
+                suggested_mib,
+            } => {
+                let amber = egui::Color32::from_rgb(225, 175, 50);
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(1.0).desired_width(180.0).fill(amber));
+                    let msg = match lang {
+                        AppLanguage::Tr => format!(
+                            "{}: ~{} > {} — güvenli öneri: >= {suggested_mib} MiB",
+                            s.preflight_fit_comp,
+                            format_bytes(required_uncompressed),
+                            format_bytes(container_bytes)
+                        ),
+                        AppLanguage::En => format!(
+                            "{}: ~{} > {} — safe minimum: >= {suggested_mib} MiB",
+                            s.preflight_fit_comp,
+                            format_bytes(required_uncompressed),
+                            format_bytes(container_bytes)
+                        ),
+                    };
+                    ui.colored_label(amber, msg);
+                });
+            }
+            ContainerFitStatus::ExceedsContainer {
+                required_bytes,
+                container_bytes,
+                suggested_mib,
+            } => {
+                let red = egui::Color32::from_rgb(230, 80, 80);
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(1.0).desired_width(180.0).fill(red));
+                    let msg = match lang {
+                        AppLanguage::Tr => format!(
+                            "{}: ~{} > {} — en az {suggested_mib} MiB seçin",
+                            s.preflight_fit_exceeds,
+                            format_bytes(required_bytes),
+                            format_bytes(container_bytes)
+                        ),
+                        AppLanguage::En => format!(
+                            "{}: ~{} > {} — choose at least {suggested_mib} MiB",
+                            s.preflight_fit_exceeds,
+                            format_bytes(required_bytes),
+                            format_bytes(container_bytes)
+                        ),
+                    };
+                    ui.colored_label(red, msg);
+                });
+            }
+        }
+    });
+}
+
 pub fn ui(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -101,6 +372,7 @@ pub fn ui(
     tx: &mpsc::Sender<WorkerUpdate>,
     cancel: &Arc<AtomicBool>,
 ) {
+    state.trigger_preflight_scan_if_needed(ctx, tx);
     let s = state.strings();
     ui.heading(s.enc_heading);
     ui.add_space(8.0);
@@ -132,6 +404,9 @@ pub fn ui(
             s.btn_remove,
         );
     });
+
+    ui.add_space(10.0);
+    render_profile_card(ui, state, s);
 
     ui.add_space(10.0);
     theme::card_frame(ui.visuals()).show(ui, |ui| {
@@ -372,27 +647,20 @@ pub fn ui(
             });
     });
 
+    render_preflight_card(ui, state, s);
+
     ui.add_space(12.0);
-    ui.add_enabled_ui(!state.busy, |ui| {
-        if ui
-            .add(theme::primary_button(s.btn_encrypt_now, ui.visuals()))
-            .clicked()
-        {
-            if let Err(err_msg) = validate_encrypt_inputs(state, s) {
-                state.set_status(err_msg, true);
-                return;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!state.busy, |ui| {
+            if ui
+                .add(theme::primary_button(s.btn_encrypt_now, ui.visuals()))
+                .clicked()
+            {
+                open_recovery_prompt(state, s, false);
             }
-            let entropy = generate_recovery_entropy();
-            match entropy_to_mnemonic(&entropy) {
-                Ok(phrase) => {
-                    state.encrypt.recovery_prompt = Some(RecoveryPrompt {
-                        phrase: phrase.to_string(),
-                        entropy,
-                        confirmed: false,
-                    });
-                }
-                Err(e) => state.set_status(e.to_string(), true),
-            }
+        });
+        if ui.button(s.btn_add_to_queue).clicked() {
+            open_recovery_prompt(state, s, true);
         }
     });
 
@@ -464,60 +732,112 @@ pub fn ui(
             } else {
                 Some(PathBuf::from(state.encrypt.output_dir.trim()))
             };
-            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-            if state.encrypt.enable_hidden {
-                let Some(container_size_bytes) = container_size else {
-                    state.set_status(s.err_hidden_requires_container, true);
-                    return;
-                };
-                state.begin_transfer(s.status_enc_hidden_running);
-                let decoy_pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
-                let hidden_pw = Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
-                state.clear_encrypt_secrets();
-                worker::spawn_encrypt_hidden(
-                    ctx.clone(),
-                    tx.clone(),
-                    Arc::clone(cancel),
-                    state.encrypt.sources.clone(),
-                    state.encrypt.hidden_sources.clone(),
-                    decoy_pw,
-                    hidden_pw,
-                    prompt.entropy.clone(),
-                    state.encrypt.keyfile.clone(),
-                    state.encrypt.hidden_keyfile.clone(),
-                    out_dir,
-                    state.encrypt.compress,
-                    state.encrypt.hidden_compress,
-                    container_size_bytes,
-                    state.encrypt.stealth,
-                    state.encrypt.reed_solomon,
-                    state.encrypt.secure_wipe,
-                    state.config.wipe_passes,
-                    state.config.kdf_params(),
-                    state.config.language,
-                );
+            if prompt.queue_after_confirm {
+                if state.encrypt.enable_hidden {
+                    let Some(container_size_bytes) = container_size else {
+                        state.set_status(s.err_hidden_requires_container, true);
+                        return;
+                    };
+                    let decoy_pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
+                    let hidden_pw =
+                        Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
+                    let decoy_sources = std::mem::take(&mut state.encrypt.sources);
+                    let hidden_sources = std::mem::take(&mut state.encrypt.hidden_sources);
+                    state.clear_encrypt_secrets();
+                    state.enqueue_job(QueuedJobKind::EncryptHidden {
+                        decoy_sources,
+                        hidden_sources,
+                        decoy_password: decoy_pw,
+                        hidden_password: hidden_pw,
+                        decoy_recovery_entropy: prompt.entropy.clone(),
+                        decoy_keyfile: state.encrypt.keyfile.clone(),
+                        hidden_keyfile: state.encrypt.hidden_keyfile.clone(),
+                        output_dir: out_dir,
+                        decoy_compressed: state.encrypt.compress,
+                        hidden_compressed: state.encrypt.hidden_compress,
+                        container_size_bytes,
+                        stealth: state.encrypt.stealth,
+                        reed_solomon: state.encrypt.reed_solomon,
+                        secure_wipe: state.encrypt.secure_wipe,
+                        wipe_passes: state.config.wipe_passes,
+                        kdf: state.config.kdf_params(),
+                    });
+                } else {
+                    let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
+                    let sources = std::mem::take(&mut state.encrypt.sources);
+                    state.clear_encrypt_secrets();
+                    state.enqueue_job(QueuedJobKind::Encrypt {
+                        sources,
+                        password: pw,
+                        recovery_entropy: prompt.entropy.clone(),
+                        keyfile: state.encrypt.keyfile.clone(),
+                        output_dir: out_dir,
+                        compress: state.encrypt.compress,
+                        container_size_bytes: container_size,
+                        stealth: state.encrypt.stealth,
+                        reed_solomon: state.encrypt.reed_solomon,
+                        secure_wipe: state.encrypt.secure_wipe,
+                        wipe_passes: state.config.wipe_passes,
+                        kdf: state.config.kdf_params(),
+                    });
+                }
             } else {
-                state.begin_transfer(s.status_enc_running);
-                let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
-                state.clear_encrypt_secrets();
-                worker::spawn_encrypt(
-                    ctx.clone(),
-                    tx.clone(),
-                    Arc::clone(cancel),
-                    state.encrypt.sources.clone(),
-                    pw,
-                    prompt.entropy.clone(),
-                    state.encrypt.keyfile.clone(),
-                    out_dir,
-                    state.encrypt.compress,
-                    container_size,
-                    state.encrypt.stealth,
-                    state.encrypt.reed_solomon,
-                    state.encrypt.secure_wipe,
-                    state.config.wipe_passes,
-                    state.config.kdf_params(),
-                    state.config.language,
-                );
+                cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                if state.encrypt.enable_hidden {
+                    let Some(container_size_bytes) = container_size else {
+                        state.set_status(s.err_hidden_requires_container, true);
+                        return;
+                    };
+                    state.begin_transfer(s.status_enc_hidden_running);
+                    let decoy_pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
+                    let hidden_pw =
+                        Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
+                    state.clear_encrypt_secrets();
+                    worker::spawn_encrypt_hidden(
+                        ctx.clone(),
+                        tx.clone(),
+                        Arc::clone(cancel),
+                        state.encrypt.sources.clone(),
+                        state.encrypt.hidden_sources.clone(),
+                        decoy_pw,
+                        hidden_pw,
+                        prompt.entropy.clone(),
+                        state.encrypt.keyfile.clone(),
+                        state.encrypt.hidden_keyfile.clone(),
+                        out_dir,
+                        state.encrypt.compress,
+                        state.encrypt.hidden_compress,
+                        container_size_bytes,
+                        state.encrypt.stealth,
+                        state.encrypt.reed_solomon,
+                        state.encrypt.secure_wipe,
+                        state.config.wipe_passes,
+                        state.config.kdf_params(),
+                        state.config.language,
+                    );
+                } else {
+                    state.begin_transfer(s.status_enc_running);
+                    let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
+                    state.clear_encrypt_secrets();
+                    worker::spawn_encrypt(
+                        ctx.clone(),
+                        tx.clone(),
+                        Arc::clone(cancel),
+                        state.encrypt.sources.clone(),
+                        pw,
+                        prompt.entropy.clone(),
+                        state.encrypt.keyfile.clone(),
+                        out_dir,
+                        state.encrypt.compress,
+                        container_size,
+                        state.encrypt.stealth,
+                        state.encrypt.reed_solomon,
+                        state.encrypt.secure_wipe,
+                        state.config.wipe_passes,
+                        state.config.kdf_params(),
+                        state.config.language,
+                    );
+                }
             }
         }
     }

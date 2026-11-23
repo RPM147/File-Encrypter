@@ -7,8 +7,66 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 use zeroize::Zeroizing;
 
+use crate::i18n::Strings;
+use crate::queue::QueuedJobKind;
 use crate::state::{AppState, Tab, WorkerUpdate};
 use crate::{theme, worker};
+
+struct ValidatedDecryptRequest {
+    vaults: Vec<PathBuf>,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+}
+
+fn take_validated_decrypt_request(
+    state: &mut AppState,
+    s: &'static Strings,
+) -> Option<ValidatedDecryptRequest> {
+    if state.decrypt.vaults.is_empty() {
+        state.set_status(s.err_select_vaults, true);
+        return None;
+    }
+    let empty_secret = if state.decrypt.use_recovery {
+        state.decrypt.recovery_phrase.trim().is_empty()
+    } else {
+        state.decrypt.password.trim().is_empty()
+    };
+    if empty_secret {
+        state.set_status(s.err_enter_pw_or_rec, true);
+        return None;
+    }
+    let out_opt = {
+        let trimmed = state.decrypt.output_dir.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            let p = PathBuf::from(trimmed);
+            if !p.is_dir() {
+                state.set_status(s.err_invalid_out_dir, true);
+                return None;
+            }
+            Some(p)
+        }
+    };
+    let secret_raw = if state.decrypt.use_recovery {
+        std::mem::take(&mut state.decrypt.recovery_phrase)
+    } else {
+        std::mem::take(&mut state.decrypt.password)
+    };
+    let use_recovery = state.decrypt.use_recovery;
+    let keyfile = state.decrypt.keyfile.clone();
+    let vaults = state.decrypt.vaults.clone();
+    state.clear_decrypt_secrets();
+    Some(ValidatedDecryptRequest {
+        vaults,
+        use_recovery,
+        secret: Zeroizing::new(secret_raw),
+        keyfile,
+        output_dir: out_opt,
+    })
+}
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -118,52 +176,40 @@ pub fn ui(
     });
 
     ui.add_space(12.0);
-    ui.add_enabled_ui(!state.busy, |ui| {
-        if ui
-            .add(theme::primary_button(s.btn_decrypt_now, ui.visuals()))
-            .clicked()
-        {
-            if state.decrypt.vaults.is_empty() {
-                state.set_status(s.err_select_vaults, true);
-                return;
-            }
-            let secret_raw = if state.decrypt.use_recovery {
-                std::mem::take(&mut state.decrypt.recovery_phrase)
-            } else {
-                std::mem::take(&mut state.decrypt.password)
-            };
-            if secret_raw.trim().is_empty() {
-                state.set_status(s.err_enter_pw_or_rec, true);
-                return;
-            }
-            let out_opt = {
-                let trimmed = state.decrypt.output_dir.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    let p = PathBuf::from(trimmed);
-                    if !p.is_dir() {
-                        state.set_status(s.err_invalid_out_dir, true);
-                        return;
-                    }
-                    Some(p)
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!state.busy, |ui| {
+            if ui
+                .add(theme::primary_button(s.btn_decrypt_now, ui.visuals()))
+                .clicked()
+            {
+                if let Some(req) = take_validated_decrypt_request(state, s) {
+                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                    state.begin_transfer(s.status_dec_running);
+                    worker::spawn_decrypt(
+                        ctx.clone(),
+                        tx.clone(),
+                        Arc::clone(cancel),
+                        req.vaults,
+                        req.use_recovery,
+                        req.secret,
+                        req.keyfile,
+                        req.output_dir,
+                        state.config.language,
+                    );
                 }
-            };
-
-            state.clear_decrypt_secrets();
-            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-            state.begin_transfer(s.status_dec_running);
-            worker::spawn_decrypt(
-                ctx.clone(),
-                tx.clone(),
-                Arc::clone(cancel),
-                state.decrypt.vaults.clone(),
-                state.decrypt.use_recovery,
-                Zeroizing::new(secret_raw),
-                state.decrypt.keyfile.clone(),
-                out_opt,
-                state.config.language,
-            );
+            }
+        });
+        if ui.button(s.btn_add_to_queue).clicked() {
+            if let Some(req) = take_validated_decrypt_request(state, s) {
+                state.decrypt.vaults.clear();
+                state.enqueue_job(QueuedJobKind::Decrypt {
+                    vaults: req.vaults,
+                    use_recovery: req.use_recovery,
+                    secret: req.secret,
+                    keyfile: req.keyfile,
+                    output_dir: req.output_dir,
+                });
+            }
         }
     });
 }

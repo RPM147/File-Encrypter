@@ -12,19 +12,25 @@ use rpm_core::{
     HiddenEncryptOptions, IntegrityReport, KdfParams, SecretKey, VaultDiff, VaultInfo,
     VaultMetadata,
 };
+use rpm_gui::estimator::{
+    estimate_encrypt_preflight, rs_wire_size, scan_sources_sync, ContainerFitStatus,
+    SourceSizeSummary,
+};
 use rpm_gui::progress::{
     format_bytes, format_eta, format_rate, format_transfer_summary, format_transfer_tooltip,
     TransferMeter, TransferSnapshot,
 };
+use rpm_gui::queue::QueuedJobKind;
+use rpm_gui::reveal::reveal_command_spec;
 use rpm_gui::state::{
     clamp_ui_scale_percent, strength_label_and_color_for, ui_scale_zoom_factor, AppState,
-    ContainerSizeError, ContainerSizePreset, PasswordGenFields, RecoveryPrompt, Tab,
-    ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, CONTAINER_MAX_MIB, CONTAINER_MIB,
-    PWGEN_AMBIGUOUS, PWGEN_DIGITS, PWGEN_LOWERCASE, PWGEN_SYMBOLS, PWGEN_UPPERCASE,
-    UI_SCALE_DEFAULT, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_PRESETS,
+    BuiltinEncryptPreset, ContainerSizeError, ContainerSizePreset, PasswordGenFields,
+    RecoveryPrompt, SessionClearReason, Tab, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE,
+    CONTAINER_MAX_MIB, CONTAINER_MIB, PWGEN_AMBIGUOUS, PWGEN_DIGITS, PWGEN_LOWERCASE,
+    PWGEN_SYMBOLS, PWGEN_UPPERCASE, UI_SCALE_DEFAULT, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_PRESETS,
 };
 use rpm_gui::{fonts, i18n, load_app_icon, worker};
-use rpm_storage::config::{load_config_from, AppConfig, AppLanguage, ThemeMode};
+use rpm_storage::config::{load_config_from, AppConfig, AppLanguage, EncryptProfile, ThemeMode};
 use rpm_storage::{encrypt_hidden_sources_v5, GuiLaunchIntent, LaunchTab};
 
 fn fresh_state() -> AppState {
@@ -119,6 +125,7 @@ fn bilingual_tr_en_strings_and_keyboard_shortcuts_and_modals() {
         phrase: "word ".repeat(24),
         entropy: SecretKey::new([0x55u8; 32]),
         confirmed: false,
+        queue_after_confirm: false,
     });
     assert!(st.dismiss_modals());
     assert!(!st.show_shell_install_modal);
@@ -981,6 +988,7 @@ fn clear_encrypt_secrets_wipes_outer_and_hidden_passwords() {
         phrase: "alpha beta gamma".into(),
         entropy: SecretKey::new([0x33u8; 32]),
         confirmed: true,
+        queue_after_confirm: false,
     });
 
     st.clear_encrypt_secrets();
@@ -1462,4 +1470,352 @@ fn upfront_gui_constraint_hints_parity_and_preview_limit_render() {
         .textures_delta
         .clear();
     }
+}
+
+fn populate_all_sensitive_fields(st: &mut AppState) {
+    st.encrypt.password = "Outer!1".into();
+    st.encrypt.confirm_password = "Outer!1".into();
+    st.encrypt.hidden_password = "Hidden!2".into();
+    st.encrypt.hidden_confirm_password = "Hidden!2".into();
+    st.encrypt.recovery_prompt = Some(RecoveryPrompt {
+        phrase: "word ".repeat(24),
+        entropy: SecretKey::new([0x44u8; 32]),
+        confirmed: false,
+        queue_after_confirm: false,
+    });
+    st.decrypt.password = "Dec!1".into();
+    st.decrypt.recovery_phrase = "rec words".into();
+    st.inspect.password = "Ins!1".into();
+    st.inspect.recovery_phrase = "ins rec".into();
+    st.inspect.results = "custom metadata output".into();
+    st.inspect.set_manifest(
+        PathBuf::from("secret.vault"),
+        vec![FileManifestEntry {
+            path: "secret.txt".into(),
+            size: 42,
+            modified_unix: 0,
+        }],
+    );
+    st.diff.password_a = "DiffA!1".into();
+    st.diff.recovery_phrase_a = "diff rec a".into();
+    st.diff.password_b = "DiffB!2".into();
+    st.diff.recovery_phrase_b = "diff rec b".into();
+    st.diff.results = "diff results".into();
+    st.rekey.current_password = "Old!1".into();
+    st.rekey.new_password = "New!2".into();
+    st.rekey.confirm_password = "New!2".into();
+    st.pwgen.generated = "GenPass!12345".into();
+    st.push_log("sensitive activity");
+    st.enqueue_job(QueuedJobKind::IntegrityCheck {
+        path: PathBuf::from("queued.vault"),
+    });
+    st.last_action = Some(rpm_gui::state::LastCompletedAction {
+        summary: "done".into(),
+        reveal_path: PathBuf::from("secret.vault"),
+        verify_vault: Some(PathBuf::from("secret.vault")),
+    });
+}
+
+#[test]
+fn panic_and_idle_clear_reset_all_in_app_secrets_without_touching_clipboard() {
+    let mut st = fresh_state();
+    assert!(!st.has_sensitive_session_data());
+
+    let clip_deadline = Instant::now() + Duration::from_secs(25);
+    st.clipboard_deadline = Some(clip_deadline);
+    st.show_shell_install_modal = true;
+    populate_all_sensitive_fields(&mut st);
+    assert!(st.has_sensitive_session_data());
+
+    st.clear_sensitive_session(SessionClearReason::ManualPanic);
+    assert!(!st.has_sensitive_session_data());
+    assert!(!st.show_shell_install_modal);
+    assert!(st.encrypt.password.is_empty());
+    assert!(st.encrypt.hidden_password.is_empty());
+    assert!(st.encrypt.recovery_prompt.is_none());
+    assert!(st.decrypt.password.is_empty());
+    assert!(st.decrypt.recovery_phrase.is_empty());
+    assert!(st.inspect.password.is_empty());
+    assert!(st.inspect.recovery_phrase.is_empty());
+    assert!(st.inspect.manifest.is_empty());
+    assert!(st.diff.password_a.is_empty() && st.diff.password_b.is_empty());
+    assert!(st.rekey.current_password.is_empty() && st.rekey.new_password.is_empty());
+    assert!(st.pwgen.generated.is_empty());
+    assert!(st.logs.is_empty());
+    assert!(st.job_queue.is_empty());
+    assert!(st.last_action.is_none());
+    assert_eq!(st.clipboard_deadline, Some(clip_deadline));
+
+    // Idle clear disabled (0 minutes) does nothing
+    st.config.idle_clear_minutes = 0;
+    st.encrypt.password = "KeepMe!1".into();
+    let t0 = st.last_activity;
+    assert!(!st.check_idle_timeout(t0 + Duration::from_secs(3600)));
+    assert_eq!(st.encrypt.password, "KeepMe!1");
+
+    // Idle timeout skipped while a non-preview transfer is busy (and refreshes activity)
+    st.config.idle_clear_minutes = 5;
+    st.busy = true;
+    let t_busy = t0 + Duration::from_secs(400);
+    assert!(!st.check_idle_timeout(t_busy));
+    assert_eq!(st.last_activity, t_busy);
+    assert_eq!(st.encrypt.password, "KeepMe!1");
+
+    // Once transfer completes and 5 minutes elapse, idle timeout clears session while preserving clipboard
+    st.busy = false;
+    assert!(!st.check_idle_timeout(t_busy + Duration::from_secs(299)));
+    assert!(st.check_idle_timeout(t_busy + Duration::from_secs(300)));
+    assert!(st.encrypt.password.is_empty());
+    assert!(!st.has_sensitive_session_data());
+    assert_eq!(st.clipboard_deadline, Some(clip_deadline));
+}
+
+#[test]
+fn encryption_profiles_presets_crud_and_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let mut st = AppState::from_config(AppConfig::default(), Some(cfg_path.clone()));
+
+    let s = st.strings();
+    // Apply each built-in preset
+    st.apply_encrypt_profile(&BuiltinEncryptPreset::LongTermArchiveRs.to_profile(s));
+    assert!(st.encrypt.reed_solomon);
+    assert!(!st.encrypt.stealth);
+    assert_eq!(st.encrypt.container_preset, ContainerSizePreset::Auto);
+
+    st.apply_encrypt_profile(&BuiltinEncryptPreset::MaximumPrivacyStealth.to_profile(s));
+    assert!(st.encrypt.stealth);
+    assert!(!st.encrypt.reed_solomon);
+    assert_eq!(st.encrypt.container_preset, ContainerSizePreset::MiB100);
+
+    // Applying Auto preset while hidden vault is enabled must keep a fixed container
+    st.encrypt.set_hidden_enabled(true);
+    st.apply_encrypt_profile(&BuiltinEncryptPreset::DailyBackup.to_profile(s));
+    assert_eq!(st.encrypt.container_preset, ContainerSizePreset::MiB50);
+    assert!(st.encrypt.resolve_container_size().unwrap().is_some());
+
+    // Save custom user profile (with custom MiB & password populated — secrets must NOT be persisted!)
+    st.encrypt.set_hidden_enabled(false);
+    st.encrypt.password = "NeverPersistPassword!99".into();
+    st.encrypt.container_preset = ContainerSizePreset::Custom;
+    st.encrypt.container_custom_mb = "250".into();
+    st.encrypt.save_next_to_source = false;
+    st.encrypt.output_dir = dir.path().display().to_string();
+
+    assert!(st.save_current_encrypt_profile("   ").is_err());
+    st.save_current_encrypt_profile("My Archive").unwrap();
+    assert_eq!(st.config.encrypt_profiles.len(), 1);
+    assert_eq!(st.config.encrypt_profiles[0].container_size_mib, Some(250));
+
+    // Upsert case-insensitively replaces existing entry
+    st.encrypt.compress = false;
+    st.save_current_encrypt_profile("my archive").unwrap();
+    assert_eq!(st.config.encrypt_profiles.len(), 1);
+    assert!(!st.config.encrypt_profiles[0].compress);
+
+    let raw = fs::read_to_string(&cfg_path).unwrap();
+    assert!(!raw.contains("NeverPersistPassword"));
+    let reloaded = load_config_from(&cfg_path);
+    assert_eq!(reloaded.encrypt_profiles, st.config.encrypt_profiles);
+
+    // Enforce max limit and delete
+    assert!(st.delete_encrypt_profile("MY ARCHIVE"));
+    assert!(st.config.encrypt_profiles.is_empty());
+    let mut cfg_full = AppConfig::default();
+    for i in 0..32 {
+        cfg_full.encrypt_profiles.push(EncryptProfile {
+            name: format!("P{i}"),
+            ..EncryptProfile::default()
+        });
+    }
+    let mut st_full = AppState::from_config(cfg_full, None);
+    assert!(st_full.save_current_encrypt_profile("33rd").is_err());
+}
+
+#[test]
+fn preflight_scan_rs_wire_size_and_fit_estimation() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let f1 = dir.path().join("a.bin");
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let f2 = sub.join("b.bin");
+    fs::write(&f1, vec![0xAAu8; 4096]).unwrap();
+    fs::write(&f2, vec![0xBBu8; 1024]).unwrap();
+
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(&f1, dir.path().join("link.bin"));
+
+    let cancel = AtomicBool::new(false);
+    let summary = scan_sources_sync(&[dir.path().to_path_buf()], &cancel).unwrap();
+    assert_eq!(summary.file_count, 2);
+    assert_eq!(summary.raw_bytes, 5120);
+    assert!(summary.dir_count >= 2);
+    #[cfg(unix)]
+    assert_eq!(summary.skipped_symlinks, 1);
+
+    let cancelled = AtomicBool::new(true);
+    assert!(scan_sources_sync(&[dir.path().to_path_buf()], &cancelled).is_none());
+
+    // Verify rs_wire_size matches RsEncoderWriter byte-for-byte across block boundaries
+    for &len in &[0usize, 100, 15_292, 15_293, 65_536] {
+        let mut encoded = Vec::new();
+        let mut enc = rpm_core::RsEncoderWriter::new(&mut encoded).unwrap();
+        if len > 0 {
+            enc.write_all(&vec![0x5Au8; len]).unwrap();
+        }
+        enc.finish().unwrap();
+        assert_eq!(
+            rs_wire_size(len as u64),
+            encoded.len() as u64,
+            "rs_wire_size mismatch for inner len {len}"
+        );
+    }
+
+    // Fit estimation scenarios
+    let small = SourceSizeSummary {
+        file_count: 1,
+        dir_count: 0,
+        raw_bytes: 1024,
+        ..Default::default()
+    };
+    let hidden_empty = SourceSizeSummary::default();
+    let auto_rs = estimate_encrypt_preflight(
+        &small,
+        &hidden_empty,
+        false,
+        true,
+        true,
+        true,
+        ContainerSizePreset::Auto,
+        "100",
+    );
+    assert_eq!(auto_rs.fit, ContainerFitStatus::NoContainer);
+    assert!(auto_rs.rs_overhead_bytes > 0);
+    assert_eq!(
+        auto_rs.estimated_disk_bytes,
+        rs_wire_size(auto_rs.total_inner_required_bytes)
+    );
+
+    let fits = estimate_encrypt_preflight(
+        &small,
+        &hidden_empty,
+        false,
+        false,
+        false,
+        false,
+        ContainerSizePreset::MiB10,
+        "100",
+    );
+    assert!(matches!(fits.fit, ContainerFitStatus::Fits { .. }));
+
+    let large = SourceSizeSummary {
+        file_count: 1,
+        dir_count: 0,
+        raw_bytes: 15 * 1024 * 1024,
+        ..Default::default()
+    };
+    let exceeds = estimate_encrypt_preflight(
+        &large,
+        &hidden_empty,
+        false,
+        false,
+        false,
+        false,
+        ContainerSizePreset::MiB10,
+        "100",
+    );
+    match exceeds.fit {
+        ContainerFitStatus::ExceedsContainer { suggested_mib, .. } => {
+            assert!(suggested_mib >= 16);
+        }
+        other => panic!("expected ExceedsContainer, got {other:?}"),
+    }
+
+    let comp_dep = estimate_encrypt_preflight(
+        &large,
+        &hidden_empty,
+        false,
+        true,
+        false,
+        false,
+        ContainerSizePreset::MiB10,
+        "100",
+    );
+    assert!(matches!(
+        comp_dep.fit,
+        ContainerFitStatus::CompressionDependent { .. }
+    ));
+
+    let invalid = estimate_encrypt_preflight(
+        &small,
+        &hidden_empty,
+        false,
+        true,
+        false,
+        false,
+        ContainerSizePreset::Custom,
+        "0",
+    );
+    assert_eq!(
+        invalid.fit,
+        ContainerFitStatus::InvalidContainer(ContainerSizeError::InvalidCustomValue)
+    );
+}
+
+#[test]
+fn reveal_command_spec_and_queue_operations_work_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("archive.vault");
+    fs::write(&file, b"vault").unwrap();
+
+    assert!(reveal_command_spec(PathBuf::new().as_path()).is_none());
+
+    let (prog_dir, args_dir) = reveal_command_spec(dir.path()).unwrap();
+    let (prog_file, args_file) = reveal_command_spec(&file).unwrap();
+    if cfg!(target_os = "windows") {
+        assert_eq!(prog_dir, "explorer.exe");
+        assert_eq!(args_dir, vec![dir.path().as_os_str()]);
+        assert_eq!(prog_file, "explorer.exe");
+        assert_eq!(
+            args_file,
+            vec![
+                std::ffi::OsString::from("/select,"),
+                file.as_os_str().to_os_string()
+            ]
+        );
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(prog_dir, "open");
+        assert_eq!(prog_file, "open");
+    } else {
+        assert_eq!(prog_dir, "xdg-open");
+        assert_eq!(args_dir, vec![dir.path().as_os_str()]);
+        assert_eq!(prog_file, "xdg-open");
+        assert_eq!(args_file, vec![dir.path().as_os_str()]);
+    }
+
+    // Queue ordering, removal, clear, and Debug redaction
+    let mut st = fresh_state();
+    let id1 = st.enqueue_job(QueuedJobKind::Decrypt {
+        vaults: vec![file.clone()],
+        use_recovery: false,
+        secret: zeroize::Zeroizing::new("TopSecretQueuePw!9".into()),
+        keyfile: None,
+        output_dir: None,
+    });
+    let id2 = st.enqueue_job(QueuedJobKind::IntegrityCheck { path: file.clone() });
+    let id3 = st.enqueue_job(QueuedJobKind::Repair { path: file.clone() });
+
+    let dbg = format!("{:?}", st.job_queue);
+    assert!(!dbg.contains("TopSecretQueuePw"));
+    assert!(dbg.contains("[REDACTED]"));
+
+    assert!(st.move_queued_job_up(2));
+    assert_eq!(st.job_queue[1].id, id3);
+    assert!(st.move_queued_job_down(0));
+    assert_eq!(st.job_queue[1].id, id1);
+    assert!(st.remove_queued_job(id2));
+    assert_eq!(st.job_queue.len(), 2);
+    assert_eq!(st.clear_pending_queue(), 2);
+    assert!(st.job_queue.is_empty());
 }

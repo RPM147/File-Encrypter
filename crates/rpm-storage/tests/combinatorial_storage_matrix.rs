@@ -5,7 +5,9 @@ use rpm_core::{
     inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, EncryptOptions,
     HiddenEncryptOptions, KdfParams, SecretKey,
 };
-use rpm_storage::config::{load_config_from, save_config_to, AppConfig, AppLanguage, ThemeMode};
+use rpm_storage::config::{
+    load_config_from, save_config_to, AppConfig, AppLanguage, EncryptProfile, ThemeMode,
+};
 use rpm_storage::shell_integration::{
     get_status_with_backend, install_with_backend, uninstall_with_backend, MemoryRegistryBackend,
 };
@@ -812,6 +814,19 @@ fn storage_config_launch_and_shell_integration_matrix() {
                     argon_iterations: iters,
                     argon_parallelism: par,
                     compress_by_default: compress,
+                    idle_clear_minutes: if idx == 0 { 0 } else { 15 },
+                    notify_on_complete: idx % 2 == 0,
+                    encrypt_profiles: vec![EncryptProfile {
+                        name: format!("Profile-{scale}"),
+                        compress,
+                        stealth: idx == 1,
+                        reed_solomon: idx == 0,
+                        secure_wipe: false,
+                        container_size_mib: (scale >= 120).then_some(100),
+                        save_next_to_source: true,
+                        output_dir: String::new(),
+                        keyfile_path: None,
+                    }],
                 };
                 save_config_to(&cfg_path, &cfg).unwrap();
                 let raw = fs::read_to_string(&cfg_path).unwrap();

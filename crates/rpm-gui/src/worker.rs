@@ -21,7 +21,9 @@ use rpm_storage::{
 };
 use zeroize::Zeroizing;
 
+use crate::estimator::{scan_sources_sync, SourceSizeSummary};
 use crate::progress::{TransferMeter, TransferSnapshot};
+use crate::queue::{QueuedJob, QueuedJobKind};
 use crate::state::WorkerUpdate;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
@@ -560,7 +562,14 @@ pub fn spawn_encrypt(
                         format!("Encrypted {} file(s) -> {vault_name}", meta.file_count)
                     }
                 };
-                send(&tx, &ctx, WorkerUpdate::EncryptDone { status });
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::EncryptDone {
+                        status,
+                        output_path: out_vault,
+                    },
+                );
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
@@ -679,7 +688,14 @@ pub fn spawn_encrypt_hidden(
                         decoy_meta.file_count, hidden_meta.file_count
                     ),
                 };
-                send(&tx, &ctx, WorkerUpdate::EncryptDone { status });
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::EncryptDone {
+                        status,
+                        output_path: out_vault,
+                    },
+                );
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
@@ -720,6 +736,7 @@ pub fn spawn_decrypt(
         };
 
         let mut ok_count = 0usize;
+        let mut first_output: Option<PathBuf> = None;
         for (idx, vault) in vaults.iter().enumerate() {
             let root_out = output_dir.clone().unwrap_or_else(|| {
                 vault
@@ -744,6 +761,9 @@ pub fn spawn_decrypt(
             match decrypt_vault_v5(vault, &root_out, auth, progress, Arc::clone(&cancel)) {
                 Ok(summary) => {
                     ok_count += 1;
+                    if first_output.is_none() {
+                        first_output = Some(summary.output_path.clone());
+                    }
                     let line = match lang {
                         AppLanguage::Tr => format!(
                             "Çözüldü: {} ({} dosya) -> {}",
@@ -767,11 +787,32 @@ pub fn spawn_decrypt(
             }
         }
 
+        let reveal_target = if vaults.len() > 1 {
+            output_dir.or_else(|| {
+                vaults
+                    .first()
+                    .and_then(|v| {
+                        v.parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(Path::to_path_buf)
+                    })
+                    .or_else(|| Some(PathBuf::from(".")))
+            })
+        } else {
+            first_output.or(output_dir)
+        };
         let status = match lang {
             AppLanguage::Tr => format!("{ok_count}/{} kasa çözüldü", vaults.len()),
             AppLanguage::En => format!("Decrypted {ok_count}/{} vault(s)", vaults.len()),
         };
-        send(&tx, &ctx, WorkerUpdate::DecryptDone { status });
+        send(
+            &tx,
+            &ctx,
+            WorkerUpdate::DecryptDone {
+                status,
+                output_path: reveal_target,
+            },
+        );
     });
 }
 
@@ -1040,7 +1081,14 @@ pub fn spawn_selective_extract(
                     ),
                 };
                 send(&tx, &ctx, WorkerUpdate::Log(msg.clone()));
-                send(&tx, &ctx, WorkerUpdate::DecryptDone { status: msg });
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::DecryptDone {
+                        status: msg,
+                        output_path: Some(summary.output_path),
+                    },
+                );
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
@@ -1096,7 +1144,14 @@ pub fn spawn_rekey(
                     }
                     AppLanguage::En => format!("Re-key complete: {}", vault.display()),
                 };
-                send(&tx, &ctx, WorkerUpdate::RekeyDone { status });
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::RekeyDone {
+                        status,
+                        vault_path: vault,
+                    },
+                );
             }
             Err(e) => send(&tx, &ctx, WorkerUpdate::Error(format_rekey_error(&e, lang))),
         }
@@ -1181,16 +1236,19 @@ pub fn spawn_repair(
     thread::spawn(move || {
         let s = crate::i18n::strings(lang);
         let msg = match rpm_storage::repair_vault_v5(&path, None, cancel) {
-            Ok(r) => WorkerUpdate::RepairDone(match lang {
-                AppLanguage::Tr => format!(
-                    "{}: {} ({} blok kontrol edildi)",
-                    s.repair_done, r.repaired_bytes, r.blocks_checked
-                ),
-                AppLanguage::En => format!(
-                    "{}: {} ({} blocks checked)",
-                    s.repair_done, r.repaired_bytes, r.blocks_checked
-                ),
-            }),
+            Ok(r) => WorkerUpdate::RepairDone {
+                text: match lang {
+                    AppLanguage::Tr => format!(
+                        "{}: {} ({} blok kontrol edildi)",
+                        s.repair_done, r.repaired_bytes, r.blocks_checked
+                    ),
+                    AppLanguage::En => format!(
+                        "{}: {} ({} blocks checked)",
+                        s.repair_done, r.repaired_bytes, r.blocks_checked
+                    ),
+                },
+                vault_path: path,
+            },
             Err(StorageError::Crypto(CryptoError::UnsupportedOperation(_))) => {
                 WorkerUpdate::Error(s.repair_requires_rs.into())
             }
@@ -1209,4 +1267,150 @@ pub fn spawn_repair(
         };
         send(&tx, &ctx, msg);
     });
+}
+
+pub fn spawn_source_scan(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    gen: u64,
+    outer_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+) {
+    thread::spawn(move || {
+        let Some(outer) = scan_sources_sync(&outer_sources, &cancel) else {
+            return;
+        };
+        let hidden = if hidden_sources.is_empty() {
+            SourceSizeSummary::default()
+        } else {
+            let Some(h) = scan_sources_sync(&hidden_sources, &cancel) else {
+                return;
+            };
+            h
+        };
+        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            send(
+                &tx,
+                &ctx,
+                WorkerUpdate::SourceScanDone { gen, outer, hidden },
+            );
+        }
+    });
+}
+
+pub fn spawn_queued_job(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    job: QueuedJob,
+    lang: AppLanguage,
+) -> &'static str {
+    let s = crate::i18n::strings(lang);
+    match job.kind {
+        QueuedJobKind::Encrypt {
+            sources,
+            password,
+            recovery_entropy,
+            keyfile,
+            output_dir,
+            compress,
+            container_size_bytes,
+            stealth,
+            reed_solomon,
+            secure_wipe,
+            wipe_passes,
+            kdf,
+        } => {
+            spawn_encrypt(
+                ctx,
+                tx,
+                cancel,
+                sources,
+                password,
+                recovery_entropy,
+                keyfile,
+                output_dir,
+                compress,
+                container_size_bytes,
+                stealth,
+                reed_solomon,
+                secure_wipe,
+                wipe_passes,
+                kdf,
+                lang,
+            );
+            s.status_enc_running
+        }
+        QueuedJobKind::EncryptHidden {
+            decoy_sources,
+            hidden_sources,
+            decoy_password,
+            hidden_password,
+            decoy_recovery_entropy,
+            decoy_keyfile,
+            hidden_keyfile,
+            output_dir,
+            decoy_compressed,
+            hidden_compressed,
+            container_size_bytes,
+            stealth,
+            reed_solomon,
+            secure_wipe,
+            wipe_passes,
+            kdf,
+        } => {
+            spawn_encrypt_hidden(
+                ctx,
+                tx,
+                cancel,
+                decoy_sources,
+                hidden_sources,
+                decoy_password,
+                hidden_password,
+                decoy_recovery_entropy,
+                decoy_keyfile,
+                hidden_keyfile,
+                output_dir,
+                decoy_compressed,
+                hidden_compressed,
+                container_size_bytes,
+                stealth,
+                reed_solomon,
+                secure_wipe,
+                wipe_passes,
+                kdf,
+                lang,
+            );
+            s.status_enc_hidden_running
+        }
+        QueuedJobKind::Decrypt {
+            vaults,
+            use_recovery,
+            secret,
+            keyfile,
+            output_dir,
+        } => {
+            spawn_decrypt(
+                ctx,
+                tx,
+                cancel,
+                vaults,
+                use_recovery,
+                secret,
+                keyfile,
+                output_dir,
+                lang,
+            );
+            s.status_dec_running
+        }
+        QueuedJobKind::Repair { path } => {
+            spawn_repair(ctx, tx, path, cancel, lang);
+            s.repair_running
+        }
+        QueuedJobKind::IntegrityCheck { path } => {
+            spawn_integrity_check(ctx, tx, path, lang);
+            s.status_checking_integrity
+        }
+    }
 }

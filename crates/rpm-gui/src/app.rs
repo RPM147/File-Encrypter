@@ -10,8 +10,8 @@ use rpm_storage::config::{AppLanguage, ThemeMode};
 use rpm_storage::GuiLaunchIntent;
 
 use crate::progress::{format_transfer_summary, format_transfer_tooltip};
-use crate::state::{AppState, Tab, WorkerUpdate};
-use crate::{tabs, theme};
+use crate::state::{AppState, LastCompletedAction, SessionClearReason, Tab, WorkerUpdate};
+use crate::{reveal, tabs, theme, worker};
 
 pub struct RpmApp {
     pub state: AppState,
@@ -35,9 +35,18 @@ impl RpmApp {
         }
     }
 
-    fn drain_updates(&mut self, ctx: &egui::Context) {
+    pub fn drain_updates(&mut self, ctx: &egui::Context) {
+        let mut completed_transfer = false;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                WorkerUpdate::SourceScanDone { gen, outer, hidden } => {
+                    if gen == self.state.encrypt.preflight_scan_gen {
+                        self.state.encrypt.preflight_outer = outer;
+                        self.state.encrypt.preflight_hidden = hidden;
+                        self.state.encrypt.preflight_scanning = false;
+                        self.state.encrypt.preflight_scan_cancel = None;
+                    }
+                }
                 WorkerUpdate::PreviewDone {
                     gen,
                     path,
@@ -89,19 +98,49 @@ impl RpmApp {
                     }
                 }
                 WorkerUpdate::Log(line) => self.state.push_log(line),
-                WorkerUpdate::EncryptDone { status } => {
+                WorkerUpdate::EncryptDone {
+                    status,
+                    output_path,
+                } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.progress = 1.0;
                     self.state.transfer = None;
-                    self.state.encrypt.sources.clear();
-                    self.state.encrypt.hidden_sources.clear();
+                    if !was_queued {
+                        self.state.encrypt.sources.clear();
+                        self.state.encrypt.hidden_sources.clear();
+                    }
+                    self.state.last_action = Some(LastCompletedAction {
+                        summary: status.clone(),
+                        reveal_path: output_path.clone(),
+                        verify_vault: Some(output_path),
+                    });
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     self.state.set_status(status, false);
+                    completed_transfer = true;
                 }
-                WorkerUpdate::DecryptDone { status } => {
+                WorkerUpdate::DecryptDone {
+                    status,
+                    output_path,
+                } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.progress = 1.0;
                     self.state.transfer = None;
+                    if let Some(reveal_path) = output_path {
+                        self.state.last_action = Some(LastCompletedAction {
+                            summary: status.clone(),
+                            reveal_path,
+                            verify_vault: None,
+                        });
+                    }
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     self.state.set_status(status, false);
+                    completed_transfer = true;
                 }
                 WorkerUpdate::InspectDone {
                     text,
@@ -109,31 +148,54 @@ impl RpmApp {
                     manifest,
                     vault_path,
                 } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.transfer = None;
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     if vault_path != std::path::Path::new(self.state.inspect.vault_path.trim()) {
                         continue;
                     }
                     self.state.inspect.results = text;
                     self.state.inspect.set_manifest(vault_path, manifest);
                     self.state.set_status(status, false);
+                    completed_transfer = true;
                 }
-                WorkerUpdate::RepairDone(text) => {
+                WorkerUpdate::RepairDone { text, vault_path } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.transfer = None;
                     self.state.inspect.reset_manifest();
                     self.state.inspect.results = text.clone();
+                    self.state.last_action = Some(LastCompletedAction {
+                        summary: text.clone(),
+                        reveal_path: vault_path.clone(),
+                        verify_vault: Some(vault_path),
+                    });
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     self.state.set_status(text, false);
+                    completed_transfer = true;
                 }
                 WorkerUpdate::IntegrityDone {
                     text,
                     ok,
                     sha256_only,
                 } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.transfer = None;
                     self.state.inspect.results = text;
                     self.state.inspect.reset_manifest();
+                    if was_queued {
+                        if !sha256_only && !ok {
+                            self.state.queue_failed += 1;
+                        } else {
+                            self.state.queue_completed += 1;
+                        }
+                    }
                     let label = match (sha256_only, self.state.config.language, ok) {
                         (true, ..) => self.state.strings().digest_computed,
                         (false, AppLanguage::Tr, true) => "Bütünlük doğrulaması başarılı",
@@ -142,31 +204,87 @@ impl RpmApp {
                         (false, AppLanguage::En, false) => "Integrity check failed",
                     };
                     self.state.set_status(label, !sha256_only && !ok);
+                    completed_transfer = true;
                 }
                 WorkerUpdate::DiffDone { text, status } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.transfer = None;
                     self.state.diff.results = text;
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     self.state.set_status(status, false);
+                    completed_transfer = true;
                 }
-                WorkerUpdate::RekeyDone { status } => {
+                WorkerUpdate::RekeyDone { status, vault_path } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.transfer = None;
+                    self.state.last_action = Some(LastCompletedAction {
+                        summary: status.clone(),
+                        reveal_path: vault_path.clone(),
+                        verify_vault: Some(vault_path),
+                    });
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
                     self.state.set_status(status, false);
+                    completed_transfer = true;
                 }
                 WorkerUpdate::Error(err) => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
                     self.state.progress = 0.0;
                     self.state.transfer = None;
+                    if was_queued {
+                        self.state.queue_failed += 1;
+                        if self.cancel.load(Ordering::Relaxed) {
+                            self.state.queue_paused = true;
+                        }
+                    }
                     self.state.set_status(err.clone(), true);
                     self.state.push_log(format!("ERROR: {err}"));
+                    completed_transfer = true;
                 }
             }
         }
+
+        if completed_transfer
+            && self.state.config.notify_on_complete
+            && (self.state.job_queue.is_empty() || self.state.queue_paused)
+            && !ctx.input(|i| i.viewport().focused.unwrap_or(true))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
+    }
+
+    pub fn maybe_start_next_queued_job(&mut self, ctx: &egui::Context) -> bool {
+        if self.state.busy || self.state.queue_paused {
+            return false;
+        }
+        let Some(job) = self.state.pop_next_queued_job() else {
+            return false;
+        };
+        self.cancel.store(false, Ordering::Relaxed);
+        let label = job.label.clone();
+        let status = worker::spawn_queued_job(
+            ctx.clone(),
+            self.tx.clone(),
+            Arc::clone(&self.cancel),
+            job,
+            self.state.config.language,
+        );
+        self.state.active_queue_job = Some(label);
+        self.state.begin_transfer(status);
+        true
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let mut digit_pressed: Option<u8> = None;
+        let mut lock_pressed = false;
         let mut esc_pressed = false;
         ctx.input(|i| {
             if i.modifiers.ctrl || i.modifiers.command {
@@ -183,12 +301,20 @@ impl RpmApp {
                         break;
                     }
                 }
+                if i.key_pressed(egui::Key::L) {
+                    lock_pressed = true;
+                }
             }
             if i.key_pressed(egui::Key::Escape) {
                 esc_pressed = true;
             }
         });
 
+        if lock_pressed {
+            self.state
+                .clear_sensitive_session(SessionClearReason::ManualPanic);
+            return;
+        }
         if let Some(d) = digit_pressed {
             self.state.handle_shortcut_tab(d);
         }
@@ -209,12 +335,34 @@ impl eframe::App for RpmApp {
             self.theme_initialized = true;
         }
 
+        let now = Instant::now();
+        let had_user_input = ctx.input(|i| {
+            i.raw.events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::PointerMoved(_)
+                        | egui::Event::MouseWheel { .. }
+                        | egui::Event::Touch { .. }
+                        | egui::Event::Paste(_)
+                        | egui::Event::MiddleClickPaste { .. }
+                        | egui::Event::Zoom(_)
+                        | egui::Event::Rotate(_)
+                )
+            })
+        });
+        if had_user_input {
+            self.state.note_activity(now);
+        }
+
         self.drain_updates(ctx);
         self.handle_keyboard_shortcuts(ctx);
 
         // Unified clipboard auto-clear timer check (Password Gen + Recovery Modal)
         if let Some(deadline) = self.state.clipboard_deadline {
-            if Instant::now() >= deadline {
+            if now >= deadline {
                 ctx.copy_text(String::new());
                 self.state.clipboard_deadline = None;
                 let msg = self.state.strings().status_clipboard_cleared;
@@ -234,6 +382,7 @@ impl eframe::App for RpmApp {
                 .collect()
         });
         if !dropped.is_empty() {
+            self.state.note_activity(now);
             let forced = match self.state.active_tab {
                 Tab::Decrypt if dropped.iter().all(|p| !p.is_dir()) => Some(Tab::Decrypt),
                 Tab::Inspect | Tab::Rekey => Some(self.state.active_tab),
@@ -241,6 +390,15 @@ impl eframe::App for RpmApp {
             };
             self.state.add_dropped_paths(dropped, forced);
         }
+
+        self.state.check_idle_timeout(now);
+        if self.state.config.idle_clear_minutes > 0
+            && self.state.has_sensitive_session_data()
+            && !(self.state.busy && self.state.inspect.preview_pending.is_none())
+        {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+
         let is_hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
         ui.reset_style();
@@ -251,6 +409,50 @@ impl eframe::App for RpmApp {
         egui::Panel::bottom("status_bar")
             .frame(egui::Frame::side_top_panel(&style).inner_margin(egui::Margin::symmetric(14, 8)))
             .show(ui, |ui| {
+                if let Some(last) = self.state.last_action.clone() {
+                    let mut dismiss = false;
+                    ui.horizontal(|ui| {
+                        ui.small(&last.summary).on_hover_text(&last.summary);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("×").clicked() {
+                                dismiss = true;
+                            }
+                            if let Some(vault_path) = last.verify_vault {
+                                let verify_btn = ui.add_enabled(
+                                    !self.state.busy,
+                                    egui::Button::new(s.btn_verify_now).small(),
+                                );
+                                if verify_btn.clicked() {
+                                    self.state.select_tab(Tab::Inspect);
+                                    self.state.inspect.vault_path =
+                                        vault_path.display().to_string();
+                                    self.state.clear_preview_and_busy();
+                                    self.state.inspect.reset_manifest();
+                                    self.state.busy = true;
+                                    self.state.transfer = None;
+                                    self.state.set_status(s.status_checking_integrity, false);
+                                    worker::spawn_integrity_check(
+                                        ctx.clone(),
+                                        self.tx.clone(),
+                                        vault_path,
+                                        self.state.config.language,
+                                    );
+                                }
+                            }
+                            if ui.small_button(s.btn_reveal_folder).clicked() {
+                                if let Err(err) = reveal::reveal_in_file_manager(&last.reveal_path)
+                                {
+                                    self.state.set_status(format!("Error: {err}"), true);
+                                }
+                            }
+                        });
+                    });
+                    if dismiss {
+                        self.state.last_action = None;
+                    }
+                    ui.separator();
+                }
+
                 ui.horizontal(|ui| {
                     if self.state.is_error {
                         ui.colored_label(egui::Color32::from_rgb(230, 80, 80), &self.state.status);
@@ -330,6 +532,20 @@ impl eframe::App for RpmApp {
                         }
                     });
                     ui.separator();
+                    let has_session_data = self.state.has_sensitive_session_data();
+                    let clear_btn = ui
+                        .add_enabled(
+                            has_session_data,
+                            egui::Button::new(s.btn_clear_session)
+                                .min_size(egui::vec2(ui.available_width(), 28.0))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
+                        .on_hover_text(s.clear_session_tip)
+                        .on_disabled_hover_text(s.clear_session_tip);
+                    if clear_btn.clicked() {
+                        self.state
+                            .clear_sensitive_session(SessionClearReason::ManualPanic);
+                    }
                 });
             });
 
@@ -370,6 +586,95 @@ impl eframe::App for RpmApp {
                     }
                 }
 
+                if !self.state.job_queue.is_empty() || self.state.active_queue_job.is_some() {
+                    let s = self.state.strings();
+                    ui.add_space(12.0);
+                    theme::card_frame(ui.visuals()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!(
+                                "{} ({})",
+                                s.queue_heading,
+                                self.state.job_queue.len()
+                            ));
+                            if self.state.queue_completed > 0 || self.state.queue_failed > 0 {
+                                ui.weak(format!(
+                                    "[ok: {}, err: {}]",
+                                    self.state.queue_completed, self.state.queue_failed
+                                ));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !self.state.job_queue.is_empty()
+                                        && ui.small_button(s.btn_queue_clear).clicked()
+                                    {
+                                        self.state.clear_pending_queue();
+                                    }
+                                    let toggle_lbl = if self.state.queue_paused {
+                                        s.btn_queue_resume
+                                    } else {
+                                        s.btn_queue_pause
+                                    };
+                                    if ui.small_button(toggle_lbl).clicked() {
+                                        self.state.queue_paused = !self.state.queue_paused;
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(ref active_label) = self.state.active_queue_job {
+                            ui.small(format!("▶ {active_label}"));
+                        }
+                        if self.state.queue_paused {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(225, 175, 50),
+                                s.queue_paused_label,
+                            );
+                        }
+
+                        let mut remove_id: Option<u64> = None;
+                        let mut move_up: Option<usize> = None;
+                        let mut move_down: Option<usize> = None;
+                        let pending_len = self.state.job_queue.len();
+                        for (idx, job) in self.state.job_queue.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{}. {}", idx + 1, job.label));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("×").clicked() {
+                                            remove_id = Some(job.id);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                idx + 1 < pending_len,
+                                                egui::Button::new("↓").small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            move_down = Some(idx);
+                                        }
+                                        if ui
+                                            .add_enabled(idx > 0, egui::Button::new("↑").small())
+                                            .clicked()
+                                        {
+                                            move_up = Some(idx);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        if let Some(id) = remove_id {
+                            self.state.remove_queued_job(id);
+                        }
+                        if let Some(idx) = move_up {
+                            self.state.move_queued_job_up(idx);
+                        }
+                        if let Some(idx) = move_down {
+                            self.state.move_queued_job_down(idx);
+                        }
+                    });
+                }
+
                 if !self.state.logs.is_empty() {
                     let s = self.state.strings();
                     ui.add_space(12.0);
@@ -384,6 +689,8 @@ impl eframe::App for RpmApp {
                 }
             });
         });
+
+        self.maybe_start_next_queued_job(ctx);
     }
 }
 
@@ -513,5 +820,189 @@ mod preview_tests {
         app.drain_updates(&egui::Context::default());
         assert!(!app.state.busy);
         assert!(app.state.inspect.preview.is_some());
+    }
+
+    #[test]
+    fn drain_updates_discards_stale_source_scan_generation() {
+        let mut app = isolated_app();
+        app.state.encrypt.preflight_scan_gen = 5;
+        app.state.encrypt.preflight_scanning = true;
+
+        let stale = crate::estimator::SourceSizeSummary {
+            file_count: 99,
+            raw_bytes: 9999,
+            ..Default::default()
+        };
+        app.tx
+            .send(WorkerUpdate::SourceScanDone {
+                gen: 4,
+                outer: stale,
+                hidden: crate::estimator::SourceSizeSummary::default(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(app.state.encrypt.preflight_scanning);
+        assert_eq!(app.state.encrypt.preflight_outer.file_count, 0);
+
+        let fresh = crate::estimator::SourceSizeSummary {
+            file_count: 3,
+            raw_bytes: 2048,
+            ..Default::default()
+        };
+        app.tx
+            .send(WorkerUpdate::SourceScanDone {
+                gen: 5,
+                outer: fresh.clone(),
+                hidden: crate::estimator::SourceSizeSummary::default(),
+            })
+            .unwrap();
+        app.drain_updates(&egui::Context::default());
+        assert!(!app.state.encrypt.preflight_scanning);
+        assert_eq!(app.state.encrypt.preflight_outer, fresh);
+    }
+
+    #[test]
+    fn drain_updates_populates_last_action_and_preserves_queued_sources() {
+        let mut app = isolated_app();
+        let ctx = egui::Context::default();
+
+        // Direct encrypt clears sources and enables Verify + Reveal
+        app.state.encrypt.sources = vec![PathBuf::from("draft.txt")];
+        app.state.busy = true;
+        app.tx
+            .send(WorkerUpdate::EncryptDone {
+                status: "ok".into(),
+                output_path: PathBuf::from("out.vault"),
+            })
+            .unwrap();
+        app.drain_updates(&ctx);
+        assert!(app.state.encrypt.sources.is_empty());
+        let last = app.state.last_action.as_ref().unwrap();
+        assert_eq!(last.reveal_path, PathBuf::from("out.vault"));
+        assert_eq!(last.verify_vault, Some(PathBuf::from("out.vault")));
+
+        // Queued encrypt preserves newly drafted sources, increments queue_completed
+        app.state.encrypt.sources = vec![PathBuf::from("next_draft.txt")];
+        app.state.active_queue_job = Some("Queued".into());
+        app.state.busy = true;
+        app.tx
+            .send(WorkerUpdate::EncryptDone {
+                status: "queued ok".into(),
+                output_path: PathBuf::from("queued.vault"),
+            })
+            .unwrap();
+        app.drain_updates(&ctx);
+        assert_eq!(
+            app.state.encrypt.sources,
+            vec![PathBuf::from("next_draft.txt")]
+        );
+        assert_eq!(app.state.queue_completed, 1);
+
+        // Decrypt sets reveal_path with verify_vault == None
+        app.state.busy = true;
+        app.tx
+            .send(WorkerUpdate::DecryptDone {
+                status: "dec ok".into(),
+                output_path: Some(PathBuf::from("extracted_dir")),
+            })
+            .unwrap();
+        app.drain_updates(&ctx);
+        let last_dec = app.state.last_action.as_ref().unwrap();
+        assert_eq!(last_dec.reveal_path, PathBuf::from("extracted_dir"));
+        assert_eq!(last_dec.verify_vault, None);
+    }
+
+    #[test]
+    fn queue_auto_advances_end_to_end_and_pauses_on_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("doc.txt");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::write(&src, b"queued payload bytes").unwrap();
+        let expected_vault = out_dir.join("doc.txt.vault");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app();
+        app.enqueue_test_encrypt_then_verify(
+            &ctx,
+            src.clone(),
+            out_dir.clone(),
+            expected_vault.clone(),
+        );
+        assert!(!expected_vault.exists());
+
+        // Start job 1 (Encrypt)
+        assert!(app.maybe_start_next_queued_job(&ctx));
+        assert!(app.state.busy);
+        assert_eq!(app.state.job_queue.len(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.state.busy && Instant::now() < deadline {
+            app.drain_updates(&ctx);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        app.drain_updates(&ctx);
+        assert!(!app.state.busy);
+        assert!(expected_vault.is_file());
+        assert_eq!(app.state.queue_completed, 1);
+
+        // Start job 2 (IntegrityCheck)
+        assert!(app.maybe_start_next_queued_job(&ctx));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.state.busy && Instant::now() < deadline {
+            app.drain_updates(&ctx);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        app.drain_updates(&ctx);
+        assert!(!app.state.busy);
+        assert_eq!(app.state.queue_completed, 2);
+        assert_eq!(app.state.queue_failed, 0);
+        assert!(!app.state.is_error);
+
+        // Cancel during a queued job pauses remaining queue
+        app.state
+            .enqueue_job(crate::queue::QueuedJobKind::IntegrityCheck {
+                path: expected_vault,
+            });
+        app.state.active_queue_job = Some("active".into());
+        app.state.busy = true;
+        app.cancel.store(true, Ordering::Relaxed);
+        app.tx
+            .send(WorkerUpdate::Error("cancelled".into()))
+            .unwrap();
+        app.drain_updates(&ctx);
+        assert!(app.state.queue_paused);
+        assert_eq!(app.state.queue_failed, 1);
+        assert!(!app.maybe_start_next_queued_job(&ctx));
+    }
+
+    impl RpmApp {
+        fn enqueue_test_encrypt_then_verify(
+            &mut self,
+            _ctx: &egui::Context,
+            src: PathBuf,
+            out_dir: PathBuf,
+            expected_vault: PathBuf,
+        ) {
+            self.state
+                .enqueue_job(crate::queue::QueuedJobKind::Encrypt {
+                    sources: vec![src],
+                    password: Zeroizing::new("QueuePass!1".into()),
+                    recovery_entropy: rpm_core::generate_recovery_entropy(),
+                    keyfile: None,
+                    output_dir: Some(out_dir),
+                    compress: true,
+                    container_size_bytes: None,
+                    stealth: false,
+                    reed_solomon: false,
+                    secure_wipe: false,
+                    wipe_passes: 1,
+                    kdf: rpm_core::KdfParams::fast_test(),
+                });
+            self.state
+                .enqueue_job(crate::queue::QueuedJobKind::IntegrityCheck {
+                    path: expected_vault,
+                });
+        }
     }
 }

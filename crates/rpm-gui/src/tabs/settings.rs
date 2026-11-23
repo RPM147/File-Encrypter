@@ -4,8 +4,26 @@ use eframe::egui;
 use rpm_storage::config::{AppLanguage, ThemeMode};
 use rpm_storage::shell_integration;
 
-use crate::state::{AppState, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, UI_SCALE_PRESETS};
+use crate::i18n::Strings;
+use crate::state::{
+    AppState, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, IDLE_CLEAR_PRESET_MINUTES,
+    UI_SCALE_PRESETS,
+};
 use crate::theme;
+
+fn idle_clear_label(minutes: u16, s: &'static Strings, lang: AppLanguage) -> String {
+    match minutes {
+        0 => s.idle_clear_off.to_owned(),
+        1 => s.idle_clear_1_min.to_owned(),
+        5 => s.idle_clear_5_min.to_owned(),
+        15 => s.idle_clear_15_min.to_owned(),
+        30 => s.idle_clear_30_min.to_owned(),
+        other => match lang {
+            AppLanguage::Tr => format!("{other} dakika"),
+            AppLanguage::En => format!("{other} min"),
+        },
+    }
+}
 
 pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
     let s = state.strings();
@@ -123,6 +141,25 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
             ui.add(egui::Slider::new(&mut state.config.wipe_passes, 1..=5));
         });
         ui.weak(s.wipe_warning_note);
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_idle_clear);
+            let selected_lbl =
+                idle_clear_label(state.config.idle_clear_minutes, s, state.config.language);
+            egui::ComboBox::from_id_salt("set_idle_clear_minutes")
+                .selected_text(selected_lbl)
+                .show_ui(ui, |ui| {
+                    for mins in IDLE_CLEAR_PRESET_MINUTES {
+                        let lbl = idle_clear_label(mins, s, state.config.language);
+                        ui.selectable_value(&mut state.config.idle_clear_minutes, mins, lbl);
+                    }
+                });
+        });
+        ui.weak(s.idle_clear_note);
+
+        ui.checkbox(&mut state.config.notify_on_complete, s.chk_notify_complete);
 
         ui.add_space(4.0);
         if ui

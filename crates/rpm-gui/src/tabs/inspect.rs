@@ -9,6 +9,7 @@ use rpm_storage::DEFAULT_PREVIEW_MAX_BYTES;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::i18n::Strings;
+use crate::queue::QueuedJobKind;
 use crate::state::{AppState, WorkerUpdate};
 use crate::worker::VaultDiffTarget;
 use crate::{theme, worker};
@@ -173,8 +174,8 @@ pub fn ui(
             });
         }
 
-        ui.add_enabled_ui(!state.busy, |ui| {
-            ui.horizontal_wrapped(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!state.busy, |ui| {
                 if ui.button(s.btn_repair).clicked() {
                     let path = PathBuf::from(state.inspect.vault_path.trim());
                     if path.is_file() {
@@ -193,6 +194,16 @@ pub fn ui(
                         state.set_status(s.err_select_vault, true);
                     }
                 }
+            });
+            if ui.small_button(s.btn_queue_short).clicked() {
+                let path = PathBuf::from(state.inspect.vault_path.trim());
+                if path.is_file() {
+                    state.enqueue_job(QueuedJobKind::Repair { path });
+                } else {
+                    state.set_status(s.err_select_vault, true);
+                }
+            }
+            ui.add_enabled_ui(!state.busy, |ui| {
                 if ui.button(s.btn_integrity_check).clicked() {
                     let p = PathBuf::from(state.inspect.vault_path.trim());
                     if !p.is_file() {
@@ -209,6 +220,16 @@ pub fn ui(
                         );
                     }
                 }
+            });
+            if ui.small_button(s.btn_queue_short).clicked() {
+                let path = PathBuf::from(state.inspect.vault_path.trim());
+                if path.is_file() {
+                    state.enqueue_job(QueuedJobKind::IntegrityCheck { path });
+                } else {
+                    state.set_status(s.err_select_vault, true);
+                }
+            }
+            ui.add_enabled_ui(!state.busy, |ui| {
                 if ui
                     .add(theme::primary_button(s.btn_inspect_meta, ui.visuals()))
                     .clicked()
