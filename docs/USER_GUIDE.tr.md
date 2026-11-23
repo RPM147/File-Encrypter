@@ -14,10 +14,10 @@ Uygulama varsayılan olarak Türkçe arayüzle açılır; sol menünün altında
 
 Şifreleme ve çözme sırasında ilerleme çubuğunun yanında aktarım hızını (ör. MiB/s) ve tahmini kalan süreyi görebilirsiniz.
 
-1. Dosyaları veya klasörleri uygulama penceresine sürükleyin. **Şifrele** sekmesinde listeyi ve kasanın kaydedileceği yeri kontrol edin.
+1. Dosyaları veya klasörleri uygulama penceresine sürükleyin. **Şifrele** sekmesinde listeyi ve kasanın kaydedileceği yeri kontrol edin. İsterseniz **Şifreleme Profili** alanından hazır bir şablon (*Günlük Yedek*, *Uzun Ömürlü Arşiv (RS)*, *Maksimum Gizlilik (Stealth)*) seçebilir veya kendi parolasız profilinizi kaydedebilirsiniz; kaynak eklediğinizde **Ön Kontrol (Boyut ve Kapasite Tahmini)** kartından toplam boyutu, RS ek yükünü ve sabit konteyner sığma durumunu başlatmadan önce görün.
 2. Uzun, benzersiz bir parola girip tekrarlayın. Ek koruma için boş olmayan bir **anahtar dosyası (keyfile)** seçebilirsiniz. Bu durumda kasayı parolayla her açtığınızda aynı içeriğe sahip dosya da gerekir. Anahtar dosyasının yedeğini kasa dışında, güvenli bir yerde saklayın.
-3. **Şimdi Şifrele** düğmesine basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın. Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
-4. İşlem tamamlandığında yeni kasayı ayrı bir klasöre çözerek dosyalarınızı açabildiğinizi kontrol edin. Bu kontrolü yapana kadar asılları saklayın.
+3. **Şimdi Şifrele** düğmesine (veya arka planda başka iş sürerken **Kuyruğa Ekle** düğmesine) basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın. Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
+4. İşlem tamamlandığında alt hızlı erişim şeridindeki **Şimdi Doğrula** veya **Klasörde Göster** düğmesini kullanın ve yeni kasayı ayrı bir klasöre çözerek dosyalarınızı açabildiğinizi kontrol edin. Bu kontrolü yapana kadar asılları saklayın.
 
 ## Konteyner Boyutu (Padding) ve Gizli Kasa (Makul İnkâr Edilebilirlik)
 
@@ -64,7 +64,11 @@ Terminalde aynı karşılaştırmayı yapmak için aşağıdaki komutu kullanın
 ./rpm-encrypter-cli diff ./onceki.vault ./sonraki.vault
 ```
 
-## Ayarlar ve Parola Üretici
+## Ayarlar, Oturum Kilidi, İş Kuyruğu ve Parola Üretici
+
+**Hareketsizlikte Oturum Temizleme ve Panik Kilidi (`Ctrl+L`):** Sol kenar çubuğunun altındaki **Oturumu Temizle (Ctrl+L)** düğmesine basarak (veya `Ctrl+L` kısayoluyla) uygulama içindeki tüm parola alanlarını, kurtarma cümlelerini, RAM önizlemeyi, yüklenmiş dosya listesini, karşılaştırma çıktılarını, günlüğü ve bekleyen iş kuyruğunu anında sıfırlayabilirsiniz. **Ayarlar → Hareketsizlikte Oturum Temizleme** `1–30` dakika (varsayılan `5 dakika`) işlem yapılmadığında aynı temizliği otomatik uygular; aktif aktarım sürerken sayaç ertelenir. Bu temizlik **sistem panonuzdaki içeriklere kesinlikle dokunmaz**.
+
+**Toplu İş Kuyruğu ve Hızlı Aksiyonlar:** **Şifrele** / **Çöz** sekmelerindeki **Kuyruğa Ekle** veya **İncele** sekmesindeki **+ Kuyruk** düğmeleriyle işleri sıralayıp duraklatabilir veya sırasını değiştirebilirsiniz. İşlem tamamlanınca alt şeritte **Klasörde Göster** ve uygun işlemlerde **Şimdi Doğrula** düğmeleri görünür; pencere odak dışındaysa görev çubuğu uyarısı tetiklenir (ayarlardan kapatılabilir).
 
 **Ayarlar** sekmesinde Argon2id yineleme sayısı (1–10), paroladan anahtar türetirken yapılan iş miktarını belirler. Paralellik (1–16), bu işin kaç şeride bölüneceğini ayarlar. Arayüzü büyütmek veya küçültmek için %80–150 arasındaki hazır ölçeklerden birini seçin. Tercihlerin sonraki açılışta da kullanılması için **Tercihleri Kaydet** düğmesine basın.
 
@@ -124,11 +128,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.4.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.5.0/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.4.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.4.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.5.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.5.0
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)

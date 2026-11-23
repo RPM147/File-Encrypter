@@ -14,10 +14,10 @@ The application opens in Turkish by default; switch language (`TR / EN`) and the
 
 During encryption and decryption, live throughput (e.g., `MiB/s`) and an estimated time remaining (ETA) appear next to the progress bar.
 
-1. Drag and drop files or folders onto the window (or use **Add Files...** / **Add Folder...**). Verify the source list and destination directory on the **Encrypt** tab.
+1. Drag and drop files or folders onto the window (or use **Add Files...** / **Add Folder...**). Verify the source list and destination directory on the **Encrypt** tab. Optionally choose a built-in **Encryption Profile** (*Daily Backup*, *Long-Term Archive (RS)*, *Maximum Privacy (Stealth)*) or save your own non-secret preset; once sources are added, review the **Pre-Flight Size & Fit Estimate** card for total size, RS parity overhead, and fixed-container fit before starting.
 2. Enter and confirm a strong, unique password. Optionally bind a non-empty **keyfile** as a second factor; if bound, that exact file is required alongside the password on every unlock, so back it up safely outside the vault.
-3. Click **Encrypt Now**. Write down the **24-word BIP-39 recovery phrase** in order and store it separately from the vault, then confirm to start. Anyone holding this phrase can unlock the vault without the password or keyfile.
-4. Once finished, test decrypting the new `.vault` into a separate folder before deleting or wiping the originals.
+3. Click **Encrypt Now** (or **Add to Queue** to enqueue after another running job). Write down the **24-word BIP-39 recovery phrase** in order and store it separately from the vault, then confirm to start. Anyone holding this phrase can unlock the vault without the password or keyfile.
+4. Once finished, use **Verify Now** or **Show in Folder** in the bottom quick-action strip (and test decrypting the new `.vault` into a separate folder) before deleting or wiping the originals.
 
 ## Container Size (Padding) & Hidden Vault (Plausible Deniability)
 
@@ -64,9 +64,11 @@ Terminal equivalent (supports `--json`, `--keyfile-a`, `--keyfile-b`, `--recover
 ./rpm-encrypter-cli diff ./previous.vault ./current.vault
 ```
 
-## Settings & Password Generator
+## Settings, Idle Auto-Lock, Batch Queue & Password Generator
 
-- **Settings:** Configure Argon2id memory (`16–256 MiB`), iterations (`1–10`), parallelism (`1–16`), default gzip compression, secure wipe passes, and persistent UI scale (`80–150%`). Click **Save Preferences** to persist settings across restarts.
+- **Idle Auto-Lock & Clear Session (`Ctrl+L`):** Click **Clear Session (Ctrl+L)** at the bottom of the left sidebar (or press `Ctrl+L`) anytime to scrub all in-app passwords, recovery phrases, RAM previews, loaded manifests, diff results, logs, and pending queued credentials. **Settings → Auto-Clear Idle Session** triggers the same cleanup automatically after `1–30` minutes of inactivity (default `5 min`; active background transfers defer the timer). This cleanup **never touches or overwrites your OS clipboard**.
+- **Batch Job Queue & Quick Actions:** Click **Add to Queue** on **Encrypt** / **Decrypt** (or **+ Queue** beside Repair / Integrity Check on **Inspect**) to run multiple operations sequentially with reorder/pause/cancel-pause support. After Encrypt, Decrypt, Repair, or Re-Key finishes, use **Show in Folder** or **Verify Now** in the bottom quick-action strip; if unfocused, the window can request taskbar attention (configurable in **Settings**).
+- **Settings:** Configure Argon2id memory (`16–256 MiB`), iterations (`1–10`), parallelism (`1–16`), default gzip compression, secure wipe passes, idle auto-clear duration, unfocused completion alerts, and persistent UI scale (`80–150%`). Click **Save Preferences** to persist settings across restarts.
 - **Password Gen:** Independently toggle uppercase letters, lowercase letters, digits, and symbols, and optionally exclude visually ambiguous characters (`0`, `O`, `1`, `l`, `I`).
 
 ## Changing a password (Re-Key)
@@ -123,11 +125,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.4.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.5.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.4.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.4.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.5.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.5.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.
