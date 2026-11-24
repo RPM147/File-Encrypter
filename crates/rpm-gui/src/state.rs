@@ -21,6 +21,7 @@ use rpm_storage::{GuiLaunchIntent, LaunchTab};
 use zeroize::Zeroize;
 
 use crate::estimator::{estimate_encrypt_preflight, EncryptPreflightEstimate, SourceSizeSummary};
+use crate::explorer::{matches_filters, FileCategoryFilter, ManifestViewMode, SizeFilter};
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
 use crate::queue::{format_job_label, QueuedJob, QueuedJobKind};
@@ -452,6 +453,11 @@ pub struct InspectFields {
     pub manifest_vault: Option<PathBuf>,
     pub selected_paths: HashSet<String>,
     pub filter_query: String,
+    pub view_mode: ManifestViewMode,
+    pub category_filter: FileCategoryFilter,
+    pub size_filter: SizeFilter,
+    pub tree_default_open: bool,
+    pub tree_id_epoch: u64,
     pub extract_output_dir: String,
 }
 
@@ -478,10 +484,12 @@ impl InspectFields {
                 self.extract_output_dir = parent.display().to_string();
             }
         }
+        self.tree_default_open = entries.len() <= 200;
+        self.tree_id_epoch = self.tree_id_epoch.wrapping_add(1);
         self.manifest = entries;
         self.manifest_vault = Some(vault);
         self.selected_paths.clear();
-        self.filter_query.clear();
+        self.reset_filters();
     }
 
     pub fn reset_manifest(&mut self) {
@@ -489,20 +497,59 @@ impl InspectFields {
         self.manifest.clear();
         self.manifest_vault = None;
         self.selected_paths.clear();
+        self.tree_default_open = true;
+        self.tree_id_epoch = self.tree_id_epoch.wrapping_add(1);
+        self.reset_filters();
+    }
+
+    pub fn expand_all_tree(&mut self) {
+        self.tree_default_open = true;
+        self.tree_id_epoch = self.tree_id_epoch.wrapping_add(1);
+    }
+
+    pub fn collapse_all_tree(&mut self) {
+        self.tree_default_open = false;
+        self.tree_id_epoch = self.tree_id_epoch.wrapping_add(1);
+    }
+
+    pub fn has_active_filters(&self) -> bool {
+        !self.filter_query.trim().is_empty()
+            || self.category_filter != FileCategoryFilter::All
+            || self.size_filter != SizeFilter::All
+    }
+
+    pub fn reset_filters(&mut self) {
         self.filter_query.clear();
+        self.category_filter = FileCategoryFilter::All;
+        self.size_filter = SizeFilter::All;
     }
 
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let q = self.filter_query.trim().to_ascii_lowercase();
-        if q.is_empty() {
+        let q = self
+            .filter_query
+            .trim()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if q.is_empty()
+            && self.category_filter == FileCategoryFilter::All
+            && self.size_filter == SizeFilter::All
+        {
             return (0..self.manifest.len()).collect();
         }
         self.manifest
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.path.to_ascii_lowercase().contains(&q))
+            .filter(|(_, e)| matches_filters(e, &q, self.category_filter, self.size_filter))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    pub fn selected_total_bytes(&self) -> u64 {
+        self.manifest
+            .iter()
+            .filter(|e| self.selected_paths.contains(&e.path))
+            .map(|e| e.size)
+            .fold(0u64, u64::saturating_add)
     }
 
     pub fn select_all_filtered(&mut self) {
@@ -773,6 +820,11 @@ impl AppState {
                 manifest_vault: None,
                 selected_paths: HashSet::new(),
                 filter_query: String::new(),
+                view_mode: ManifestViewMode::default(),
+                category_filter: FileCategoryFilter::default(),
+                size_filter: SizeFilter::default(),
+                tree_default_open: true,
+                tree_id_epoch: 0,
                 extract_output_dir: String::new(),
             },
             diff: DiffFields {

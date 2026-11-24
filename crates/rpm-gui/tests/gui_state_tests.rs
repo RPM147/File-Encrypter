@@ -1819,3 +1819,192 @@ fn reveal_command_spec_and_queue_operations_work_safely() {
     assert_eq!(st.clear_pending_queue(), 2);
     assert!(st.job_queue.is_empty());
 }
+
+#[test]
+fn vault_explorer_tree_building_folder_selection_and_filters() {
+    use rpm_gui::explorer::{
+        build_manifest_tree, category_badge, classify_file_category, file_basename,
+        folder_selection_state, set_folder_selection, FileCategory, FileCategoryFilter,
+        FolderSelectionState, ManifestViewMode, SizeFilter,
+    };
+
+    let entries = vec![
+        FileManifestEntry {
+            path: "docs/readme.txt".into(),
+            size: 512,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "docs\\sub\\photo.PNG".into(),
+            size: 2 * 1024 * 1024,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "media/clip.mp4".into(),
+            size: 5 * 1024 * 1024,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "archive/backup.zip".into(),
+            size: 20 * 1024 * 1024,
+            modified_unix: 0,
+        },
+        FileManifestEntry {
+            path: "root.bin".into(),
+            size: 128,
+            modified_unix: 0,
+        },
+    ];
+
+    assert_eq!(
+        classify_file_category("docs/readme.txt"),
+        FileCategory::Text
+    );
+    assert_eq!(
+        classify_file_category("docs/sub/photo.PNG"),
+        FileCategory::Image
+    );
+    assert_eq!(
+        classify_file_category("archive/backup.zip"),
+        FileCategory::Archive
+    );
+    assert_eq!(
+        classify_file_category("media/clip.mp4"),
+        FileCategory::Media
+    );
+    assert_eq!(classify_file_category("root.bin"), FileCategory::Other);
+    assert_eq!(category_badge(FileCategory::Text), "[TXT]");
+    assert_eq!(file_basename("docs\\sub\\photo.PNG"), "photo.PNG");
+
+    let mut st = fresh_state();
+    st.inspect
+        .set_manifest(PathBuf::from("vault.vault"), entries);
+    assert_eq!(st.inspect.view_mode, ManifestViewMode::Tree);
+    assert_eq!(st.inspect.filtered_indices(), vec![0, 1, 2, 3, 4]);
+
+    let all_idx = st.inspect.filtered_indices();
+    let tree = build_manifest_tree(&st.inspect.manifest, &all_idx);
+    assert_eq!(tree.total_files, 5);
+    assert_eq!(tree.files, vec![4]);
+    let docs_node = tree.dirs.get("docs").expect("docs dir present");
+    assert_eq!(docs_node.total_files, 2);
+    assert_eq!(docs_node.total_bytes, 512 + 2 * 1024 * 1024);
+    assert_eq!(
+        folder_selection_state(docs_node, &st.inspect.manifest, &st.inspect.selected_paths),
+        FolderSelectionState::None
+    );
+
+    // Select one file -> Partial
+    st.inspect.selected_paths.insert("docs/readme.txt".into());
+    assert_eq!(
+        folder_selection_state(docs_node, &st.inspect.manifest, &st.inspect.selected_paths),
+        FolderSelectionState::Partial
+    );
+
+    // Folder checkbox selects entire subtree without affecting siblings
+    set_folder_selection(
+        docs_node,
+        &st.inspect.manifest,
+        &mut st.inspect.selected_paths,
+        true,
+    );
+    assert_eq!(
+        folder_selection_state(docs_node, &st.inspect.manifest, &st.inspect.selected_paths),
+        FolderSelectionState::All
+    );
+    assert_eq!(st.inspect.selected_paths.len(), 2);
+    assert_eq!(st.inspect.selected_total_bytes(), 512 + 2 * 1024 * 1024);
+
+    set_folder_selection(
+        docs_node,
+        &st.inspect.manifest,
+        &mut st.inspect.selected_paths,
+        false,
+    );
+    assert_eq!(
+        folder_selection_state(docs_node, &st.inspect.manifest, &st.inspect.selected_paths),
+        FolderSelectionState::None
+    );
+
+    // Combined Category + Size + Text filters
+    st.inspect.category_filter = FileCategoryFilter::Image;
+    assert_eq!(st.inspect.filtered_indices(), vec![1]);
+    st.inspect.category_filter = FileCategoryFilter::All;
+    st.inspect.size_filter = SizeFilter::Over16MiB;
+    assert_eq!(st.inspect.filtered_indices(), vec![3]);
+    st.inspect.size_filter = SizeFilter::PreviewableOnly;
+    assert_eq!(st.inspect.filtered_indices(), vec![0, 1, 2, 4]);
+    st.inspect.size_filter = SizeFilter::From1To16MiB;
+    assert_eq!(st.inspect.filtered_indices(), vec![1, 2]);
+    st.inspect.filter_query = "sub/photo".into();
+    assert_eq!(st.inspect.filtered_indices(), vec![1]);
+    assert!(st.inspect.has_active_filters());
+    st.inspect.reset_filters();
+    assert!(!st.inspect.has_active_filters());
+    assert_eq!(st.inspect.filtered_indices(), vec![0, 1, 2, 3, 4]);
+
+    // Headless render across Tree, Flat, TR, EN + expand/collapse epochs
+    let prev_epoch = st.inspect.tree_id_epoch;
+    st.inspect.collapse_all_tree();
+    assert!(!st.inspect.tree_default_open);
+    assert!(st.inspect.tree_id_epoch > prev_epoch);
+    st.inspect.expand_all_tree();
+    assert!(st.inspect.tree_default_open);
+
+    let ctx = egui::Context::default();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        st.config.language = lang;
+        for mode in [ManifestViewMode::Tree, ManifestViewMode::Flat] {
+            st.inspect.view_mode = mode;
+            ctx.run_ui(Default::default(), |ui| {
+                rpm_gui::tabs::inspect::ui(ui, &ctx, &mut st, &tx, &cancel);
+            })
+            .textures_delta
+            .clear();
+        }
+    }
+
+    // Package 2 i18n parity check (universal numeric size ranges checked non-empty separately)
+    let pkg2_localized = |s: &i18n::Strings| {
+        [
+            s.view_tree,
+            s.view_flat,
+            s.btn_expand_all,
+            s.btn_collapse_all,
+            s.btn_reset_filters,
+            s.lbl_filter_type,
+            s.lbl_filter_size,
+            s.cat_all,
+            s.cat_text,
+            s.cat_image,
+            s.cat_archive,
+            s.cat_media,
+            s.cat_other,
+            s.size_all,
+            s.size_previewable,
+            s.ins_no_matching_files,
+            s.preview_search_hint,
+            s.preview_line_numbers,
+            s.preview_match_prev,
+            s.preview_match_next,
+            s.preview_zoom_fit,
+            s.preview_rotate_left,
+            s.preview_rotate_right,
+            s.preview_empty_binary,
+        ]
+    };
+    for (tr, en) in pkg2_localized(&i18n::TR)
+        .into_iter()
+        .zip(pkg2_localized(&i18n::EN))
+    {
+        assert!(!tr.is_empty() && !en.is_empty());
+        assert_ne!(tr, en);
+    }
+    for s in [&i18n::TR, &i18n::EN] {
+        assert!(!s.size_under_1m.is_empty());
+        assert!(!s.size_1_to_16m.is_empty());
+        assert!(!s.size_over_16m.is_empty());
+    }
+}

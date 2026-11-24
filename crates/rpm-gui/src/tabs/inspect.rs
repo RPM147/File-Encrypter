@@ -5,10 +5,18 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
+use rpm_core::FileManifestEntry;
+use rpm_storage::config::AppLanguage;
 use rpm_storage::DEFAULT_PREVIEW_MAX_BYTES;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::explorer::{
+    build_manifest_tree, category_badge, classify_file_category, file_basename,
+    folder_selection_state, set_folder_selection, FileCategory, FileCategoryFilter,
+    FolderSelectionState, ManifestTreeNode, ManifestViewMode, SizeFilter,
+};
 use crate::i18n::Strings;
+use crate::progress::format_bytes;
 use crate::queue::QueuedJobKind;
 use crate::state::{AppState, WorkerUpdate};
 use crate::worker::VaultDiffTarget;
@@ -21,6 +29,158 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KiB", (bytes as f64) / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn badge_color(cat: FileCategory, visuals: &egui::Visuals) -> egui::Color32 {
+    let dark = visuals.dark_mode;
+    match cat {
+        FileCategory::Text => {
+            if dark {
+                egui::Color32::from_rgb(94, 234, 212)
+            } else {
+                egui::Color32::from_rgb(13, 148, 136)
+            }
+        }
+        FileCategory::Image => {
+            if dark {
+                egui::Color32::from_rgb(125, 211, 252)
+            } else {
+                egui::Color32::from_rgb(2, 132, 199)
+            }
+        }
+        FileCategory::Archive => {
+            if dark {
+                egui::Color32::from_rgb(252, 211, 77)
+            } else {
+                egui::Color32::from_rgb(180, 83, 9)
+            }
+        }
+        FileCategory::Media => {
+            if dark {
+                egui::Color32::from_rgb(216, 180, 254)
+            } else {
+                egui::Color32::from_rgb(126, 34, 206)
+            }
+        }
+        FileCategory::Other => visuals.weak_text_color(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_manifest_file_row(
+    ui: &mut egui::Ui,
+    entry: &FileManifestEntry,
+    display_name: &str,
+    full_path_tooltip: Option<&str>,
+    selected_paths: &mut std::collections::HashSet<String>,
+    busy: bool,
+    requested: &mut Option<String>,
+    s: &'static Strings,
+) {
+    let mut checked = selected_paths.contains(&entry.path);
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut checked, "").changed() {
+            if checked {
+                selected_paths.insert(entry.path.clone());
+            } else {
+                selected_paths.remove(&entry.path);
+            }
+        }
+        let too_large = entry.size > DEFAULT_PREVIEW_MAX_BYTES as u64;
+        let preview_btn = ui.add_enabled(
+            !busy && !too_large,
+            egui::Button::new(s.btn_preview).small(),
+        );
+        let preview_btn = if too_large {
+            preview_btn.on_disabled_hover_text(s.preview_too_large_tip)
+        } else {
+            preview_btn
+        };
+        if preview_btn.clicked() {
+            *requested = Some(entry.path.clone());
+        }
+        let cat = classify_file_category(&entry.path);
+        ui.colored_label(
+            badge_color(cat, ui.visuals()),
+            egui::RichText::new(category_badge(cat)).monospace().small(),
+        );
+        let lbl_resp = ui.label(display_name);
+        if let Some(tip) = full_path_tooltip {
+            lbl_resp.on_hover_text(tip);
+        }
+        ui.weak(format!("({})", format_size(entry.size)));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_manifest_tree_dirs(
+    ui: &mut egui::Ui,
+    node: &ManifestTreeNode,
+    manifest: &[FileManifestEntry],
+    selected_paths: &mut std::collections::HashSet<String>,
+    busy: bool,
+    tree_default_open: bool,
+    tree_epoch: u64,
+    active_filters: bool,
+    requested: &mut Option<String>,
+    s: &'static Strings,
+) {
+    for dir_node in node.dirs.values() {
+        let sel_state = folder_selection_state(dir_node, manifest, selected_paths);
+        let mut all_checked = sel_state == FolderSelectionState::All;
+        let is_partial = sel_state == FolderSelectionState::Partial;
+
+        let id = if active_filters {
+            ui.make_persistent_id(("inspect_tree_filtered", &dir_node.full_path))
+        } else {
+            ui.make_persistent_id(("inspect_tree", tree_epoch, &dir_node.full_path))
+        };
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id,
+            active_filters || tree_default_open,
+        );
+        let header_res = state.show_header(ui, |ui| {
+            let chk = ui.add(egui::Checkbox::new(&mut all_checked, "").indeterminate(is_partial));
+            if chk.changed() {
+                set_folder_selection(dir_node, manifest, selected_paths, all_checked);
+            }
+            ui.strong(&dir_node.name);
+            ui.weak(format!(
+                "({}, {})",
+                dir_node.total_files,
+                format_bytes(dir_node.total_bytes)
+            ));
+        });
+        header_res.body(|ui| {
+            render_manifest_tree_dirs(
+                ui,
+                dir_node,
+                manifest,
+                selected_paths,
+                busy,
+                tree_default_open,
+                tree_epoch,
+                active_filters,
+                requested,
+                s,
+            );
+            for &idx in &dir_node.files {
+                if let Some(entry) = manifest.get(idx) {
+                    render_manifest_file_row(
+                        ui,
+                        entry,
+                        file_basename(&entry.path),
+                        Some(entry.path.as_str()),
+                        selected_paths,
+                        busy,
+                        requested,
+                        s,
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -291,58 +451,143 @@ pub fn ui(
             ui.strong(s.ins_selective_heading);
             ui.weak(s.ins_preview_limits_note);
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut state.inspect.filter_query)
                         .hint_text(s.ins_filter_hint)
-                        .desired_width(240.0),
+                        .desired_width(210.0),
                 );
+                ui.label(s.lbl_filter_type);
+                egui::ComboBox::from_id_salt("ins_category_filter")
+                    .selected_text(state.inspect.category_filter.localized_label(s))
+                    .show_ui(ui, |ui| {
+                        for cat in FileCategoryFilter::ALL {
+                            ui.selectable_value(
+                                &mut state.inspect.category_filter,
+                                cat,
+                                cat.localized_label(s),
+                            );
+                        }
+                    });
+                ui.label(s.lbl_filter_size);
+                egui::ComboBox::from_id_salt("ins_size_filter")
+                    .selected_text(state.inspect.size_filter.localized_label(s))
+                    .show_ui(ui, |ui| {
+                        for sz in SizeFilter::ALL {
+                            ui.selectable_value(
+                                &mut state.inspect.size_filter,
+                                sz,
+                                sz.localized_label(s),
+                            );
+                        }
+                    });
+                ui.selectable_value(
+                    &mut state.inspect.view_mode,
+                    ManifestViewMode::Tree,
+                    s.view_tree,
+                );
+                ui.selectable_value(
+                    &mut state.inspect.view_mode,
+                    ManifestViewMode::Flat,
+                    s.view_flat,
+                );
+            });
+
+            let indices = state.inspect.filtered_indices();
+            let shown_count = indices.len();
+            let total_count = state.inspect.manifest.len();
+            let selected_count = state.inspect.selected_paths.len();
+            let selected_bytes = state.inspect.selected_total_bytes();
+            let has_filters = state.inspect.has_active_filters();
+
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(s.btn_select_all).clicked() {
                     state.inspect.select_all_filtered();
                 }
                 if ui.button(s.btn_clear_selection).clicked() {
                     state.inspect.clear_selection();
                 }
-                ui.weak(format!(
-                    "{}/{}",
-                    state.inspect.selected_paths.len(),
-                    state.inspect.manifest.len()
-                ));
+                if state.inspect.view_mode == ManifestViewMode::Tree && !has_filters {
+                    if ui.small_button(s.btn_expand_all).clicked() {
+                        state.inspect.expand_all_tree();
+                    }
+                    if ui.small_button(s.btn_collapse_all).clicked() {
+                        state.inspect.collapse_all_tree();
+                    }
+                }
+                if has_filters && ui.small_button(s.btn_reset_filters).clicked() {
+                    state.inspect.reset_filters();
+                }
+                let summary = match state.config.language {
+                    AppLanguage::Tr => format!(
+                        "Seçili: {selected_count}/{total_count} ({}) · Gösterilen: {shown_count}/{total_count}",
+                        format_bytes(selected_bytes)
+                    ),
+                    AppLanguage::En => format!(
+                        "Selected: {selected_count}/{total_count} ({}) · Showing: {shown_count}/{total_count}",
+                        format_bytes(selected_bytes)
+                    ),
+                };
+                ui.weak(summary);
             });
 
             let mut requested = None;
-            let indices = state.inspect.filtered_indices();
             egui::ScrollArea::vertical()
                 .id_salt("inspect_manifest_list")
-                .max_height(200.0)
+                .max_height(260.0)
                 .show(ui, |ui| {
-                    for idx in indices {
-                        if let Some(entry) = state.inspect.manifest.get(idx) {
-                            let mut checked = state.inspect.selected_paths.contains(&entry.path);
-                            ui.horizontal(|ui| {
-                                if ui.checkbox(&mut checked, "").changed() {
-                                    if checked {
-                                        state.inspect.selected_paths.insert(entry.path.clone());
-                                    } else {
-                                        state.inspect.selected_paths.remove(&entry.path);
-                                    }
+                    if indices.is_empty() {
+                        ui.weak(s.ins_no_matching_files);
+                        return;
+                    }
+                    match state.inspect.view_mode {
+                        ManifestViewMode::Flat => {
+                            for idx in indices {
+                                if let Some(entry) = state.inspect.manifest.get(idx) {
+                                    render_manifest_file_row(
+                                        ui,
+                                        entry,
+                                        &entry.path,
+                                        None,
+                                        &mut state.inspect.selected_paths,
+                                        state.busy,
+                                        &mut requested,
+                                        s,
+                                    );
                                 }
-                                let too_large = entry.size > DEFAULT_PREVIEW_MAX_BYTES as u64;
-                                let preview_btn = ui.add_enabled(
-                                    !state.busy && !too_large,
-                                    egui::Button::new(s.btn_preview).small(),
-                                );
-                                let preview_btn = if too_large {
-                                    preview_btn.on_disabled_hover_text(s.preview_too_large_tip)
-                                } else {
-                                    preview_btn
-                                };
-                                if preview_btn.clicked() {
-                                    requested = Some(entry.path.clone());
+                            }
+                        }
+                        ManifestViewMode::Tree => {
+                            let tree = build_manifest_tree(&state.inspect.manifest, &indices);
+                            let busy = state.busy;
+                            let tree_default_open = state.inspect.tree_default_open;
+                            let tree_epoch = state.inspect.tree_id_epoch;
+                            render_manifest_tree_dirs(
+                                ui,
+                                &tree,
+                                &state.inspect.manifest,
+                                &mut state.inspect.selected_paths,
+                                busy,
+                                tree_default_open,
+                                tree_epoch,
+                                has_filters,
+                                &mut requested,
+                                s,
+                            );
+                            for &idx in &tree.files {
+                                if let Some(entry) = state.inspect.manifest.get(idx) {
+                                    render_manifest_file_row(
+                                        ui,
+                                        entry,
+                                        file_basename(&entry.path),
+                                        Some(entry.path.as_str()),
+                                        &mut state.inspect.selected_paths,
+                                        busy,
+                                        &mut requested,
+                                        s,
+                                    );
                                 }
-                                ui.label(&entry.path);
-                                ui.weak(format!("({})", format_size(entry.size)));
-                            });
+                            }
                         }
                     }
                 });

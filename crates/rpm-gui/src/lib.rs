@@ -1,5 +1,6 @@
 pub mod app;
 pub mod estimator;
+pub mod explorer;
 pub mod fonts;
 pub mod i18n;
 pub mod progress;
