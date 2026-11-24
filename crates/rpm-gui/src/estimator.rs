@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rpm_core::constants::{DEFAULT_CHUNK_SIZE, HIDDEN_MINI_HEADER_WIRE_SIZE};
 use rpm_core::rs::{RS_BLOCK_DATA_CAP, RS_BLOCK_WIRE_SIZE};
 
-use crate::state::{ContainerSizeError, ContainerSizePreset, CONTAINER_MAX_MIB, CONTAINER_MIB};
+use crate::state::{
+    ContainerSizeError, ContainerSizePreset, SplitSizeError, SplitSizePreset, CONTAINER_MAX_MIB,
+    CONTAINER_MIB,
+};
 
 pub const MAX_SCAN_ENTRIES: u64 = 250_000;
 pub const RS_HEADER_BYTES: u64 = 48;
@@ -140,6 +143,16 @@ pub enum ContainerFitStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitEstimateStatus {
+    Off,
+    Invalid(SplitSizeError),
+    Parts {
+        part_bytes: u64,
+        estimated_parts: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptPreflightEstimate {
     pub outer: SourceSizeSummary,
     pub hidden: SourceSizeSummary,
@@ -149,6 +162,7 @@ pub struct EncryptPreflightEstimate {
     pub estimated_disk_bytes: u64,
     pub rs_overhead_bytes: u64,
     pub fit: ContainerFitStatus,
+    pub split: SplitEstimateStatus,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,6 +175,33 @@ pub fn estimate_encrypt_preflight(
     reed_solomon: bool,
     container_preset: ContainerSizePreset,
     container_custom_mb: &str,
+) -> EncryptPreflightEstimate {
+    estimate_encrypt_preflight_with_split(
+        outer,
+        hidden,
+        enable_hidden,
+        compress,
+        hidden_compress,
+        reed_solomon,
+        container_preset,
+        container_custom_mb,
+        SplitSizePreset::None,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_encrypt_preflight_with_split(
+    outer: &SourceSizeSummary,
+    hidden: &SourceSizeSummary,
+    enable_hidden: bool,
+    compress: bool,
+    hidden_compress: bool,
+    reed_solomon: bool,
+    container_preset: ContainerSizePreset,
+    container_custom_mb: &str,
+    split_preset: SplitSizePreset,
+    split_custom_mb: &str,
 ) -> EncryptPreflightEstimate {
     let outer_estimated_bytes = estimate_compartment_bytes(outer, true);
     let hidden_estimated_bytes = if enable_hidden {
@@ -239,6 +280,15 @@ pub fn estimate_encrypt_preflight(
         0
     };
 
+    let split = match split_preset.resolve_bytes(split_custom_mb) {
+        Ok(None) => SplitEstimateStatus::Off,
+        Ok(Some(part_bytes)) => SplitEstimateStatus::Parts {
+            part_bytes,
+            estimated_parts: estimated_disk_bytes.max(1).div_ceil(part_bytes),
+        },
+        Err(err) => SplitEstimateStatus::Invalid(err),
+    };
+
     EncryptPreflightEstimate {
         outer: outer.clone(),
         hidden: hidden.clone(),
@@ -248,5 +298,6 @@ pub fn estimate_encrypt_preflight(
         estimated_disk_bytes,
         rs_overhead_bytes,
         fit,
+        split,
     }
 }

@@ -83,7 +83,7 @@ pub fn ui(
         ui.horizontal(|ui| {
             if ui.button(s.btn_add_vaults).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("RPM Vault", &["vault"])
+                    .add_filter("RPM Vault", &["vault", "001"])
                     .add_filter("All Files", &["*"])
                     .pick_files()
                 {

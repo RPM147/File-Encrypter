@@ -18,7 +18,7 @@ use crate::explorer::{
 use crate::i18n::Strings;
 use crate::progress::format_bytes;
 use crate::queue::QueuedJobKind;
-use crate::state::{AppState, WorkerUpdate};
+use crate::state::{AppState, SplitSizeError, SplitSizePreset, WorkerUpdate};
 use crate::worker::VaultDiffTarget;
 use crate::{theme, worker};
 
@@ -203,7 +203,7 @@ fn diff_vault_side_ui(
             ui.text_edit_singleline(vault_path);
             if ui.button(s.btn_browse).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("RPM Vault", &["vault"])
+                    .add_filter("RPM Vault", &["vault", "001"])
                     .add_filter("All Files", &["*"])
                     .pick_file()
                 {
@@ -277,7 +277,7 @@ pub fn ui(
             }
             if ui.button(s.btn_browse).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("RPM Vault", &["vault"])
+                    .add_filter("RPM Vault", &["vault", "001"])
                     .add_filter("All Files", &["*"])
                     .pick_file()
                 {
@@ -817,6 +817,164 @@ pub fn ui(
                         .desired_rows(10)
                         .font(egui::TextStyle::Monospace),
                 );
+            });
+    });
+
+    ui.add_space(12.0);
+    theme::card_frame(ui.visuals()).show(ui, |ui| {
+        egui::CollapsingHeader::new(s.split_tool_heading)
+            .id_salt("inspect_split_join_tool")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.weak(s.split_tool_subtitle);
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(s.lbl_split_source);
+                    ui.text_edit_singleline(&mut state.split_join.split_source_path);
+                    if ui.button(s.btn_browse).clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("RPM Vault", &["vault"])
+                            .add_filter("All Files", &["*"])
+                            .pick_file()
+                        {
+                            state.split_join.split_source_path = p.display().to_string();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(s.lbl_split_part_size);
+                    egui::ComboBox::from_id_salt("tool_split_preset")
+                        .selected_text(state.split_join.split_preset.localized_label(s))
+                        .show_ui(ui, |ui| {
+                            for preset in SplitSizePreset::STANDALONE_ALL {
+                                ui.selectable_value(
+                                    &mut state.split_join.split_preset,
+                                    preset,
+                                    preset.localized_label(s),
+                                );
+                            }
+                        });
+                    if state.split_join.split_preset == SplitSizePreset::Custom {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.split_join.split_custom_mb)
+                                .desired_width(80.0),
+                        );
+                        ui.label("MiB");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(s.lbl_output_folder);
+                    ui.text_edit_singleline(&mut state.split_join.split_output_dir);
+                    if ui.button(s.btn_browse).clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            state.split_join.split_output_dir = dir.display().to_string();
+                        }
+                    }
+                });
+                ui.add_enabled_ui(!state.busy, |ui| {
+                    if ui.button(s.btn_split_now).clicked() {
+                        let src = PathBuf::from(state.split_join.split_source_path.trim());
+                        if !src.is_file() {
+                            state.set_status(s.err_split_select_vault, true);
+                        } else {
+                            let part_res = state
+                                .split_join
+                                .split_preset
+                                .resolve_bytes(&state.split_join.split_custom_mb);
+                            let out_dir_res = {
+                                let trimmed = state.split_join.split_output_dir.trim();
+                                if trimmed.is_empty() {
+                                    Ok(None)
+                                } else {
+                                    let d = PathBuf::from(trimmed);
+                                    if d.is_dir() {
+                                        Ok(Some(d))
+                                    } else {
+                                        Err(s.err_invalid_out_dir)
+                                    }
+                                }
+                            };
+                            match (part_res, out_dir_res) {
+                                (Ok(Some(part_bytes)), Ok(out_dir)) => {
+                                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    state.begin_transfer(s.status_splitting);
+                                    worker::spawn_split_vault(
+                                        ctx.clone(),
+                                        tx.clone(),
+                                        Arc::clone(cancel),
+                                        src,
+                                        out_dir,
+                                        part_bytes,
+                                        state.config.language,
+                                    );
+                                }
+                                (Ok(None) | Err(SplitSizeError::InvalidCustomValue), _) => {
+                                    state.set_status(s.err_split_invalid_mb, true);
+                                }
+                                (Err(SplitSizeError::OutOfRange), _) => {
+                                    state.set_status(s.err_split_out_of_range, true);
+                                }
+                                (_, Err(msg)) => {
+                                    state.set_status(msg, true);
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(s.lbl_join_part);
+                    ui.text_edit_singleline(&mut state.split_join.join_part_path);
+                    if ui.button(s.btn_browse).clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Split Vault Part (.001)", &["001"])
+                            .add_filter("All Files", &["*"])
+                            .pick_file()
+                        {
+                            state.split_join.join_part_path = p.display().to_string();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(s.lbl_join_output);
+                    ui.text_edit_singleline(&mut state.split_join.join_output_path);
+                    if ui.button(s.btn_browse).clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("RPM Vault", &["vault"])
+                            .save_file()
+                        {
+                            state.split_join.join_output_path = p.display().to_string();
+                        }
+                    }
+                });
+                ui.add_enabled_ui(!state.busy, |ui| {
+                    if ui.button(s.btn_join_now).clicked() {
+                        let part = PathBuf::from(state.split_join.join_part_path.trim());
+                        if !part.is_file() {
+                            state.set_status(s.err_join_select_part, true);
+                        } else {
+                            let out_opt = {
+                                let trimmed = state.split_join.join_output_path.trim();
+                                (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+                            };
+                            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                            state.begin_transfer(s.status_joining);
+                            worker::spawn_join_vault(
+                                ctx.clone(),
+                                tx.clone(),
+                                Arc::clone(cancel),
+                                part,
+                                out_opt,
+                                state.config.language,
+                            );
+                        }
+                    }
+                });
             });
     });
     if let Some(preview) = &mut state.inspect.preview {

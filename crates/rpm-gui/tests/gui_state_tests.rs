@@ -2008,3 +2008,333 @@ fn vault_explorer_tree_building_folder_selection_and_filters() {
         assert!(!s.size_over_16m.is_empty());
     }
 }
+
+#[test]
+fn split_volumes_presets_profiles_estimator_drop_dedup_workers_and_i18n() {
+    use rpm_gui::estimator::{estimate_encrypt_preflight_with_split, SplitEstimateStatus};
+    use rpm_gui::state::{SplitSizeError, SplitSizePreset, WorkerUpdate};
+    use rpm_storage::{parse_gui_launch_args, LaunchTab};
+    use zeroize::Zeroizing;
+
+    // 1. SplitSizePreset resolution, bounds, and from_mib roundtrip
+    assert_eq!(SplitSizePreset::None.resolve_bytes(""), Ok(None));
+    assert_eq!(
+        SplitSizePreset::MiB25.resolve_bytes(""),
+        Ok(Some(25 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::MiB100.resolve_bytes(""),
+        Ok(Some(100 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::MiB500.resolve_bytes(""),
+        Ok(Some(500 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::MiB2000.resolve_bytes(""),
+        Ok(Some(2000 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::MiB4000Fat32.resolve_bytes(""),
+        Ok(Some(4000 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::Custom.resolve_bytes(" 75 "),
+        Ok(Some(75 * CONTAINER_MIB))
+    );
+    assert_eq!(
+        SplitSizePreset::Custom.resolve_bytes("0"),
+        Err(SplitSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        SplitSizePreset::Custom.resolve_bytes("abc"),
+        Err(SplitSizeError::InvalidCustomValue)
+    );
+    assert_eq!(
+        SplitSizePreset::Custom.resolve_bytes(&(CONTAINER_MAX_MIB + 1).to_string()),
+        Err(SplitSizeError::OutOfRange)
+    );
+    assert_eq!(
+        SplitSizePreset::from_mib(None),
+        (SplitSizePreset::None, None)
+    );
+    assert_eq!(
+        SplitSizePreset::from_mib(Some(4000)),
+        (SplitSizePreset::MiB4000Fat32, None)
+    );
+    assert_eq!(
+        SplitSizePreset::from_mib(Some(350)),
+        (SplitSizePreset::Custom, Some("350".into()))
+    );
+
+    // 2. EncryptProfile split_part_mib save/apply/sanitize roundtrip
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let mut st = AppState::from_config(AppConfig::default(), Some(cfg_path.clone()));
+    st.encrypt.split_preset = SplitSizePreset::MiB4000Fat32;
+    st.save_current_encrypt_profile("FAT32 USB").unwrap();
+    assert_eq!(st.config.encrypt_profiles[0].split_part_mib, Some(4000));
+
+    let reloaded = load_config_from(&cfg_path);
+    assert_eq!(reloaded.encrypt_profiles[0].split_part_mib, Some(4000));
+
+    let mut st2 = AppState::from_config(reloaded, None);
+    let prof = st2.config.encrypt_profiles[0].clone();
+    st2.apply_encrypt_profile(&prof);
+    assert_eq!(st2.encrypt.split_preset, SplitSizePreset::MiB4000Fat32);
+
+    // Invalid custom split value rejected when saving profile
+    st2.encrypt.split_preset = SplitSizePreset::Custom;
+    st2.encrypt.split_custom_mb = "0".into();
+    assert!(st2.save_current_encrypt_profile("BadSplit").is_err());
+
+    // 3. Pre-flight estimator part count calculation
+    let summary_60m = SourceSizeSummary {
+        file_count: 1,
+        dir_count: 0,
+        raw_bytes: 60 * CONTAINER_MIB,
+        ..Default::default()
+    };
+    let hidden_empty = SourceSizeSummary::default();
+    let est = estimate_encrypt_preflight_with_split(
+        &summary_60m,
+        &hidden_empty,
+        false,
+        false,
+        false,
+        false,
+        ContainerSizePreset::Auto,
+        "100",
+        SplitSizePreset::MiB25,
+        "100",
+    );
+    match est.split {
+        SplitEstimateStatus::Parts {
+            part_bytes,
+            estimated_parts,
+        } => {
+            assert_eq!(part_bytes, 25 * CONTAINER_MIB);
+            assert_eq!(estimated_parts, 3);
+        }
+        other => panic!("expected Parts, got {other:?}"),
+    }
+    let bad_split = estimate_encrypt_preflight_with_split(
+        &summary_60m,
+        &hidden_empty,
+        false,
+        false,
+        false,
+        false,
+        ContainerSizePreset::Auto,
+        "100",
+        SplitSizePreset::Custom,
+        "0",
+    );
+    assert_eq!(
+        bad_split.split,
+        SplitEstimateStatus::Invalid(SplitSizeError::InvalidCustomValue)
+    );
+
+    // 4. Launch intent & drag-and-drop deduplication for split `.vault.001..003`
+    let intent = parse_gui_launch_args(&["C:\\Backups\\Archive.vault.001".into()]);
+    assert_eq!(intent.tab, Some(LaunchTab::Decrypt));
+
+    let p1 = dir.path().join("drop.vault.001");
+    let p2 = dir.path().join("drop.vault.002");
+    let p3 = dir.path().join("drop.vault.003");
+    fs::write(&p1, b"part1").unwrap();
+    fs::write(&p2, b"part2").unwrap();
+    fs::write(&p3, b"part3").unwrap();
+    let mut drop_state = fresh_state();
+    drop_state.add_dropped_paths(vec![p1.clone(), p2.clone(), p3.clone()], None);
+    assert_eq!(drop_state.active_tab, Tab::Decrypt);
+    assert_eq!(drop_state.decrypt.vaults, vec![p1]);
+
+    // 5. End-to-end GUI worker flow: split encrypt -> integrity -> inspect -> join -> split
+    let data_file = dir.path().join("movie.bin");
+    let mut raw = Vec::with_capacity(1_200_000);
+    let mut x: u32 = 0x1234_5678;
+    for _ in 0..1_200_000 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        raw.push((x & 0xFF) as u8);
+    }
+    fs::write(&data_file, &raw).unwrap();
+
+    let ctx = egui::Context::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let out_dir = dir.path().join("gui_split");
+    fs::create_dir(&out_dir).unwrap();
+
+    worker::spawn_encrypt_with_split(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        vec![data_file],
+        Zeroizing::new("GuiSplit!1".into()),
+        SecretKey::new([0x77; 32]),
+        None,
+        Some(out_dir.clone()),
+        false,
+        None,
+        Some(CONTAINER_MIB),
+        false,
+        false,
+        false,
+        1,
+        KdfParams::fast_test(),
+        AppLanguage::En,
+    );
+    let first_part = loop {
+        match rx.recv_timeout(Duration::from_secs(60)).unwrap() {
+            WorkerUpdate::EncryptDone {
+                status,
+                output_path,
+            } => {
+                assert!(status.contains("2 part(s)"), "status: {status}");
+                break output_path;
+            }
+            WorkerUpdate::Error(e) => panic!("gui split encrypt failed: {e}"),
+            _ => {}
+        }
+    };
+    assert!(first_part.to_string_lossy().ends_with(".001"));
+
+    worker::spawn_integrity_check(ctx.clone(), tx.clone(), first_part.clone(), AppLanguage::En);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::IntegrityDone { text, ok, .. } => {
+                assert!(ok);
+                assert!(text.contains("Split Parts"), "text: {text}");
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("integrity failed: {e}"),
+            _ => {}
+        }
+    }
+
+    worker::spawn_inspect(
+        ctx.clone(),
+        tx.clone(),
+        first_part.clone(),
+        false,
+        Zeroizing::new("GuiSplit!1".into()),
+        None,
+        AppLanguage::En,
+    );
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::InspectDone { text, manifest, .. } => {
+                assert!(text.contains("Split Parts"), "text: {text}");
+                assert_eq!(manifest.len(), 1);
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("inspect failed: {e}"),
+            _ => {}
+        }
+    }
+
+    let joined_file = dir.path().join("joined_gui.vault");
+    worker::spawn_join_vault(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        first_part,
+        Some(joined_file.clone()),
+        AppLanguage::En,
+    );
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::JoinDone { output_path, .. } => {
+                assert_eq!(output_path, joined_file);
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("join failed: {e}"),
+            _ => {}
+        }
+    }
+
+    let resplit_dir = dir.path().join("resplit_gui");
+    fs::create_dir(&resplit_dir).unwrap();
+    worker::spawn_split_vault(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        joined_file,
+        Some(resplit_dir),
+        CONTAINER_MIB,
+        AppLanguage::Tr,
+    );
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::SplitDone { status, first_part } => {
+                assert!(status.contains("2 parçaya bölündü"), "status: {status}");
+                assert!(first_part.is_file());
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("split failed: {e}"),
+            _ => {}
+        }
+    }
+
+    // 6. Headless render of Encrypt & Inspect tabs with split options in TR & EN
+    let mut ui_st = fresh_state();
+    ui_st.encrypt.split_preset = SplitSizePreset::Custom;
+    ui_st.encrypt.split_custom_mb = "250".into();
+    ui_st.encrypt.sources.push(PathBuf::from("sample.bin"));
+    ui_st.encrypt.preflight_outer = summary_60m;
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        ui_st.config.language = lang;
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::encrypt::ui(ui, &ctx, &mut ui_st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+        ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::inspect::ui(ui, &ctx, &mut ui_st, &tx, &cancel);
+        })
+        .textures_delta
+        .clear();
+    }
+
+    // 7. Package 3 bilingual strings parity
+    let pkg3_localized = |s: &i18n::Strings| {
+        [
+            s.lbl_split_volume,
+            s.split_none,
+            s.split_4000_fat32,
+            s.split_custom,
+            s.hint_split_volume,
+            s.err_split_invalid_mb,
+            s.err_split_out_of_range,
+            s.preflight_split_parts,
+            s.split_tool_heading,
+            s.split_tool_subtitle,
+            s.lbl_split_source,
+            s.lbl_split_part_size,
+            s.btn_split_now,
+            s.lbl_join_part,
+            s.lbl_join_output,
+            s.btn_join_now,
+            s.status_splitting,
+            s.status_joining,
+            s.err_split_select_vault,
+            s.err_join_select_part,
+        ]
+    };
+    for (tr, en) in pkg3_localized(&i18n::TR)
+        .into_iter()
+        .zip(pkg3_localized(&i18n::EN))
+    {
+        assert!(!tr.is_empty() && !en.is_empty());
+        assert_ne!(tr, en);
+    }
+    for s in [&i18n::TR, &i18n::EN] {
+        assert!(!s.split_25_mib.is_empty());
+        assert!(!s.split_100_mib.is_empty());
+        assert!(!s.split_500_mib.is_empty());
+        assert!(!s.split_2000_mib.is_empty());
+    }
+}

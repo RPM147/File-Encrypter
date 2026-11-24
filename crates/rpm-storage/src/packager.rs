@@ -216,12 +216,33 @@ fn append_recursive<W: Write>(
     }
 
     if meta.is_file() {
-        // A destination inside a selected directory may appear after manifest collection.
+        // A destination inside a selected directory may appear after manifest collection
+        // (including multi-part Stealth outputs `<base>.001`, `<base>.002`, ...).
         if let Some(path) = excluded {
-            if path.file_name() == fs_path.file_name()
+            let exact_match = path.file_name() == fs_path.file_name()
                 && fs::canonicalize(path)
-                    .is_ok_and(|out| fs::canonicalize(fs_path).is_ok_and(|input| input == out))
-            {
+                    .is_ok_and(|out| fs::canonicalize(fs_path).is_ok_and(|input| input == out));
+            let split_part_match =
+                crate::split::parse_split_part_path(fs_path).is_some_and(|(cand_base, _)| {
+                    cand_base.file_name() == path.file_name()
+                        && match (path.parent(), cand_base.parent()) {
+                            (Some(p1), Some(p2)) => {
+                                let d1 = if p1.as_os_str().is_empty() {
+                                    Path::new(".")
+                                } else {
+                                    p1
+                                };
+                                let d2 = if p2.as_os_str().is_empty() {
+                                    Path::new(".")
+                                } else {
+                                    p2
+                                };
+                                fs::canonicalize(d1).ok() == fs::canonicalize(d2).ok()
+                            }
+                            _ => cand_base == path,
+                        }
+                });
+            if exact_match || split_part_match {
                 return Ok(());
             }
         }

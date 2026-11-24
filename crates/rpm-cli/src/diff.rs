@@ -4,9 +4,8 @@ use rpm_core::{
     diff_metadata, inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, KdfParams,
     VaultMetadata,
 };
-use rpm_storage::StorageError;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use rpm_storage::{open_vault_reader, StorageError};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -46,7 +45,7 @@ impl DiffArgs {
                 path.display()
             )));
         }
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = open_vault_reader(path)?;
         let keyfile = load_keyfile(keyfile).map_err(StorageError::InvalidPath)?;
         let kind = if recovery {
             "24-word recovery phrase"

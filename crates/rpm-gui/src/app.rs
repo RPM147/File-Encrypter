@@ -232,6 +232,41 @@ impl RpmApp {
                     self.state.set_status(status, false);
                     completed_transfer = true;
                 }
+                WorkerUpdate::SplitDone { status, first_part } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
+                    self.state.busy = false;
+                    self.state.progress = 1.0;
+                    self.state.transfer = None;
+                    self.state.last_action = Some(LastCompletedAction {
+                        summary: status.clone(),
+                        reveal_path: first_part.clone(),
+                        verify_vault: Some(first_part),
+                    });
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
+                    self.state.set_status(status, false);
+                    completed_transfer = true;
+                }
+                WorkerUpdate::JoinDone {
+                    status,
+                    output_path,
+                } => {
+                    let was_queued = self.state.active_queue_job.take().is_some();
+                    self.state.busy = false;
+                    self.state.progress = 1.0;
+                    self.state.transfer = None;
+                    self.state.last_action = Some(LastCompletedAction {
+                        summary: status.clone(),
+                        reveal_path: output_path.clone(),
+                        verify_vault: Some(output_path),
+                    });
+                    if was_queued {
+                        self.state.queue_completed += 1;
+                    }
+                    self.state.set_status(status, false);
+                    completed_transfer = true;
+                }
                 WorkerUpdate::Error(err) => {
                     let was_queued = self.state.active_queue_job.take().is_some();
                     self.state.busy = false;
@@ -993,6 +1028,7 @@ mod preview_tests {
                     output_dir: Some(out_dir),
                     compress: true,
                     container_size_bytes: None,
+                    split_part_bytes: None,
                     stealth: false,
                     reed_solomon: false,
                     secure_wipe: false,

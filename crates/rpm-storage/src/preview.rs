@@ -1,6 +1,5 @@
 use rpm_core::{decrypt_unlocked_stream, unlock_seekable_with_kdf, Auth, CryptoError};
-use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -9,6 +8,7 @@ use std::sync::{
 use zeroize::Zeroizing;
 
 use crate::packager::{sanitize_archive_path, visit_tar_entries};
+use crate::split::open_vault_reader;
 use crate::{pipe::bounded_pipe, StorageError, UnpackLimits};
 
 pub const DEFAULT_PREVIEW_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -85,7 +85,7 @@ pub fn extract_entry_to_memory_v5_with_stealth_kdf(
     cancel: Arc<AtomicBool>,
 ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
     let target = relative_path(target_path, UnpackLimits::default().max_path_depth)?;
-    let mut vault = BufReader::new(File::open(vault_path)?);
+    let mut vault = open_vault_reader(vault_path)?;
     let unlocked = unlock_seekable_with_kdf(&mut vault, auth, stealth_kdf)?;
     let compressed = unlocked.is_compressed();
     let total = unlocked.metadata().original_size;

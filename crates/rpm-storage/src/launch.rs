@@ -49,7 +49,10 @@ pub fn parse_gui_launch_args(args: &[String]) -> GuiLaunchIntent {
                     tab: None,
                     paths: Vec::new(),
                 }
-            } else if paths.iter().all(|p| p.to_lowercase().ends_with(".vault")) {
+            } else if paths
+                .iter()
+                .all(|p| crate::split::is_vault_or_split_filename(std::path::Path::new(p)))
+            {
                 GuiLaunchIntent {
                     tab: Some(LaunchTab::Decrypt),
                     paths,

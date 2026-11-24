@@ -17,6 +17,7 @@ pub enum QueuedJobKind {
         output_dir: Option<PathBuf>,
         compress: bool,
         container_size_bytes: Option<u64>,
+        split_part_bytes: Option<u64>,
         stealth: bool,
         reed_solomon: bool,
         secure_wipe: bool,
@@ -35,6 +36,7 @@ pub enum QueuedJobKind {
         decoy_compressed: bool,
         hidden_compressed: bool,
         container_size_bytes: u64,
+        split_part_bytes: Option<u64>,
         stealth: bool,
         reed_solomon: bool,
         secure_wipe: bool,
@@ -65,6 +67,7 @@ impl fmt::Debug for QueuedJobKind {
                 output_dir,
                 compress,
                 container_size_bytes,
+                split_part_bytes,
                 stealth,
                 reed_solomon,
                 secure_wipe,
@@ -80,6 +83,7 @@ impl fmt::Debug for QueuedJobKind {
                 .field("output_dir", output_dir)
                 .field("compress", compress)
                 .field("container_size_bytes", container_size_bytes)
+                .field("split_part_bytes", split_part_bytes)
                 .field("stealth", stealth)
                 .field("reed_solomon", reed_solomon)
                 .field("secure_wipe", secure_wipe)
@@ -95,6 +99,7 @@ impl fmt::Debug for QueuedJobKind {
                 decoy_compressed,
                 hidden_compressed,
                 container_size_bytes,
+                split_part_bytes,
                 stealth,
                 reed_solomon,
                 secure_wipe,
@@ -114,6 +119,7 @@ impl fmt::Debug for QueuedJobKind {
                 .field("decoy_compressed", decoy_compressed)
                 .field("hidden_compressed", hidden_compressed)
                 .field("container_size_bytes", container_size_bytes)
+                .field("split_part_bytes", split_part_bytes)
                 .field("stealth", stealth)
                 .field("reed_solomon", reed_solomon)
                 .field("secure_wipe", secure_wipe)

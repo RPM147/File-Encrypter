@@ -1,7 +1,6 @@
 //! Background worker thread launchers bridging `rpm-core`/`rpm-storage` to `egui`.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
@@ -10,14 +9,16 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
-    check_integrity, diff_metadata, hash_keyfile_reader, inspect_header_seekable,
-    mnemonic_to_entropy, Auth, CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport,
-    KdfParams, SecretKey, VaultDiff, VaultInfo,
+    diff_metadata, hash_keyfile_reader, inspect_header_seekable, mnemonic_to_entropy, Auth,
+    CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport, KdfParams, SecretKey,
+    VaultDiff, VaultInfo,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
-    decrypt_vault_selected_v5, decrypt_vault_v5, encrypt_hidden_sources_v5, encrypt_sources_v5,
-    rekey_vault_v5, unique_path, SecureWiper, StorageError,
+    check_vault_integrity, decrypt_vault_selected_v5, decrypt_vault_v5, discover_split_parts,
+    encrypt_hidden_sources_v5, encrypt_hidden_sources_v5_split, encrypt_sources_v5,
+    encrypt_sources_v5_split, join_vault_parts, open_vault_reader, rekey_vault_v5,
+    split_vault_file, unique_path, unique_split_base, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -431,7 +432,11 @@ pub fn format_diff_report(diff: &VaultDiff, lang: AppLanguage) -> String {
     lines.join("\n")
 }
 
-fn resolve_output_vault_path(sources: &[PathBuf], output_dir: Option<PathBuf>) -> PathBuf {
+fn resolve_output_vault_path(
+    sources: &[PathBuf],
+    output_dir: Option<PathBuf>,
+    split_mode: bool,
+) -> PathBuf {
     let base_dir = output_dir.unwrap_or_else(|| {
         sources
             .first()
@@ -448,7 +453,12 @@ fn resolve_output_vault_path(sources: &[PathBuf], output_dir: Option<PathBuf>) -
     } else {
         "Archive".into()
     };
-    unique_path(&base_dir.join(format!("{base_name}.vault")))
+    let candidate = base_dir.join(format!("{base_name}.vault"));
+    if split_mode {
+        unique_split_base(&candidate)
+    } else {
+        unique_path(&candidate)
+    }
 }
 
 fn wipe_sources(
@@ -494,6 +504,47 @@ pub fn spawn_encrypt(
     kdf: KdfParams,
     lang: AppLanguage,
 ) {
+    spawn_encrypt_with_split(
+        ctx,
+        tx,
+        cancel,
+        sources,
+        password,
+        recovery_entropy,
+        keyfile,
+        output_dir,
+        compress,
+        container_size_bytes,
+        None,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_encrypt_with_split(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    sources: Vec<PathBuf>,
+    password: Zeroizing<String>,
+    recovery_entropy: SecretKey,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    compress: bool,
+    container_size_bytes: Option<u64>,
+    split_part_bytes: Option<u64>,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
@@ -518,10 +569,16 @@ pub fn spawn_encrypt(
             container_size_bytes,
         };
 
-        let out_vault = resolve_output_vault_path(&sources, output_dir);
-        let start_log = match lang {
-            AppLanguage::Tr => format!("Şifreleniyor -> {}", out_vault.display()),
-            AppLanguage::En => format!("Encrypting -> {}", out_vault.display()),
+        let out_vault = resolve_output_vault_path(&sources, output_dir, split_part_bytes.is_some());
+        let start_log = match (lang, split_part_bytes.is_some()) {
+            (AppLanguage::Tr, true) => {
+                format!("Parçalı şifreleniyor -> {}.001...", out_vault.display())
+            }
+            (AppLanguage::Tr, false) => format!("Şifreleniyor -> {}", out_vault.display()),
+            (AppLanguage::En, true) => {
+                format!("Encrypting (split) -> {}.001...", out_vault.display())
+            }
+            (AppLanguage::En, false) => format!("Encrypting -> {}", out_vault.display()),
         };
         send(&tx, &ctx, WorkerUpdate::Log(start_log));
 
@@ -529,37 +586,70 @@ pub fn spawn_encrypt(
 
         let tx_skip = tx.clone();
         let ctx_skip = ctx.clone();
-        let res = encrypt_sources_v5(
-            &sources,
-            &out_vault,
-            password.as_bytes(),
-            &opts,
-            progress,
-            cancel,
-            move |msg| {
-                let line = match lang {
-                    AppLanguage::Tr => format!("Atlandı: {msg}"),
-                    AppLanguage::En => format!("Skipped: {msg}"),
-                };
-                send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
-            },
-        );
+        let on_skip = move |msg: &str| {
+            let line = match lang {
+                AppLanguage::Tr => format!("Atlandı: {msg}"),
+                AppLanguage::En => format!("Skipped: {msg}"),
+            };
+            send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
+        };
+
+        let res = if let Some(part_bytes) = split_part_bytes {
+            encrypt_sources_v5_split(
+                &sources,
+                &out_vault,
+                part_bytes,
+                password.as_bytes(),
+                &opts,
+                progress,
+                cancel,
+                on_skip,
+            )
+            .map(|(_summary, meta, parts)| (meta, parts))
+        } else {
+            encrypt_sources_v5(
+                &sources,
+                &out_vault,
+                password.as_bytes(),
+                &opts,
+                progress,
+                cancel,
+                on_skip,
+            )
+            .map(|(_summary, meta)| (meta, vec![out_vault.clone()]))
+        };
 
         match res {
-            Ok((_summary, meta)) => {
+            Ok((meta, outputs)) => {
                 if secure_wipe {
                     wipe_sources(&sources, wipe_passes, &tx, &ctx, lang);
                 }
-                let vault_name = out_vault
+                let primary_out = outputs.first().cloned().unwrap_or(out_vault);
+                let vault_name = primary_out
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "vault".into());
-                let status = match lang {
-                    AppLanguage::Tr => {
-                        format!("{} dosya şifrelendi -> {vault_name}", meta.file_count)
+                let status = if split_part_bytes.is_some() {
+                    match lang {
+                        AppLanguage::Tr => format!(
+                            "{} dosya şifrelendi ({} parça) -> {vault_name}",
+                            meta.file_count,
+                            outputs.len()
+                        ),
+                        AppLanguage::En => format!(
+                            "Encrypted {} file(s) ({} part(s)) -> {vault_name}",
+                            meta.file_count,
+                            outputs.len()
+                        ),
                     }
-                    AppLanguage::En => {
-                        format!("Encrypted {} file(s) -> {vault_name}", meta.file_count)
+                } else {
+                    match lang {
+                        AppLanguage::Tr => {
+                            format!("{} dosya şifrelendi -> {vault_name}", meta.file_count)
+                        }
+                        AppLanguage::En => {
+                            format!("Encrypted {} file(s) -> {vault_name}", meta.file_count)
+                        }
                     }
                 };
                 send(
@@ -567,7 +657,7 @@ pub fn spawn_encrypt(
                     &ctx,
                     WorkerUpdate::EncryptDone {
                         status,
-                        output_path: out_vault,
+                        output_path: primary_out,
                     },
                 );
             }
@@ -592,6 +682,55 @@ pub fn spawn_encrypt_hidden(
     decoy_compressed: bool,
     hidden_compressed: bool,
     container_size_bytes: u64,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    lang: AppLanguage,
+) {
+    spawn_encrypt_hidden_with_split(
+        ctx,
+        tx,
+        cancel,
+        decoy_sources,
+        hidden_sources,
+        decoy_password,
+        hidden_password,
+        decoy_recovery_entropy,
+        decoy_keyfile,
+        hidden_keyfile,
+        output_dir,
+        decoy_compressed,
+        hidden_compressed,
+        container_size_bytes,
+        None,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_encrypt_hidden_with_split(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    decoy_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+    decoy_password: Zeroizing<String>,
+    hidden_password: Zeroizing<String>,
+    decoy_recovery_entropy: SecretKey,
+    decoy_keyfile: Option<PathBuf>,
+    hidden_keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    decoy_compressed: bool,
+    hidden_compressed: bool,
+    container_size_bytes: u64,
+    split_part_bytes: Option<u64>,
     stealth: bool,
     reed_solomon: bool,
     secure_wipe: bool,
@@ -636,64 +775,110 @@ pub fn spawn_encrypt_hidden(
             hidden_compressed,
         };
 
-        let out_vault = resolve_output_vault_path(&decoy_sources, output_dir);
-        let start_log = match lang {
-            AppLanguage::Tr => {
+        let out_vault =
+            resolve_output_vault_path(&decoy_sources, output_dir, split_part_bytes.is_some());
+        let start_log = match (lang, split_part_bytes.is_some()) {
+            (AppLanguage::Tr, true) => format!(
+                "Parçalı gizli kasa konteyneri yazılıyor -> {}.001...",
+                out_vault.display()
+            ),
+            (AppLanguage::Tr, false) => {
                 format!("Gizli kasa konteyneri yazılıyor -> {}", out_vault.display())
             }
-            AppLanguage::En => format!("Writing hidden vault container -> {}", out_vault.display()),
+            (AppLanguage::En, true) => format!(
+                "Writing split hidden vault container -> {}.001...",
+                out_vault.display()
+            ),
+            (AppLanguage::En, false) => {
+                format!("Writing hidden vault container -> {}", out_vault.display())
+            }
         };
         send(&tx, &ctx, WorkerUpdate::Log(start_log));
 
         let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
         let tx_skip = tx.clone();
         let ctx_skip = ctx.clone();
+        let on_skip = move |msg: &str| {
+            let line = match lang {
+                AppLanguage::Tr => format!("Atlandı: {msg}"),
+                AppLanguage::En => format!("Skipped: {msg}"),
+            };
+            send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
+        };
 
-        let res = encrypt_hidden_sources_v5(
-            &decoy_sources,
-            &hidden_sources,
-            &out_vault,
-            decoy_password.as_bytes(),
-            hidden_password.as_bytes(),
-            &opts,
-            progress,
-            cancel,
-            move |msg| {
-                let line = match lang {
-                    AppLanguage::Tr => format!("Atlandı: {msg}"),
-                    AppLanguage::En => format!("Skipped: {msg}"),
-                };
-                send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
-            },
-        );
+        let res = if let Some(part_bytes) = split_part_bytes {
+            encrypt_hidden_sources_v5_split(
+                &decoy_sources,
+                &hidden_sources,
+                &out_vault,
+                part_bytes,
+                decoy_password.as_bytes(),
+                hidden_password.as_bytes(),
+                &opts,
+                progress,
+                cancel,
+                on_skip,
+            )
+        } else {
+            encrypt_hidden_sources_v5(
+                &decoy_sources,
+                &hidden_sources,
+                &out_vault,
+                decoy_password.as_bytes(),
+                hidden_password.as_bytes(),
+                &opts,
+                progress,
+                cancel,
+                on_skip,
+            )
+            .map(|(summary, d, h)| (summary, d, h, vec![out_vault.clone()]))
+        };
 
         match res {
-            Ok((summary, decoy_meta, hidden_meta)) => {
+            Ok((summary, decoy_meta, hidden_meta, outputs)) => {
                 if secure_wipe {
                     wipe_sources(&decoy_sources, wipe_passes, &tx, &ctx, lang);
                     wipe_sources(&hidden_sources, wipe_passes, &tx, &ctx, lang);
                 }
-                let vault_name = out_vault
+                let primary_out = outputs.first().cloned().unwrap_or(out_vault);
+                let vault_name = primary_out
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "vault".into());
                 let container_mib = (summary.container_size as f64) / (1024.0 * 1024.0);
-                let status = match lang {
-                    AppLanguage::Tr => format!(
-                        "{} dış + {} gizli dosya şifrelendi ({container_mib:.1} MiB) -> {vault_name}",
-                        decoy_meta.file_count, hidden_meta.file_count
-                    ),
-                    AppLanguage::En => format!(
-                        "Encrypted {} decoy + {} hidden file(s) ({container_mib:.1} MiB) -> {vault_name}",
-                        decoy_meta.file_count, hidden_meta.file_count
-                    ),
+                let status = if split_part_bytes.is_some() {
+                    match lang {
+                        AppLanguage::Tr => format!(
+                            "{} dış + {} gizli dosya şifrelendi ({container_mib:.1} MiB, {} parça) -> {vault_name}",
+                            decoy_meta.file_count,
+                            hidden_meta.file_count,
+                            outputs.len()
+                        ),
+                        AppLanguage::En => format!(
+                            "Encrypted {} decoy + {} hidden file(s) ({container_mib:.1} MiB, {} part(s)) -> {vault_name}",
+                            decoy_meta.file_count,
+                            hidden_meta.file_count,
+                            outputs.len()
+                        ),
+                    }
+                } else {
+                    match lang {
+                        AppLanguage::Tr => format!(
+                            "{} dış + {} gizli dosya şifrelendi ({container_mib:.1} MiB) -> {vault_name}",
+                            decoy_meta.file_count, hidden_meta.file_count
+                        ),
+                        AppLanguage::En => format!(
+                            "Encrypted {} decoy + {} hidden file(s) ({container_mib:.1} MiB) -> {vault_name}",
+                            decoy_meta.file_count, hidden_meta.file_count
+                        ),
+                    }
                 };
                 send(
                     &tx,
                     &ctx,
                     WorkerUpdate::EncryptDone {
                         status,
-                        output_path: out_vault,
+                        output_path: primary_out,
                     },
                 );
             }
@@ -822,20 +1007,37 @@ pub fn spawn_integrity_check(
     vault: PathBuf,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || match check_integrity(&vault) {
-        Ok(rep) => {
-            let text = format_integrity_report(&rep, lang);
-            send(
-                &tx,
-                &ctx,
-                WorkerUpdate::IntegrityDone {
-                    text,
-                    ok: rep.ok,
-                    sha256_only: rep.sha256_only,
-                },
-            );
+    thread::spawn(move || {
+        let split_parts = match discover_split_parts(&vault) {
+            Ok(Some(set)) => Some(set.part_count()),
+            Ok(None) => None,
+            Err(e) => {
+                send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                return;
+            }
+        };
+        match check_vault_integrity(&vault) {
+            Ok(rep) => {
+                let mut text = format_integrity_report(&rep, lang);
+                if let Some(parts) = split_parts {
+                    let line = match lang {
+                        AppLanguage::Tr => format!("\nBölünmüş Parçalar : {parts}"),
+                        AppLanguage::En => format!("\nSplit Parts      : {parts}"),
+                    };
+                    text.push_str(&line);
+                }
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::IntegrityDone {
+                        text,
+                        ok: rep.ok,
+                        sha256_only: rep.sha256_only,
+                    },
+                );
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
         }
-        Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
     });
 }
 
@@ -868,13 +1070,14 @@ pub fn spawn_inspect(
             None
         };
 
-        let mut reader = match File::open(&vault).map(BufReader::new) {
+        let mut reader = match open_vault_reader(&vault) {
             Ok(r) => r,
             Err(e) => {
                 send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
                 return;
             }
         };
+        let split_parts = reader.is_split().then_some(reader.part_count());
         let auth = if let Some(ref rk) = recovery_key {
             Auth::RecoveryKey(rk)
         } else {
@@ -886,7 +1089,14 @@ pub fn spawn_inspect(
 
         match inspect_header_seekable(&mut reader, auth) {
             Ok(info) => {
-                let text = format_inspect_report(&info, lang);
+                let mut text = format_inspect_report(&info, lang);
+                if let Some(parts) = split_parts {
+                    let line = match lang {
+                        AppLanguage::Tr => format!("\nBölünmüş Parçalar: {parts}"),
+                        AppLanguage::En => format!("\nSplit Parts    : {parts}"),
+                    };
+                    text.push_str(&line);
+                }
                 let status = match (lang, info.is_hidden_compartment) {
                     (AppLanguage::Tr, true) => "Gizli kasa meta verisi açıldı",
                     (AppLanguage::Tr, false) => "Kasa meta verisi açıldı",
@@ -944,9 +1154,7 @@ fn unlock_vault_header_for_diff(
         None
     };
 
-    let mut reader = File::open(&target.path)
-        .map(BufReader::new)
-        .map_err(|e| format!("{prefix}: {e}"))?;
+    let mut reader = open_vault_reader(&target.path).map_err(|e| format!("{prefix}: {e}"))?;
     let auth = if let Some(ref rk) = recovery_key {
         Auth::RecoveryKey(rk)
     } else {
@@ -1299,6 +1507,87 @@ pub fn spawn_source_scan(
     });
 }
 
+pub fn spawn_split_vault(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    vault: PathBuf,
+    output_dir: Option<PathBuf>,
+    part_size_bytes: u64,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        match split_vault_file(
+            &vault,
+            output_dir.as_deref(),
+            part_size_bytes,
+            progress,
+            cancel,
+        ) {
+            Ok(parts) => {
+                let first_part = parts[0].clone();
+                let first_name = first_part
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "vault.001".into());
+                let status = match lang {
+                    AppLanguage::Tr => {
+                        format!("Kasa {} parçaya bölündü -> {first_name}", parts.len())
+                    }
+                    AppLanguage::En => {
+                        format!("Split vault into {} part(s) -> {first_name}", parts.len())
+                    }
+                };
+                send(&tx, &ctx, WorkerUpdate::Log(status.clone()));
+                send(&tx, &ctx, WorkerUpdate::SplitDone { status, first_part });
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        }
+    });
+}
+
+pub fn spawn_join_vault(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    part: PathBuf,
+    output_path: Option<PathBuf>,
+    lang: AppLanguage,
+) {
+    thread::spawn(move || {
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        match join_vault_parts(&part, output_path.as_deref(), progress, cancel) {
+            Ok((out_path, total_bytes)) => {
+                let out_name = out_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "vault".into());
+                let status = match lang {
+                    AppLanguage::Tr => format!(
+                        "Parçalar birleştirildi -> {out_name} ({})",
+                        crate::progress::format_bytes(total_bytes)
+                    ),
+                    AppLanguage::En => format!(
+                        "Joined parts -> {out_name} ({})",
+                        crate::progress::format_bytes(total_bytes)
+                    ),
+                };
+                send(&tx, &ctx, WorkerUpdate::Log(status.clone()));
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::JoinDone {
+                        status,
+                        output_path: out_path,
+                    },
+                );
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        }
+    });
+}
+
 pub fn spawn_queued_job(
     ctx: egui::Context,
     tx: mpsc::Sender<WorkerUpdate>,
@@ -1316,13 +1605,14 @@ pub fn spawn_queued_job(
             output_dir,
             compress,
             container_size_bytes,
+            split_part_bytes,
             stealth,
             reed_solomon,
             secure_wipe,
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt(
+            spawn_encrypt_with_split(
                 ctx,
                 tx,
                 cancel,
@@ -1333,6 +1623,7 @@ pub fn spawn_queued_job(
                 output_dir,
                 compress,
                 container_size_bytes,
+                split_part_bytes,
                 stealth,
                 reed_solomon,
                 secure_wipe,
@@ -1354,13 +1645,14 @@ pub fn spawn_queued_job(
             decoy_compressed,
             hidden_compressed,
             container_size_bytes,
+            split_part_bytes,
             stealth,
             reed_solomon,
             secure_wipe,
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt_hidden(
+            spawn_encrypt_hidden_with_split(
                 ctx,
                 tx,
                 cancel,
@@ -1375,6 +1667,7 @@ pub fn spawn_queued_job(
                 decoy_compressed,
                 hidden_compressed,
                 container_size_bytes,
+                split_part_bytes,
                 stealth,
                 reed_solomon,
                 secure_wipe,

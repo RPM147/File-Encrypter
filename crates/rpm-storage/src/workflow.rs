@@ -1,7 +1,7 @@
 //! High-level zero-temp-plaintext workflows uniting `rpm-core` v5 and `rpm-storage`.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,10 @@ use crate::packager::{
     unpack_vault_stream_selected, UnpackLimits,
 };
 use crate::pipe::bounded_pipe;
+use crate::split::{
+    discover_split_parts, open_vault_reader, vault_display_stem, write_split_vault,
+    write_split_vault_replacing, SplitVolumeReader,
+};
 
 #[derive(Clone, Debug)]
 pub struct DecryptSummary {
@@ -61,9 +65,8 @@ fn random_hex_6() -> String {
     hex
 }
 
-/// Stream-pack `sources` directly into a Vault v5 archive via an in-memory bounded
-/// pipe — zero plaintext temporary archive is ever written to disk.
-pub fn encrypt_sources_v5(
+#[allow(clippy::too_many_arguments)]
+fn encrypt_sources_v5_with_sink<F>(
     sources: &[PathBuf],
     out_vault: &Path,
     password: &[u8],
@@ -71,7 +74,13 @@ pub fn encrypt_sources_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
     mut on_skip: impl FnMut(&str) + Send + 'static,
-) -> Result<(EncryptSummary, VaultMetadata), StorageError> {
+    write_sink: F,
+) -> Result<(EncryptSummary, VaultMetadata), StorageError>
+where
+    F: FnOnce(
+        &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError>,
+{
     let metadata = collect_manifest(sources, opts.compressed, Some(&cancel))?;
     let total_expected = metadata.original_size;
     let (writer, reader) = bounded_pipe(8);
@@ -97,11 +106,11 @@ pub fn encrypt_sources_v5(
     let mut packer_opt = Some(packer_handle);
     let mut summary_out: Option<EncryptSummary> = None;
 
-    let enc_res = write_vault(out_vault, opts.stealth, |vault_writer| {
+    let mut run_enc = |mut vault_writer: &mut dyn Write| -> Result<(), StorageError> {
         let mut reader = reader_opt.take().expect("reader taken once");
         let enc_attempt = encrypt_stream(
             &mut reader,
-            vault_writer,
+            &mut vault_writer,
             &metadata,
             password,
             opts,
@@ -119,9 +128,11 @@ pub fn encrypt_sources_v5(
         pack_attempt?;
         summary_out = Some(summary);
         Ok(())
-    });
+    };
 
-    // Clean up if `atomic_write` failed before entering its closure.
+    let enc_res = write_sink(&mut run_enc);
+
+    // Clean up if sink creation failed before invoking `run_enc`.
     drop(reader_opt.take());
     if let Some(handle) = packer_opt.take() {
         let _ = handle.join();
@@ -131,10 +142,62 @@ pub fn encrypt_sources_v5(
     Ok((summary_out.expect("summary set on Ok"), metadata))
 }
 
-/// Stream-pack decoy and hidden sources directly into a single fixed-size padded
-/// Vault v5 container with plausible deniability (zero temporary plaintext files).
+/// Stream-pack `sources` directly into a Vault v5 archive via an in-memory bounded
+/// pipe — zero plaintext temporary archive is ever written to disk.
+pub fn encrypt_sources_v5(
+    sources: &[PathBuf],
+    out_vault: &Path,
+    password: &[u8],
+    opts: &EncryptOptions,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(EncryptSummary, VaultMetadata), StorageError> {
+    encrypt_sources_v5_with_sink(
+        sources,
+        out_vault,
+        password,
+        opts,
+        progress,
+        cancel,
+        on_skip,
+        |run| write_vault(out_vault, opts.stealth, |w| run(w)),
+    )
+}
+
+/// Stream-pack `sources` directly into a multi-part split Vault v5 volume
+/// (`<out_vault_base>.001`, `.002`, ...) with zero temporary merged files on disk.
 #[allow(clippy::too_many_arguments)]
-pub fn encrypt_hidden_sources_v5(
+pub fn encrypt_sources_v5_split(
+    sources: &[PathBuf],
+    out_vault_base: &Path,
+    part_size_bytes: u64,
+    password: &[u8],
+    opts: &EncryptOptions,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(EncryptSummary, VaultMetadata, Vec<PathBuf>), StorageError> {
+    let mut created_parts = Vec::new();
+    let (summary, meta) = encrypt_sources_v5_with_sink(
+        sources,
+        out_vault_base,
+        password,
+        opts,
+        progress,
+        cancel,
+        on_skip,
+        |run| {
+            created_parts =
+                write_split_vault(out_vault_base, part_size_bytes, opts.stealth, |w| run(w))?;
+            Ok(())
+        },
+    )?;
+    Ok((summary, meta, created_parts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypt_hidden_sources_v5_with_sink<F>(
     decoy_sources: &[PathBuf],
     hidden_sources: &[PathBuf],
     out_vault: &Path,
@@ -144,7 +207,13 @@ pub fn encrypt_hidden_sources_v5(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
-) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError> {
+    write_sink: F,
+) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError>
+where
+    F: FnOnce(
+        &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError>,
+{
     let decoy_meta = collect_manifest(decoy_sources, opts.decoy_compressed, Some(&cancel))?;
     let hidden_meta = collect_manifest(hidden_sources, opts.hidden_compressed, Some(&cancel))?;
     let total_expected = decoy_meta
@@ -204,7 +273,7 @@ pub fn encrypt_hidden_sources_v5(
     let decoy_done = Arc::new(AtomicU64::new(0));
     let hidden_done = Arc::new(AtomicU64::new(0));
 
-    let enc_res = write_vault(out_vault, opts.stealth, |vault_writer| {
+    let mut run_enc = |mut vault_writer: &mut dyn Write| -> Result<(), StorageError> {
         let mut d_reader = decoy_reader_opt.take().expect("decoy reader taken once");
         let mut h_reader = hidden_reader_opt.take().expect("hidden reader taken once");
 
@@ -233,7 +302,7 @@ pub fn encrypt_hidden_sources_v5(
         let enc_attempt = encrypt_hidden_stream(
             &mut d_reader,
             &mut h_reader,
-            vault_writer,
+            &mut vault_writer,
             &decoy_meta,
             &hidden_meta,
             decoy_password,
@@ -263,7 +332,9 @@ pub fn encrypt_hidden_sources_v5(
         hidden_pack?;
         summary_out = Some(summary);
         Ok(())
-    });
+    };
+
+    let enc_res = write_sink(&mut run_enc);
 
     drop(decoy_reader_opt.take());
     drop(hidden_reader_opt.take());
@@ -280,6 +351,76 @@ pub fn encrypt_hidden_sources_v5(
         decoy_meta,
         hidden_meta,
     ))
+}
+
+/// Stream-pack decoy and hidden sources directly into a single fixed-size padded
+/// Vault v5 container with plausible deniability (zero temporary plaintext files).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_sources_v5(
+    decoy_sources: &[PathBuf],
+    hidden_sources: &[PathBuf],
+    out_vault: &Path,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError> {
+    encrypt_hidden_sources_v5_with_sink(
+        decoy_sources,
+        hidden_sources,
+        out_vault,
+        decoy_password,
+        hidden_password,
+        opts,
+        progress,
+        cancel,
+        on_skip,
+        |run| write_vault(out_vault, opts.stealth, |w| run(w)),
+    )
+}
+
+/// Stream-pack decoy and hidden sources directly into a multi-part split Vault v5 container.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_sources_v5_split(
+    decoy_sources: &[PathBuf],
+    hidden_sources: &[PathBuf],
+    out_vault_base: &Path,
+    part_size_bytes: u64,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<
+    (
+        HiddenEncryptSummary,
+        VaultMetadata,
+        VaultMetadata,
+        Vec<PathBuf>,
+    ),
+    StorageError,
+> {
+    let mut created_parts = Vec::new();
+    let (summary, decoy_meta, hidden_meta) = encrypt_hidden_sources_v5_with_sink(
+        decoy_sources,
+        hidden_sources,
+        out_vault_base,
+        decoy_password,
+        hidden_password,
+        opts,
+        progress,
+        cancel,
+        on_skip,
+        |run| {
+            created_parts =
+                write_split_vault(out_vault_base, part_size_bytes, opts.stealth, |w| run(w))?;
+            Ok(())
+        },
+    )?;
+    Ok((summary, decoy_meta, hidden_meta, created_parts))
 }
 
 /// Stream-decrypt a Vault v5 file directly through AEAD chunk verification into an
@@ -350,7 +491,7 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
         None => None,
     };
 
-    let mut reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
+    let mut reader = open_vault_reader(vault_path)?;
     let unlocked = unlock_seekable_with_kdf(&mut reader, auth, stealth_kdf)?;
     let metadata = unlocked.metadata().clone();
 
@@ -468,10 +609,7 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
             let _ = fs::remove_dir(&staging_dir);
             Ok(target)
         } else {
-            let stem = vault_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "restored".into());
+            let stem = vault_display_stem(vault_path);
             let target = unique_path(&output_root.join(stem));
             fs::rename(&staging_dir, &target)?;
             Ok(target)
@@ -494,8 +632,8 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
     }
 }
 
-/// Atomically re-key `vault_path` in place using a sibling temp file (payload is
-/// never decrypted).
+/// Atomically re-key `vault_path` in place using sibling temp file(s) (payload is
+/// never decrypted). Works transparently on both single `.vault` files and split volumes.
 pub fn rekey_vault_v5(
     vault_path: &Path,
     old_password: &[u8],
@@ -505,39 +643,80 @@ pub fn rekey_vault_v5(
     new_kdf: Option<KdfParams>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), StorageError> {
+    let rekey_opts = RekeyOptions {
+        old_password,
+        new_password,
+        old_keyfile_hash: old_keyfile,
+        new_keyfile_hash: new_keyfile,
+        new_kdf,
+    };
+    if let Some(set) = discover_split_parts(vault_path)? {
+        let old_parts = set.part_paths();
+        let part_size = set.part_size_hint();
+        let base = set.base.clone();
+        write_split_vault_replacing(&base, &old_parts, part_size, false, |out_writer| {
+            let mut src_reader = SplitVolumeReader::new(set.clone());
+            rekey_stream(&mut src_reader, out_writer, &rekey_opts, cancel)?;
+            drop(src_reader); // Crucial on Windows before promoting over existing part files.
+            Ok(())
+        })?;
+        return Ok(());
+    }
     atomic_write(vault_path, |out_writer| {
         let mut src_reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
-        rekey_stream(
-            &mut src_reader,
-            out_writer,
-            &RekeyOptions {
-                old_password,
-                new_password,
-                old_keyfile_hash: old_keyfile,
-                new_keyfile_hash: new_keyfile,
-                new_kdf,
-            },
-            cancel,
-        )?;
+        rekey_stream(&mut src_reader, out_writer, &rekey_opts, cancel)?;
         drop(src_reader); // Crucial on Windows before `atomic_write` renames over `vault_path`.
         Ok(())
     })
 }
 
-/// Repair ciphertext into a sibling staging file, promoting it only after the entire envelope succeeds.
+/// Repair ciphertext into sibling staging file(s), promoting only after the entire envelope
+/// succeeds. Supports single vaults and multi-part split volumes (preserving split layout in place).
 pub fn repair_vault_v5(
     vault_path: &Path,
     output_path: Option<&Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<rpm_core::RepairReport, StorageError> {
     let mut report = None;
-    atomic_write(output_path.unwrap_or(vault_path), |writer| {
+    if let Some(out) = output_path {
+        atomic_write(out, |writer| {
+            let mut input = open_vault_reader(vault_path)?;
+            report = Some(rpm_core::repair_vault_stream(
+                &mut input,
+                writer,
+                Some(&cancel),
+            )?);
+            drop(input);
+            Ok(())
+        })?;
+        return Ok(report.expect("atomic write completed"));
+    }
+
+    if let Some(set) = discover_split_parts(vault_path)? {
+        let old_parts = set.part_paths();
+        let part_size = set.part_size_hint();
+        let base = set.base.clone();
+        write_split_vault_replacing(&base, &old_parts, part_size, false, |writer| {
+            let mut input = SplitVolumeReader::new(set.clone());
+            report = Some(rpm_core::repair_vault_stream(
+                &mut input,
+                writer,
+                Some(&cancel),
+            )?);
+            drop(input);
+            Ok(())
+        })?;
+        return Ok(report.expect("split write completed"));
+    }
+
+    atomic_write(vault_path, |writer| {
         let mut input = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
         report = Some(rpm_core::repair_vault_stream(
             &mut input,
             writer,
             Some(&cancel),
         )?);
+        drop(input);
         Ok(())
     })?;
     Ok(report.expect("atomic write completed"))

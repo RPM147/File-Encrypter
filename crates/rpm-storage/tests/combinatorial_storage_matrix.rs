@@ -823,6 +823,7 @@ fn storage_config_launch_and_shell_integration_matrix() {
                         reed_solomon: idx == 0,
                         secure_wipe: false,
                         container_size_mib: (scale >= 120).then_some(100),
+                        split_part_mib: (scale >= 120).then_some(4000),
                         save_next_to_source: true,
                         output_dir: String::new(),
                         keyfile_path: None,

@@ -29,7 +29,7 @@ pub fn ui(
             ui.text_edit_singleline(&mut state.rekey.vault_path);
             if ui.button(s.btn_browse).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("RPM Vault", &["vault"])
+                    .add_filter("RPM Vault", &["vault", "001"])
                     .add_filter("All Files", &["*"])
                     .pick_file()
                 {

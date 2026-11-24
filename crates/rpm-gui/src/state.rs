@@ -17,10 +17,12 @@ use rpm_storage::config::{
     ThemeMode, MAX_ENCRYPT_PROFILES, MAX_IDLE_CLEAR_MINUTES,
 };
 use rpm_storage::shell_integration::{self, ShellIntegrationStatus};
-use rpm_storage::{GuiLaunchIntent, LaunchTab};
+use rpm_storage::{discover_split_parts, is_vault_or_split_filename, GuiLaunchIntent, LaunchTab};
 use zeroize::Zeroize;
 
-use crate::estimator::{estimate_encrypt_preflight, EncryptPreflightEstimate, SourceSizeSummary};
+use crate::estimator::{
+    estimate_encrypt_preflight_with_split, EncryptPreflightEstimate, SourceSizeSummary,
+};
 use crate::explorer::{matches_filters, FileCategoryFilter, ManifestViewMode, SizeFilter};
 use crate::i18n::{self, Strings};
 use crate::progress::TransferSnapshot;
@@ -94,6 +96,101 @@ impl ContainerSizePreset {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SplitSizePreset {
+    None,
+    MiB25,
+    MiB100,
+    MiB500,
+    MiB2000,
+    MiB4000Fat32,
+    Custom,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SplitSizeError {
+    InvalidCustomValue,
+    OutOfRange,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProfileSnapshotError {
+    Container(ContainerSizeError),
+    Split(SplitSizeError),
+}
+
+impl SplitSizePreset {
+    pub const ALL: [SplitSizePreset; 7] = [
+        SplitSizePreset::None,
+        SplitSizePreset::MiB25,
+        SplitSizePreset::MiB100,
+        SplitSizePreset::MiB500,
+        SplitSizePreset::MiB2000,
+        SplitSizePreset::MiB4000Fat32,
+        SplitSizePreset::Custom,
+    ];
+
+    pub const STANDALONE_ALL: [SplitSizePreset; 6] = [
+        SplitSizePreset::MiB25,
+        SplitSizePreset::MiB100,
+        SplitSizePreset::MiB500,
+        SplitSizePreset::MiB2000,
+        SplitSizePreset::MiB4000Fat32,
+        SplitSizePreset::Custom,
+    ];
+
+    pub fn localized_label(self, s: &'static Strings) -> &'static str {
+        match self {
+            Self::None => s.split_none,
+            Self::MiB25 => s.split_25_mib,
+            Self::MiB100 => s.split_100_mib,
+            Self::MiB500 => s.split_500_mib,
+            Self::MiB2000 => s.split_2000_mib,
+            Self::MiB4000Fat32 => s.split_4000_fat32,
+            Self::Custom => s.split_custom,
+        }
+    }
+
+    pub fn from_mib(mib: Option<u64>) -> (Self, Option<String>) {
+        match mib {
+            None => (Self::None, None),
+            Some(25) => (Self::MiB25, None),
+            Some(100) => (Self::MiB100, None),
+            Some(500) => (Self::MiB500, None),
+            Some(2000) => (Self::MiB2000, None),
+            Some(4000) => (Self::MiB4000Fat32, None),
+            Some(other) => (Self::Custom, Some(other.to_string())),
+        }
+    }
+
+    pub fn resolve_bytes(self, custom_mb: &str) -> Result<Option<u64>, SplitSizeError> {
+        let bytes = match self {
+            Self::None => return Ok(None),
+            Self::MiB25 => 25 * CONTAINER_MIB,
+            Self::MiB100 => 100 * CONTAINER_MIB,
+            Self::MiB500 => 500 * CONTAINER_MIB,
+            Self::MiB2000 => 2000 * CONTAINER_MIB,
+            Self::MiB4000Fat32 => 4000 * CONTAINER_MIB,
+            Self::Custom => {
+                let parsed: u64 = custom_mb
+                    .trim()
+                    .parse()
+                    .map_err(|_| SplitSizeError::InvalidCustomValue)?;
+                if parsed == 0 {
+                    return Err(SplitSizeError::InvalidCustomValue);
+                }
+                parsed
+                    .checked_mul(CONTAINER_MIB)
+                    .ok_or(SplitSizeError::OutOfRange)?
+            }
+        };
+        if !(MIN_CONTAINER_SIZE..=MAX_CONTAINER_SIZE).contains(&bytes) {
+            return Err(SplitSizeError::OutOfRange);
+        }
+        Ok(Some(bytes))
+    }
+}
+
 pub const UI_SCALE_PRESETS: [u16; 7] = [80, 90, 100, 110, 120, 130, 150];
 pub const UI_SCALE_MIN: u16 = 80;
 pub const UI_SCALE_MAX: u16 = 150;
@@ -145,6 +242,7 @@ impl BuiltinEncryptPreset {
                 reed_solomon: false,
                 secure_wipe: false,
                 container_size_mib: None,
+                split_part_mib: None,
                 save_next_to_source: true,
                 output_dir: String::new(),
                 keyfile_path: None,
@@ -156,6 +254,7 @@ impl BuiltinEncryptPreset {
                 reed_solomon: true,
                 secure_wipe: false,
                 container_size_mib: None,
+                split_part_mib: None,
                 save_next_to_source: true,
                 output_dir: String::new(),
                 keyfile_path: None,
@@ -167,6 +266,7 @@ impl BuiltinEncryptPreset {
                 reed_solomon: false,
                 secure_wipe: false,
                 container_size_mib: Some(100),
+                split_part_mib: None,
                 save_next_to_source: true,
                 output_dir: String::new(),
                 keyfile_path: None,
@@ -274,6 +374,14 @@ pub enum WorkerUpdate {
         status: String,
         vault_path: PathBuf,
     },
+    SplitDone {
+        status: String,
+        first_part: PathBuf,
+    },
+    JoinDone {
+        status: String,
+        output_path: PathBuf,
+    },
     SourceScanDone {
         gen: u64,
         outer: SourceSizeSummary,
@@ -310,6 +418,8 @@ pub struct EncryptFields {
     pub recovery_prompt: Option<RecoveryPrompt>,
     pub container_preset: ContainerSizePreset,
     pub container_custom_mb: String,
+    pub split_preset: SplitSizePreset,
+    pub split_custom_mb: String,
     pub enable_hidden: bool,
     pub hidden_sources: Vec<PathBuf>,
     pub hidden_keyfile: Option<PathBuf>,
@@ -351,6 +461,10 @@ impl EncryptFields {
         Ok(resolved)
     }
 
+    pub fn resolve_split_size(&self) -> Result<Option<u64>, SplitSizeError> {
+        self.split_preset.resolve_bytes(&self.split_custom_mb)
+    }
+
     pub fn set_hidden_enabled(&mut self, enabled: bool) {
         self.enable_hidden = enabled;
         if enabled && self.container_preset == ContainerSizePreset::Auto {
@@ -372,10 +486,16 @@ impl EncryptFields {
     pub fn current_profile_snapshot(
         &self,
         name: String,
-    ) -> Result<EncryptProfile, ContainerSizeError> {
+    ) -> Result<EncryptProfile, ProfileSnapshotError> {
         let container_size_mib = self
             .container_preset
-            .resolve_bytes(&self.container_custom_mb)?
+            .resolve_bytes(&self.container_custom_mb)
+            .map_err(ProfileSnapshotError::Container)?
+            .map(|bytes| bytes / CONTAINER_MIB);
+        let split_part_mib = self
+            .split_preset
+            .resolve_bytes(&self.split_custom_mb)
+            .map_err(ProfileSnapshotError::Split)?
             .map(|bytes| bytes / CONTAINER_MIB);
         Ok(EncryptProfile {
             name,
@@ -384,6 +504,7 @@ impl EncryptFields {
             reed_solomon: self.reed_solomon,
             secure_wipe: self.secure_wipe,
             container_size_mib,
+            split_part_mib,
             save_next_to_source: self.save_next_to_source,
             output_dir: self.output_dir.clone(),
             keyfile_path: self.keyfile.clone(),
@@ -391,7 +512,7 @@ impl EncryptFields {
     }
 
     pub fn preflight_estimate(&self) -> EncryptPreflightEstimate {
-        estimate_encrypt_preflight(
+        estimate_encrypt_preflight_with_split(
             &self.preflight_outer,
             &self.preflight_hidden,
             self.enable_hidden,
@@ -400,6 +521,8 @@ impl EncryptFields {
             self.reed_solomon,
             self.container_preset,
             &self.container_custom_mb,
+            self.split_preset,
+            &self.split_custom_mb,
         )
     }
 
@@ -681,6 +804,28 @@ impl Drop for PasswordGenFields {
     }
 }
 
+pub struct SplitJoinFields {
+    pub split_source_path: String,
+    pub split_preset: SplitSizePreset,
+    pub split_custom_mb: String,
+    pub split_output_dir: String,
+    pub join_part_path: String,
+    pub join_output_path: String,
+}
+
+impl Default for SplitJoinFields {
+    fn default() -> Self {
+        Self {
+            split_source_path: String::new(),
+            split_preset: SplitSizePreset::MiB100,
+            split_custom_mb: "100".into(),
+            split_output_dir: String::new(),
+            join_part_path: String::new(),
+            join_output_path: String::new(),
+        }
+    }
+}
+
 pub struct AppState {
     pub active_tab: Tab,
     pub busy: bool,
@@ -706,6 +851,7 @@ pub struct AppState {
     pub decrypt: DecryptFields,
     pub inspect: InspectFields,
     pub diff: DiffFields,
+    pub split_join: SplitJoinFields,
     pub rekey: RekeyFields,
     pub pwgen: PasswordGenFields,
 }
@@ -780,6 +926,8 @@ impl AppState {
                 recovery_prompt: None,
                 container_preset: ContainerSizePreset::Auto,
                 container_custom_mb: "100".into(),
+                split_preset: SplitSizePreset::None,
+                split_custom_mb: "100".into(),
                 enable_hidden: false,
                 hidden_sources: Vec::new(),
                 hidden_keyfile: None,
@@ -842,6 +990,7 @@ impl AppState {
                 recovery_phrase_b: String::new(),
                 results: s.diff_default_results.into(),
             },
+            split_join: SplitJoinFields::default(),
             rekey: RekeyFields {
                 vault_path: String::new(),
                 current_keyfile: None,
@@ -1100,6 +1249,12 @@ impl AppState {
             }
         }
 
+        let (split_preset, split_custom) = SplitSizePreset::from_mib(profile.split_part_mib);
+        self.encrypt.split_preset = split_preset;
+        if let Some(custom) = split_custom {
+            self.encrypt.split_custom_mb = custom;
+        }
+
         self.encrypt.selected_profile_name = Some(profile.name.clone());
         let msg = self.strings().status_profile_applied;
         self.set_status(msg, false);
@@ -1117,9 +1272,21 @@ impl AppState {
             .current_profile_snapshot(trimmed.to_owned())
             .map_err(|err| {
                 let msg = match err {
-                    ContainerSizeError::InvalidCustomValue => s.err_container_invalid_mb,
-                    ContainerSizeError::OutOfRange => s.err_container_out_of_range,
-                    ContainerSizeError::RequiredForHidden => s.err_hidden_requires_container,
+                    ProfileSnapshotError::Container(ContainerSizeError::InvalidCustomValue) => {
+                        s.err_container_invalid_mb
+                    }
+                    ProfileSnapshotError::Container(ContainerSizeError::OutOfRange) => {
+                        s.err_container_out_of_range
+                    }
+                    ProfileSnapshotError::Container(ContainerSizeError::RequiredForHidden) => {
+                        s.err_hidden_requires_container
+                    }
+                    ProfileSnapshotError::Split(SplitSizeError::InvalidCustomValue) => {
+                        s.err_split_invalid_mb
+                    }
+                    ProfileSnapshotError::Split(SplitSizeError::OutOfRange) => {
+                        s.err_split_out_of_range
+                    }
                 };
                 self.set_status(msg, true);
                 msg
@@ -1318,8 +1485,7 @@ impl AppState {
             return;
         }
         let all_vaults = paths.iter().all(|p| {
-            p.extension()
-                .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("vault"))
+            is_vault_or_split_filename(p) || discover_split_parts(p).ok().flatten().is_some()
         });
 
         let target = forced_tab.unwrap_or(if all_vaults {
@@ -1335,15 +1501,18 @@ impl AppState {
                 let mut added = 0usize;
                 let mut skipped = 0usize;
                 for p in paths {
-                    let is_vault = p
-                        .extension()
-                        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("vault"));
+                    let is_vault = is_vault_or_split_filename(&p);
                     if !is_vault && !p.is_file() {
                         skipped += 1;
                         continue;
                     }
-                    if !self.decrypt.vaults.contains(&p) {
-                        self.decrypt.vaults.push(p);
+                    // Deduplicate multiple dropped parts of the same split volume to its `.001` part.
+                    let canonical = match discover_split_parts(&p) {
+                        Ok(Some(set)) => set.first_part().to_path_buf(),
+                        _ => p,
+                    };
+                    if !self.decrypt.vaults.contains(&canonical) {
+                        self.decrypt.vaults.push(canonical);
                         added += 1;
                     }
                 }

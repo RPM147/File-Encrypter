@@ -4,7 +4,7 @@ mod diff;
 pub mod progress;
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -13,14 +13,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::rngs::OsRng;
 use rand::Rng;
 use rpm_core::{
-    check_integrity, entropy_to_mnemonic, generate_recovery_entropy, hash_keyfile_reader,
+    entropy_to_mnemonic, generate_recovery_entropy, hash_keyfile_reader,
     inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
     HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
 };
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    decrypt_vault_v5_with_stealth_kdf, encrypt_hidden_sources_v5, encrypt_sources_v5,
-    rekey_vault_v5, unique_path, SecureWiper, StorageError,
+    check_vault_integrity, decrypt_vault_v5_with_stealth_kdf, discover_split_parts,
+    encrypt_hidden_sources_v5, encrypt_hidden_sources_v5_split, encrypt_sources_v5,
+    encrypt_sources_v5_split, join_vault_parts, open_vault_reader, rekey_vault_v5,
+    split_vault_file, unique_path, unique_split_base, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -55,6 +57,9 @@ pub enum Commands {
         /// Pad the output container to this exact size in MiB.
         #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
         container_mb: Option<u64>,
+        /// Split the encrypted output into numbered parts (.001, .002, ...) of at most this size in MiB (e.g. 4000 for FAT32).
+        #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
+        split_mb: Option<u64>,
         /// Store these sources in a separately password-protected compartment.
         #[arg(long, value_name = "PATH", num_args = 1.., requires = "container_mb")]
         hidden: Vec<PathBuf>,
@@ -135,6 +140,28 @@ pub enum Commands {
         clear_keyfile: bool,
         #[arg(long)]
         password_stdin: bool,
+    },
+    /// Split an existing .vault file into numbered multi-part volumes (.001, .002, ...).
+    Split {
+        vault: PathBuf,
+        /// Maximum size of each part in MiB (e.g. 4000 for FAT32).
+        #[arg(long, value_name = "MiB", value_parser = clap::value_parser!(u64).range(1..=MAX_CONTAINER_MIB))]
+        part_mb: u64,
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+        /// Progress display on stderr: auto (TTY only), always, or never.
+        #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+        progress: ProgressMode,
+    },
+    /// Join a numbered split volume (.001, .002, ...) back into a single .vault file.
+    Join {
+        /// Path to any part of the split volume (typically the .001 file).
+        part: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Progress display on stderr: auto (TTY only), always, or never.
+        #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+        progress: ProgressMode,
     },
     /// Generate a cryptographically random password and report zxcvbn strength.
     Password {
@@ -358,6 +385,7 @@ where
         Commands::Encrypt {
             sources,
             container_mb,
+            split_mb,
             stealth,
             reed_solomon,
             hidden,
@@ -435,7 +463,11 @@ where
             } else {
                 "Archive".into()
             };
-            let out_vault = unique_path(&base_dir.join(format!("{base_name}.vault")));
+            let out_vault = if split_mb.is_some() {
+                unique_split_base(&base_dir.join(format!("{base_name}.vault")))
+            } else {
+                unique_path(&base_dir.join(format!("{base_name}.vault")))
+            };
             if wipe {
                 if let Err(err) = check_wipe_targets(
                     sources.iter().chain(&hidden),
@@ -449,7 +481,8 @@ where
             let reporter = CliProgressReporter::new(progress, stderr_is_tty, "Encrypting");
 
             let container_size_bytes = container_mb.map(|mb| mb * MIB);
-            let enc_res = if hidden.is_empty() {
+            let split_part_bytes = split_mb.map(|mb| mb * MIB);
+            let enc_res: Result<Vec<PathBuf>, StorageError> = if hidden.is_empty() {
                 let opts = EncryptOptions {
                     stealth,
                     reed_solomon,
@@ -460,16 +493,30 @@ where
                     container_size_bytes,
                     ..Default::default()
                 };
-                encrypt_sources_v5(
-                    &sources,
-                    &out_vault,
-                    password.as_bytes(),
-                    &opts,
-                    reporter.callback(),
-                    Arc::clone(&cancel),
-                    |_| {},
-                )
-                .map(|_| ())
+                if let Some(part_bytes) = split_part_bytes {
+                    encrypt_sources_v5_split(
+                        &sources,
+                        &out_vault,
+                        part_bytes,
+                        password.as_bytes(),
+                        &opts,
+                        reporter.callback(),
+                        Arc::clone(&cancel),
+                        |_| {},
+                    )
+                    .map(|(_, _, parts)| parts)
+                } else {
+                    encrypt_sources_v5(
+                        &sources,
+                        &out_vault,
+                        password.as_bytes(),
+                        &opts,
+                        reporter.callback(),
+                        Arc::clone(&cancel),
+                        |_| {},
+                    )
+                    .map(|_| vec![out_vault.clone()])
+                }
             } else {
                 let hidden_password = match read_secret_line(
                     "Hidden password: ",
@@ -503,24 +550,43 @@ where
                     hidden_compressed: !hidden_no_compress,
                     ..Default::default()
                 };
-                encrypt_hidden_sources_v5(
-                    &sources,
-                    &hidden,
-                    &out_vault,
-                    password.as_bytes(),
-                    hidden_password.as_bytes(),
-                    &opts,
-                    reporter.callback(),
-                    Arc::clone(&cancel),
-                    |_| {},
-                )
-                .map(|_| ())
+                if let Some(part_bytes) = split_part_bytes {
+                    encrypt_hidden_sources_v5_split(
+                        &sources,
+                        &hidden,
+                        &out_vault,
+                        part_bytes,
+                        password.as_bytes(),
+                        hidden_password.as_bytes(),
+                        &opts,
+                        reporter.callback(),
+                        Arc::clone(&cancel),
+                        |_| {},
+                    )
+                    .map(|(_, _, _, parts)| parts)
+                } else {
+                    encrypt_hidden_sources_v5(
+                        &sources,
+                        &hidden,
+                        &out_vault,
+                        password.as_bytes(),
+                        hidden_password.as_bytes(),
+                        &opts,
+                        reporter.callback(),
+                        Arc::clone(&cancel),
+                        |_| {},
+                    )
+                    .map(|_| vec![out_vault.clone()])
+                }
             };
             reporter.finish(stderr);
-            if let Err(err) = enc_res {
-                let _ = writeln!(stderr, "Error encrypting: {err}");
-                return exit_code_for_storage_error(&err);
-            }
+            let created_outputs = match enc_res {
+                Ok(outputs) => outputs,
+                Err(err) => {
+                    let _ = writeln!(stderr, "Error encrypting: {err}");
+                    return exit_code_for_storage_error(&err);
+                }
+            };
 
             if wipe {
                 let wiper = SecureWiper::new(1);
@@ -536,7 +602,25 @@ where
                 }
             }
 
-            let _ = writeln!(stdout, "Encrypted: {}", out_vault.display());
+            if split_part_bytes.is_some() {
+                if created_outputs.len() == 1 {
+                    let _ = writeln!(
+                        stdout,
+                        "Encrypted (1 part): {}",
+                        created_outputs[0].display()
+                    );
+                } else {
+                    let _ = writeln!(
+                        stdout,
+                        "Encrypted ({} parts): {} .. {}",
+                        created_outputs.len(),
+                        created_outputs[0].display(),
+                        created_outputs.last().unwrap().display()
+                    );
+                }
+            } else {
+                let _ = writeln!(stdout, "Encrypted: {}", out_vault.display());
+            }
             let recovery_label = if hidden.is_empty() {
                 "Recovery phrase"
             } else {
@@ -575,18 +659,39 @@ where
             recovery_stdin,
             progress,
         } => {
+            for v in &vaults {
+                if !v.is_file() {
+                    let _ = writeln!(stderr, "Error: vault not found: {}", v.display());
+                    return 1;
+                }
+            }
+            // Collapse multiple parts of the same split volume (e.g. shell glob `archive.vault.*`)
+            // to a single canonical `.001` target.
+            let mut normalized_vaults = Vec::with_capacity(vaults.len());
+            for v in vaults {
+                match discover_split_parts(&v) {
+                    Ok(Some(set)) => {
+                        let first = set.first_part().to_path_buf();
+                        if !normalized_vaults.contains(&first) {
+                            normalized_vaults.push(first);
+                        }
+                    }
+                    Ok(None) => {
+                        normalized_vaults.push(v);
+                    }
+                    Err(err) => {
+                        let _ = writeln!(stderr, "Error decrypting {}: {err}", v.display());
+                        return exit_code_for_storage_error(&err);
+                    }
+                }
+            }
+            let vaults = normalized_vaults;
             if !only.is_empty() && vaults.len() > 1 {
                 let _ = writeln!(
                     stderr,
                     "Error: --only can only be used with a single .vault file"
                 );
                 return 1;
-            }
-            for v in &vaults {
-                if !v.is_file() {
-                    let _ = writeln!(stderr, "Error: vault not found: {}", v.display());
-                    return 1;
-                }
             }
             if let Some(dir) = output_dir.as_deref() {
                 if !dir.is_dir() {
@@ -714,7 +819,15 @@ where
                 return 1;
             }
             if integrity_only {
-                match check_integrity(&vault) {
+                let split_parts = match discover_split_parts(&vault) {
+                    Ok(Some(set)) => Some(set.part_count()),
+                    Ok(None) => None,
+                    Err(e) => {
+                        let _ = writeln!(stderr, "Error: {e}");
+                        return 1;
+                    }
+                };
+                match check_vault_integrity(&vault) {
                     Ok(rep) => {
                         if json {
                             let val = serde_json::json!({
@@ -729,24 +842,34 @@ where
                                 "has_keyfile": rep.has_keyfile,
                                 "has_recovery": rep.has_recovery,
                                 "chunk_count": rep.chunk_count,
+                                "split_parts": split_parts.unwrap_or(1),
                                 "message": rep.message,
                             });
                             let _ =
                                 writeln!(stdout, "{}", serde_json::to_string_pretty(&val).unwrap());
                         } else if rep.sha256_only {
                             let _ = writeln!(stdout, "{}", rep.message);
+                            if let Some(n) = split_parts {
+                                let _ = writeln!(stdout, "split_parts: {n}");
+                            }
                         } else if rep.has_reed_solomon {
                             let _ = writeln!(
                                 stdout,
                                 "{}\nhas_reed_solomon: {}\nrs_repaired_bytes: {}",
                                 rep.message, rep.has_reed_solomon, rep.rs_repaired_bytes
                             );
+                            if let Some(n) = split_parts {
+                                let _ = writeln!(stdout, "split_parts: {n}");
+                            }
                         } else {
                             let _ = writeln!(
                                 stdout,
                                 "{}\nhas_reed_solomon: {}",
                                 rep.message, rep.has_reed_solomon
                             );
+                            if let Some(n) = split_parts {
+                                let _ = writeln!(stdout, "split_parts: {n}");
+                            }
                         }
                         return if rep.ok { 0 } else { 1 };
                     }
@@ -810,13 +933,14 @@ where
                 }
             };
 
-            let mut reader = match File::open(&vault).map(BufReader::new) {
+            let mut reader = match open_vault_reader(&vault) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = writeln!(stderr, "Error: {e}");
                     return 1;
                 }
             };
+            let split_parts = reader.is_split().then_some(reader.part_count());
             match inspect_header_seekable_with_kdf(&mut reader, auth, &kdf) {
                 Ok(info) => {
                     if json {
@@ -832,6 +956,7 @@ where
                             "rs_repaired_bytes": info.rs_repaired_bytes,
                             "has_keyfile": info.has_keyfile,
                             "has_recovery": info.has_recovery,
+                            "split_parts": split_parts.unwrap_or(1),
                             "metadata": info.metadata,
                         });
                         let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&val).unwrap());
@@ -844,9 +969,13 @@ where
                         } else {
                             "has_reed_solomon: false\n".into()
                         };
+                        let split_line = match split_parts {
+                            Some(n) => format!("split_parts: {n}\n"),
+                            None => String::new(),
+                        };
                         let _ = writeln!(
                             stdout,
-                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\nis_stealth: {}\n{}{}",
+                            "Version: v{}  Cipher: {}  Chunk: {} KiB\ncontainer_size: {}\nis_hidden_compartment: {}\nis_stealth: {}\n{}{}{}",
                             info.version,
                             info.cipher,
                             info.chunk_size / 1024,
@@ -854,6 +983,7 @@ where
                             info.is_hidden_compartment,
                             info.is_stealth,
                             rs_line,
+                            split_line,
                             format_metadata_plain(&info.metadata)
                         );
                     }
@@ -955,6 +1085,72 @@ where
                 }
                 Err(err) => {
                     let _ = writeln!(stderr, "Error re-keying: {err}");
+                    exit_code_for_storage_error(&err)
+                }
+            }
+        }
+
+        Commands::Split {
+            vault,
+            part_mb,
+            output_dir,
+            progress,
+        } => {
+            let reporter = CliProgressReporter::new(progress, stderr_is_tty, "Splitting");
+            let res = split_vault_file(
+                &vault,
+                output_dir.as_deref(),
+                part_mb * MIB,
+                reporter.callback(),
+                Arc::clone(&cancel),
+            );
+            reporter.finish(stderr);
+            match res {
+                Ok(parts) => {
+                    if parts.len() == 1 {
+                        let _ = writeln!(stdout, "Split (1 part): {}", parts[0].display());
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            "Split ({} parts): {} .. {}",
+                            parts.len(),
+                            parts[0].display(),
+                            parts.last().unwrap().display()
+                        );
+                    }
+                    0
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "Error splitting vault: {err}");
+                    exit_code_for_storage_error(&err)
+                }
+            }
+        }
+
+        Commands::Join {
+            part,
+            output,
+            progress,
+        } => {
+            let reporter = CliProgressReporter::new(progress, stderr_is_tty, "Joining");
+            let res = join_vault_parts(
+                &part,
+                output.as_deref(),
+                reporter.callback(),
+                Arc::clone(&cancel),
+            );
+            reporter.finish(stderr);
+            match res {
+                Ok((out_path, total_bytes)) => {
+                    let _ = writeln!(
+                        stdout,
+                        "Joined: {} ({total_bytes} bytes)",
+                        out_path.display()
+                    );
+                    0
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "Error joining vault: {err}");
                     exit_code_for_storage_error(&err)
                 }
             }

@@ -47,6 +47,7 @@ pub struct EncryptProfile {
     pub reed_solomon: bool,
     pub secure_wipe: bool,
     pub container_size_mib: Option<u64>,
+    pub split_part_mib: Option<u64>,
     pub save_next_to_source: bool,
     pub output_dir: String,
     pub keyfile_path: Option<PathBuf>,
@@ -61,6 +62,7 @@ impl Default for EncryptProfile {
             reed_solomon: false,
             secure_wipe: false,
             container_size_mib: None,
+            split_part_mib: None,
             save_next_to_source: true,
             output_dir: String::new(),
             keyfile_path: None,
@@ -84,6 +86,11 @@ impl EncryptProfile {
         if let Some(mib) = self.container_size_mib {
             if mib == 0 || mib > MAX_CONTAINER_MIB {
                 self.container_size_mib = None;
+            }
+        }
+        if let Some(mib) = self.split_part_mib {
+            if mib == 0 || mib > MAX_CONTAINER_MIB {
+                self.split_part_mib = None;
             }
         }
         true

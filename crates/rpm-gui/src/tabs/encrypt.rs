@@ -9,13 +9,13 @@ use rpm_core::{entropy_to_mnemonic, generate_recovery_entropy};
 use rpm_storage::config::AppLanguage;
 use zeroize::Zeroizing;
 
-use crate::estimator::ContainerFitStatus;
+use crate::estimator::{ContainerFitStatus, SplitEstimateStatus};
 use crate::i18n::Strings;
 use crate::progress::format_bytes;
 use crate::queue::QueuedJobKind;
 use crate::state::{
     strength_label_and_color_for, AppState, BuiltinEncryptPreset, ContainerSizeError,
-    ContainerSizePreset, RecoveryPrompt, Tab, WorkerUpdate,
+    ContainerSizePreset, RecoveryPrompt, SplitSizeError, SplitSizePreset, Tab, WorkerUpdate,
 };
 use crate::{theme, worker};
 
@@ -27,10 +27,17 @@ fn container_size_error_msg(err: ContainerSizeError, s: &'static Strings) -> &'s
     }
 }
 
+fn split_size_error_msg(err: SplitSizeError, s: &'static Strings) -> &'static str {
+    match err {
+        SplitSizeError::InvalidCustomValue => s.err_split_invalid_mb,
+        SplitSizeError::OutOfRange => s.err_split_out_of_range,
+    }
+}
+
 fn validate_encrypt_inputs(
     state: &AppState,
     s: &'static Strings,
-) -> Result<Option<u64>, &'static str> {
+) -> Result<(Option<u64>, Option<u64>), &'static str> {
     if state.encrypt.sources.is_empty() {
         return Err(s.err_add_source);
     }
@@ -50,6 +57,10 @@ fn validate_encrypt_inputs(
         .encrypt
         .resolve_container_size()
         .map_err(|e| container_size_error_msg(e, s))?;
+    let split_part_size = state
+        .encrypt
+        .resolve_split_size()
+        .map_err(|e| split_size_error_msg(e, s))?;
     if state.encrypt.enable_hidden {
         if state.encrypt.hidden_sources.is_empty() {
             return Err(s.err_hidden_add_source);
@@ -64,7 +75,7 @@ fn validate_encrypt_inputs(
             return Err(s.err_hidden_same_pw);
         }
     }
-    Ok(container_size)
+    Ok((container_size, split_part_size))
 }
 
 fn render_source_list(
@@ -278,6 +289,34 @@ fn render_preflight_card(ui: &mut egui::Ui, state: &AppState, s: &'static String
             )
         };
         ui.label(output_line);
+
+        match est.split {
+            SplitEstimateStatus::Off => {}
+            SplitEstimateStatus::Invalid(err) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 80, 80),
+                    split_size_error_msg(err, s),
+                );
+            }
+            SplitEstimateStatus::Parts {
+                part_bytes,
+                estimated_parts,
+            } => {
+                let split_line = match lang {
+                    AppLanguage::Tr => format!(
+                        "{} ~{estimated_parts} parça (parça başına en fazla {})",
+                        s.preflight_split_parts,
+                        format_bytes(part_bytes)
+                    ),
+                    AppLanguage::En => format!(
+                        "{} ~{estimated_parts} part(s) (max {} each)",
+                        s.preflight_split_parts,
+                        format_bytes(part_bytes)
+                    ),
+                };
+                ui.label(split_line);
+            }
+        }
 
         match est.fit {
             ContainerFitStatus::NoContainer => {}
@@ -523,6 +562,31 @@ pub fn ui(
             ui.weak(s.hint_container_padding);
         }
 
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_split_volume);
+            egui::ComboBox::from_id_salt("enc_split_preset")
+                .selected_text(state.encrypt.split_preset.localized_label(s))
+                .show_ui(ui, |ui| {
+                    for preset in SplitSizePreset::ALL {
+                        ui.selectable_value(
+                            &mut state.encrypt.split_preset,
+                            preset,
+                            preset.localized_label(s),
+                        );
+                    }
+                });
+            if state.encrypt.split_preset == SplitSizePreset::Custom {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.encrypt.split_custom_mb)
+                        .desired_width(80.0),
+                );
+                ui.label("MiB");
+            }
+        });
+        if state.encrypt.split_preset != SplitSizePreset::None {
+            ui.weak(s.hint_split_volume);
+        }
+
         ui.checkbox(
             &mut state.encrypt.save_next_to_source,
             s.chk_save_next_to_source,
@@ -718,8 +782,8 @@ pub fn ui(
         state.encrypt.recovery_prompt = None;
         state.set_status(s.status_enc_cancelled, false);
     } else if launch {
-        let container_size = match validate_encrypt_inputs(state, s) {
-            Ok(sz) => sz,
+        let (container_size, split_part_bytes) = match validate_encrypt_inputs(state, s) {
+            Ok(pair) => pair,
             Err(err_msg) => {
                 state.encrypt.recovery_prompt = None;
                 state.set_status(err_msg, true);
@@ -756,6 +820,7 @@ pub fn ui(
                         decoy_compressed: state.encrypt.compress,
                         hidden_compressed: state.encrypt.hidden_compress,
                         container_size_bytes,
+                        split_part_bytes,
                         stealth: state.encrypt.stealth,
                         reed_solomon: state.encrypt.reed_solomon,
                         secure_wipe: state.encrypt.secure_wipe,
@@ -774,6 +839,7 @@ pub fn ui(
                         output_dir: out_dir,
                         compress: state.encrypt.compress,
                         container_size_bytes: container_size,
+                        split_part_bytes,
                         stealth: state.encrypt.stealth,
                         reed_solomon: state.encrypt.reed_solomon,
                         secure_wipe: state.encrypt.secure_wipe,
@@ -793,7 +859,7 @@ pub fn ui(
                     let hidden_pw =
                         Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt_hidden(
+                    worker::spawn_encrypt_hidden_with_split(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -808,6 +874,7 @@ pub fn ui(
                         state.encrypt.compress,
                         state.encrypt.hidden_compress,
                         container_size_bytes,
+                        split_part_bytes,
                         state.encrypt.stealth,
                         state.encrypt.reed_solomon,
                         state.encrypt.secure_wipe,
@@ -819,7 +886,7 @@ pub fn ui(
                     state.begin_transfer(s.status_enc_running);
                     let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt(
+                    worker::spawn_encrypt_with_split(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -830,6 +897,7 @@ pub fn ui(
                         out_dir,
                         state.encrypt.compress,
                         container_size,
+                        split_part_bytes,
                         state.encrypt.stealth,
                         state.encrypt.reed_solomon,
                         state.encrypt.secure_wipe,
