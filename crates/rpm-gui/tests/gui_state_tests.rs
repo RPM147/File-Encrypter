@@ -2309,6 +2309,9 @@ fn split_volumes_presets_profiles_estimator_drop_dedup_workers_and_i18n() {
             s.hint_split_volume,
             s.err_split_invalid_mb,
             s.err_split_out_of_range,
+            s.err_split_too_many_parts,
+            s.err_compartment_overlap,
+            s.err_wipe_protected_target,
             s.preflight_split_parts,
             s.split_tool_heading,
             s.split_tool_subtitle,
@@ -2336,5 +2339,498 @@ fn split_volumes_presets_profiles_estimator_drop_dedup_workers_and_i18n() {
         assert!(!s.split_100_mib.is_empty());
         assert!(!s.split_500_mib.is_empty());
         assert!(!s.split_2000_mib.is_empty());
+    }
+}
+
+#[test]
+fn gui_split_audit_regressions_drop_guards_wipe_overlap_reports_and_canonical_done() {
+    use rpm_gui::estimator::{estimate_encrypt_preflight_with_split, SplitEstimateStatus};
+    use rpm_gui::queue::{QueuedJob, QueuedJobKind};
+    use rpm_gui::state::{SplitSizePreset, WorkerUpdate};
+    use rpm_gui::tabs::encrypt::validate_encrypt_inputs;
+    use rpm_storage::split_part_path;
+    use zeroize::Zeroizing;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1) Lone non-`.vault` `photo.001` routes to Encrypt (NOT Decrypt!)
+    let photo = dir.path().join("photo.001");
+    fs::write(&photo, b"jpeg bytes").unwrap();
+    let mut st = fresh_state();
+    st.add_dropped_paths(vec![photo.clone()], None);
+    assert_eq!(st.active_tab, Tab::Encrypt);
+    assert_eq!(st.encrypt.sources, vec![photo]);
+
+    // 2) Folder named `folder.vault.001` routes to Encrypt on smart drop and is rejected on forced Decrypt
+    let dir_vault = dir.path().join("folder.vault.001");
+    fs::create_dir(&dir_vault).unwrap();
+    let mut st_dir = fresh_state();
+    st_dir.add_dropped_paths(vec![dir_vault.clone()], None);
+    assert_eq!(st_dir.active_tab, Tab::Encrypt);
+    assert_eq!(st_dir.encrypt.sources, vec![dir_vault.clone()]);
+
+    let mut st_dir_dec = fresh_state();
+    st_dir_dec.add_dropped_paths(vec![dir_vault], Some(Tab::Decrypt));
+    assert!(st_dir_dec.decrypt.vaults.is_empty());
+    assert!(st_dir_dec.is_error);
+
+    // 3) Missing middle part in dropped split volume surfaces error (NEVER swallowed!)
+    let gap_dir = dir.path().join("gap");
+    fs::create_dir(&gap_dir).unwrap();
+    let g1 = gap_dir.join("broken.vault.001");
+    let g3 = gap_dir.join("broken.vault.003");
+    fs::write(&g1, b"p1").unwrap();
+    fs::write(&g3, b"p3").unwrap();
+    let mut st_gap = fresh_state();
+    st_gap.add_dropped_paths(vec![g1.clone(), g3], None);
+    assert_eq!(st_gap.active_tab, Tab::Decrypt);
+    assert!(st_gap.decrypt.vaults.is_empty());
+    assert!(st_gap.is_error);
+    assert!(
+        st_gap.status.contains("missing split volume part"),
+        "status: {}",
+        st_gap.status
+    );
+
+    // 3b) Missing part in dropped STEALTH split volume (non-`.vault`) with `forced_tab = None`
+    //     MUST route to Decrypt and surface the missing-part error (NOT silently route to Encrypt!).
+    let stealth_gap_dir = dir.path().join("stealth_gap_drop");
+    fs::create_dir(&stealth_gap_dir).unwrap();
+    let sg1 = stealth_gap_dir.join("opaque.bin.001");
+    let sg3 = stealth_gap_dir.join("opaque.bin.003");
+    fs::write(&sg1, b"s1").unwrap();
+    fs::write(&sg3, b"s3").unwrap();
+    let mut st_sgap = fresh_state();
+    st_sgap.add_dropped_paths(vec![sg1, sg3], None);
+    assert_eq!(st_sgap.active_tab, Tab::Decrypt);
+    assert!(st_sgap.decrypt.vaults.is_empty());
+    assert!(st_sgap.encrypt.sources.is_empty());
+    assert!(st_sgap.is_error);
+    assert!(
+        st_sgap.status.contains("missing split volume part"),
+        "status: {}",
+        st_sgap.status
+    );
+
+    let stealth_head_dir = dir.path().join("stealth_head_drop");
+    fs::create_dir(&stealth_head_dir).unwrap();
+    let sh2 = stealth_head_dir.join("opaque.bin.002");
+    let sh3 = stealth_head_dir.join("opaque.bin.003");
+    fs::write(&sh2, b"s2").unwrap();
+    fs::write(&sh3, b"s3").unwrap();
+    let mut st_shead = fresh_state();
+    st_shead.add_dropped_paths(vec![sh2, sh3], None);
+    assert_eq!(st_shead.active_tab, Tab::Decrypt);
+    assert!(st_shead.decrypt.vaults.is_empty());
+    assert!(st_shead.encrypt.sources.is_empty());
+    assert!(st_shead.is_error);
+    assert!(
+        st_shead.status.contains("missing split volume part"),
+        "status: {}",
+        st_shead.status
+    );
+
+    // 4) O(N) large multi-part drop (200 parts) + Windows case-variant dedup collapses to single `.001`
+    let many_dir = dir.path().join("many_drop");
+    fs::create_dir(&many_dir).unwrap();
+    let many_base = many_dir.join("Batch.vault");
+    let mut all_parts = Vec::with_capacity(200);
+    for idx in 1..=200 {
+        let p = split_part_path(&many_base, idx);
+        fs::write(&p, b"x").unwrap();
+        all_parts.push(p);
+    }
+    #[cfg(windows)]
+    all_parts.push(many_dir.join("BATCH.VAULT.002"));
+
+    let mut st_many = fresh_state();
+    st_many.add_dropped_paths(all_parts, None);
+    assert_eq!(st_many.active_tab, Tab::Decrypt);
+    assert_eq!(st_many.decrypt.vaults, vec![split_part_path(&many_base, 1)]);
+
+    // 5) Estimator TooManyParts + profile snapshot + validate_encrypt_inputs reject > MAX_SPLIT_PARTS
+    let huge_summary = SourceSizeSummary {
+        file_count: 1,
+        dir_count: 0,
+        raw_bytes: 20_000 * CONTAINER_MIB,
+        ..Default::default()
+    };
+    let est_many = estimate_encrypt_preflight_with_split(
+        &huge_summary,
+        &SourceSizeSummary::default(),
+        false,
+        false,
+        false,
+        false,
+        ContainerSizePreset::Auto,
+        "100",
+        SplitSizePreset::Custom,
+        "1",
+    );
+    assert!(
+        matches!(est_many.split, SplitEstimateStatus::TooManyParts { .. }),
+        "expected TooManyParts, got {:?}",
+        est_many.split
+    );
+
+    let mut st_bounds = fresh_state();
+    st_bounds.encrypt.container_preset = ContainerSizePreset::Custom;
+    st_bounds.encrypt.container_custom_mb = "20000".into();
+    st_bounds.encrypt.split_preset = SplitSizePreset::Custom;
+    st_bounds.encrypt.split_custom_mb = "1".into();
+    assert!(st_bounds.save_current_encrypt_profile("BadCombo").is_err());
+
+    let dummy_file = dir.path().join("dummy.txt");
+    fs::write(&dummy_file, b"hello").unwrap();
+    st_bounds.encrypt.sources = vec![dummy_file.clone()];
+    st_bounds.encrypt.password = "StrongPass!1".into();
+    st_bounds.encrypt.confirm_password = "StrongPass!1".into();
+    assert_eq!(
+        validate_encrypt_inputs(&st_bounds, &i18n::EN),
+        Err(i18n::EN.err_split_too_many_parts)
+    );
+
+    // 6) GUI wipe target & compartment overlap protections (validate_encrypt_inputs, direct workers, AND queued jobs)
+    let guard_dir = dir.path().join("guard_tree");
+    let nested_dir = guard_dir.join("nested");
+    fs::create_dir_all(&nested_dir).unwrap();
+    let outer_file = guard_dir.join("outer.txt");
+    let hidden_file = nested_dir.join("hidden.txt");
+    let keyfile_inside = nested_dir.join("secret.key");
+    fs::write(&outer_file, b"outer").unwrap();
+    fs::write(&hidden_file, b"hidden").unwrap();
+    fs::write(&keyfile_inside, b"key-bytes").unwrap();
+
+    // 6a) validate_encrypt_inputs catches compartment overlap (outer folder contains hidden file)
+    let mut st_ov = fresh_state();
+    st_ov.encrypt.sources = vec![guard_dir.clone()];
+    st_ov.encrypt.enable_hidden = true;
+    st_ov.encrypt.container_preset = ContainerSizePreset::MiB10;
+    st_ov.encrypt.hidden_sources = vec![hidden_file.clone()];
+    st_ov.encrypt.password = "OuterPw!1".into();
+    st_ov.encrypt.confirm_password = "OuterPw!1".into();
+    st_ov.encrypt.hidden_password = "HiddenPw!2".into();
+    st_ov.encrypt.hidden_confirm_password = "HiddenPw!2".into();
+    st_ov.encrypt.save_next_to_source = false;
+    st_ov.encrypt.output_dir = dir.path().display().to_string();
+    assert_eq!(
+        validate_encrypt_inputs(&st_ov, &i18n::EN),
+        Err(i18n::EN.err_compartment_overlap)
+    );
+    // Still detects overlap even if an unrelated sibling source was deleted from disk.
+    st_ov
+        .encrypt
+        .sources
+        .insert(0, dir.path().join("deleted_sibling.txt"));
+    assert_eq!(
+        validate_encrypt_inputs(&st_ov, &i18n::EN),
+        Err(i18n::EN.err_compartment_overlap)
+    );
+    #[cfg(windows)]
+    {
+        let mut st_hid_dedup = fresh_state();
+        assert_eq!(
+            st_hid_dedup
+                .encrypt
+                .add_hidden_sources(vec![hidden_file.clone(), nested_dir.join("HIDDEN.TXT")]),
+            1
+        );
+    }
+
+    // 6b) validate_encrypt_inputs catches secure_wipe targeting output_dir or keyfile
+    let mut st_wipe = fresh_state();
+    st_wipe.encrypt.sources = vec![guard_dir.clone()];
+    st_wipe.encrypt.password = "WipePw!1".into();
+    st_wipe.encrypt.confirm_password = "WipePw!1".into();
+    st_wipe.encrypt.secure_wipe = true;
+    st_wipe.encrypt.save_next_to_source = false;
+    st_wipe.encrypt.output_dir = nested_dir.display().to_string();
+    assert_eq!(
+        validate_encrypt_inputs(&st_wipe, &i18n::EN),
+        Err(i18n::EN.err_wipe_protected_target)
+    );
+    // Still detects protected output_dir even if keyfile was deleted from disk.
+    st_wipe.encrypt.keyfile = Some(dir.path().join("missing.key"));
+    assert_eq!(
+        validate_encrypt_inputs(&st_wipe, &i18n::EN),
+        Err(i18n::EN.err_wipe_protected_target)
+    );
+    st_wipe.encrypt.output_dir = dir.path().display().to_string();
+    st_wipe.encrypt.keyfile = Some(keyfile_inside.clone());
+    assert_eq!(
+        validate_encrypt_inputs(&st_wipe, &i18n::EN),
+        Err(i18n::EN.err_wipe_protected_target)
+    );
+
+    // 6c) Direct worker + queued job enforce BOTH wipe and overlap protections without touching files!
+    let ctx = egui::Context::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Direct worker wipe protection (output_dir inside source)
+    worker::spawn_encrypt_with_split(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        vec![guard_dir.clone()],
+        Zeroizing::new("WipePw!1".into()),
+        SecretKey::new([0x11; 32]),
+        None,
+        Some(nested_dir.clone()),
+        false,
+        None,
+        None,
+        false,
+        false,
+        true,
+        1,
+        KdfParams::fast_test(),
+        AppLanguage::En,
+    );
+    match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        WorkerUpdate::Error(msg) => assert_eq!(msg, i18n::EN.err_wipe_protected_target),
+        other => panic!("expected wipe protection error, got {other:?}"),
+    }
+    assert!(outer_file.is_file() && hidden_file.is_file() && keyfile_inside.is_file());
+
+    // Queued EncryptHidden job enforces compartment overlap protection
+    let queued_overlap = QueuedJob {
+        id: 1,
+        label: "overlap".into(),
+        kind: QueuedJobKind::EncryptHidden {
+            decoy_sources: vec![guard_dir.clone()],
+            hidden_sources: vec![hidden_file.clone()],
+            decoy_password: Zeroizing::new("OuterPw!1".into()),
+            hidden_password: Zeroizing::new("HiddenPw!2".into()),
+            decoy_recovery_entropy: SecretKey::new([0x22; 32]),
+            decoy_keyfile: None,
+            hidden_keyfile: None,
+            output_dir: Some(dir.path().to_path_buf()),
+            decoy_compressed: false,
+            hidden_compressed: false,
+            container_size_bytes: CONTAINER_MIB,
+            split_part_bytes: None,
+            stealth: false,
+            reed_solomon: false,
+            secure_wipe: true,
+            wipe_passes: 1,
+            kdf: KdfParams::fast_test(),
+        },
+    };
+    worker::spawn_queued_job(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        queued_overlap,
+        AppLanguage::Tr,
+    );
+    match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        WorkerUpdate::Error(msg) => assert_eq!(msg, i18n::TR.err_compartment_overlap),
+        other => panic!("expected queued overlap error, got {other:?}"),
+    }
+    assert!(outer_file.is_file() && hidden_file.is_file());
+
+    // Queued Encrypt job enforces keyfile wipe protection
+    let queued_wipe_kf = QueuedJob {
+        id: 2,
+        label: "wipe_kf".into(),
+        kind: QueuedJobKind::Encrypt {
+            sources: vec![guard_dir.clone()],
+            password: Zeroizing::new("WipePw!1".into()),
+            recovery_entropy: SecretKey::new([0x33; 32]),
+            keyfile: Some(keyfile_inside.clone()),
+            output_dir: Some(dir.path().to_path_buf()),
+            compress: false,
+            container_size_bytes: None,
+            split_part_bytes: None,
+            stealth: false,
+            reed_solomon: false,
+            secure_wipe: true,
+            wipe_passes: 1,
+            kdf: KdfParams::fast_test(),
+        },
+    };
+    worker::spawn_queued_job(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        queued_wipe_kf,
+        AppLanguage::Tr,
+    );
+    match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        WorkerUpdate::Error(msg) => assert_eq!(msg, i18n::TR.err_wipe_protected_target),
+        other => panic!("expected queued wipe keyfile error, got {other:?}"),
+    }
+    assert!(keyfile_inside.is_file());
+
+    // 7) `RekeyDone` / `RepairDone` return canonical `.001` path even when launched from `.002`,
+    //    AND integrity/inspect reports keep aligned headers + Turkish `AEAD Blok Sayısı` + header-block `Split Parts`!
+    let big_src = dir.path().join("split_done.bin");
+    let mut blob = Vec::with_capacity(1_200_000);
+    let mut s: u32 = 0x55AA_1234;
+    for _ in 0..1_200_000 {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        blob.push((s & 0xFF) as u8);
+    }
+    fs::write(&big_src, &blob).unwrap();
+
+    // Standard 2-part split -> Rekey from `.002` -> RekeyDone returns `.001`, Integrity & Inspect aligned in TR & EN
+    let std_out = dir.path().join("std_done");
+    fs::create_dir(&std_out).unwrap();
+    worker::spawn_encrypt_with_split(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        vec![big_src.clone()],
+        Zeroizing::new("DonePw!1".into()),
+        SecretKey::new([0x44; 32]),
+        None,
+        Some(std_out.clone()),
+        false,
+        None,
+        Some(CONTAINER_MIB),
+        false,
+        false,
+        false,
+        1,
+        KdfParams::fast_test(),
+        AppLanguage::Tr,
+    );
+    let std_p1 = loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::EncryptDone { output_path, .. } => break output_path,
+            WorkerUpdate::Error(e) => panic!("std split encrypt failed: {e}"),
+            _ => {}
+        }
+    };
+    let std_p2 = std_out.join("split_done.bin.vault.002");
+    assert!(std_p1.is_file() && std_p2.is_file());
+
+    // Check TR + EN Integrity & Inspect report alignment and header placement
+    for lang in [AppLanguage::Tr, AppLanguage::En] {
+        worker::spawn_integrity_check(ctx.clone(), tx.clone(), std_p2.clone(), lang);
+        let text = loop {
+            match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+                WorkerUpdate::IntegrityDone { text, ok, .. } => {
+                    assert!(ok);
+                    break text;
+                }
+                WorkerUpdate::Error(e) => panic!("integrity failed: {e}"),
+                _ => {}
+            }
+        };
+        let header_block = text.split("\n\n").next().unwrap();
+        let cols: Vec<usize> = header_block
+            .lines()
+            .skip(1)
+            .map(|l| l.chars().position(|c| c == ':').unwrap())
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{text}");
+        match lang {
+            AppLanguage::Tr => {
+                assert!(header_block.contains("AEAD Blok Sayısı"), "{text}");
+                assert!(header_block.contains("Bölünmüş Parça"), "{text}");
+            }
+            AppLanguage::En => {
+                assert!(header_block.contains("Split Parts"), "{text}");
+            }
+        }
+
+        worker::spawn_inspect(
+            ctx.clone(),
+            tx.clone(),
+            std_p2.clone(),
+            false,
+            Zeroizing::new("DonePw!1".into()),
+            None,
+            lang,
+        );
+        let ins_text = loop {
+            match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+                WorkerUpdate::InspectDone { text, .. } => break text,
+                WorkerUpdate::Error(e) => panic!("inspect failed: {e}"),
+                _ => {}
+            }
+        };
+        let ins_header = ins_text.split("\n\n").next().unwrap();
+        let ins_cols: Vec<usize> = ins_header
+            .lines()
+            .skip(1)
+            .map(|l| l.chars().position(|c| c == ':').unwrap())
+            .collect();
+        assert!(ins_cols.windows(2).all(|w| w[0] == w[1]), "{ins_text}");
+        match lang {
+            AppLanguage::Tr => assert!(ins_header.contains("Bölünmüş Parça"), "{ins_text}"),
+            AppLanguage::En => assert!(ins_header.contains("Split Parts"), "{ins_text}"),
+        }
+    }
+
+    worker::spawn_rekey(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        std_p2,
+        Zeroizing::new("DonePw!1".into()),
+        Zeroizing::new("DonePw!2".into()),
+        None,
+        None,
+        KdfParams::fast_test(),
+        AppLanguage::En,
+    );
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::RekeyDone { vault_path, .. } => {
+                assert_eq!(vault_path, std_p1);
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("rekey failed: {e}"),
+            _ => {}
+        }
+    }
+
+    // RS 2-part split -> Repair from `.002` -> RepairDone returns `.001`
+    let rs_out = dir.path().join("rs_done");
+    fs::create_dir(&rs_out).unwrap();
+    worker::spawn_encrypt_with_split(
+        ctx.clone(),
+        tx.clone(),
+        Arc::clone(&cancel),
+        vec![big_src],
+        Zeroizing::new("RsDone!1".into()),
+        SecretKey::new([0x55; 32]),
+        None,
+        Some(rs_out.clone()),
+        false,
+        None,
+        Some(CONTAINER_MIB),
+        false,
+        true,
+        false,
+        1,
+        KdfParams::fast_test(),
+        AppLanguage::En,
+    );
+    let rs_p1 = loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::EncryptDone { output_path, .. } => break output_path,
+            WorkerUpdate::Error(e) => panic!("rs split encrypt failed: {e}"),
+            _ => {}
+        }
+    };
+    let rs_p2 = rs_out.join("split_done.bin.vault.002");
+    assert!(rs_p1.is_file() && rs_p2.is_file());
+
+    worker::spawn_repair(ctx, tx, rs_p2, cancel, AppLanguage::En);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+            WorkerUpdate::RepairDone { vault_path, .. } => {
+                assert_eq!(vault_path, rs_p1);
+                break;
+            }
+            WorkerUpdate::Error(e) => panic!("repair failed: {e}"),
+            _ => {}
+        }
     }
 }

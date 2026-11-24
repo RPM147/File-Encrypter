@@ -89,7 +89,24 @@ impl EncryptProfile {
             }
         }
         if let Some(mib) = self.split_part_mib {
-            if mib == 0 || mib > MAX_CONTAINER_MIB {
+            let part_bytes = mib.saturating_mul(CONTAINER_MIB);
+            if mib == 0 || mib > MAX_CONTAINER_MIB || part_bytes < crate::split::MIN_SPLIT_PART_SIZE
+            {
+                self.split_part_mib = None;
+            }
+        }
+        if let (Some(container_mib), Some(split_mib)) =
+            (self.container_size_mib, self.split_part_mib)
+        {
+            let container_bytes = container_mib.saturating_mul(CONTAINER_MIB);
+            let split_bytes = split_mib.saturating_mul(CONTAINER_MIB);
+            if crate::split::validate_split_bounds(
+                split_bytes,
+                Some(container_bytes),
+                self.reed_solomon,
+            )
+            .is_err()
+            {
                 self.split_part_mib = None;
             }
         }

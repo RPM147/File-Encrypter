@@ -1,10 +1,11 @@
 //! Pure-Rust streaming tar (+ optional deflate/gzip) packager with symlink & Tar-Slip guards.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
@@ -14,6 +15,104 @@ use rpm_core::{FileManifestEntry, VaultMetadata};
 use tar::{Archive, Builder, EntryType};
 
 use crate::error::StorageError;
+use crate::split::{os_name_key, path_dedup_key, OsNameKey, PathDedupKey};
+
+/// Thread-safe registry of exact output/staging paths created during an encryption run.
+///
+/// Writers register each staging or Stealth output file (and any brand-new output directory
+/// created by `create_dir_all_tracked`) BEFORE creating it on disk, ensuring concurrent directory
+/// traversal skips only entries created by THIS run while never silently dropping pre-existing
+/// user files.
+#[derive(Default)]
+pub(crate) struct OutputExclusion {
+    entries: Mutex<HashMap<PathDedupKey, HashSet<OsNameKey>>>,
+}
+
+impl OutputExclusion {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn register_path(&self, path: &Path) {
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_key = path_dedup_key(parent);
+        if let Ok(mut guard) = self.entries.lock() {
+            guard
+                .entry(parent_key)
+                .or_default()
+                .insert(os_name_key(name));
+        }
+    }
+
+    pub(crate) fn is_excluded(
+        &self,
+        fs_path: &Path,
+        cached_parent_key: Option<&PathDedupKey>,
+    ) -> bool {
+        let Some(name) = fs_path.file_name() else {
+            return false;
+        };
+        let Ok(guard) = self.entries.lock() else {
+            return false;
+        };
+        if guard.is_empty() {
+            return false;
+        }
+        let owned_key;
+        let parent_key = match cached_parent_key {
+            Some(k) => k,
+            None => {
+                let parent = fs_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                owned_key = path_dedup_key(parent);
+                &owned_key
+            }
+        };
+        guard
+            .get(parent_key)
+            .is_some_and(|names| names.contains(&os_name_key(name)))
+    }
+}
+
+/// Create `parent` (and any missing ancestors), registering the highest newly created
+/// directory in `exclusion` so a concurrent packer walking an ancestor source folder never
+/// archives an empty output directory created by this run.
+pub(crate) fn create_dir_all_tracked(
+    parent: &Path,
+    exclusion: Option<&OutputExclusion>,
+) -> io::Result<()> {
+    let first_missing = exclusion.and_then(|_| {
+        if fs::symlink_metadata(parent).is_ok() {
+            return None;
+        }
+        let mut cur = parent;
+        let mut highest_missing = Some(parent.to_path_buf());
+        while let Some(up) = cur.parent() {
+            if up.as_os_str().is_empty() {
+                break;
+            }
+            if fs::symlink_metadata(up).is_ok() {
+                break;
+            }
+            highest_missing = Some(up.to_path_buf());
+            cur = up;
+        }
+        highest_missing
+    });
+
+    if let (Some(ex), Some(missing)) = (exclusion, &first_missing) {
+        ex.register_path(missing);
+    }
+    fs::create_dir_all(parent)
+}
 
 fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), StorageError> {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -198,7 +297,8 @@ fn append_recursive<W: Write>(
     fs_path: &Path,
     arc_path: &str,
     cancel: Option<&AtomicBool>,
-    excluded: Option<&Path>,
+    excluded: Option<&OutputExclusion>,
+    parent_key: Option<&PathDedupKey>,
     on_skip: &mut dyn FnMut(&str),
 ) -> Result<(), StorageError> {
     check_cancelled(cancel)?;
@@ -216,35 +316,9 @@ fn append_recursive<W: Write>(
     }
 
     if meta.is_file() {
-        // A destination inside a selected directory may appear after manifest collection
-        // (including multi-part Stealth outputs `<base>.001`, `<base>.002`, ...).
-        if let Some(path) = excluded {
-            let exact_match = path.file_name() == fs_path.file_name()
-                && fs::canonicalize(path)
-                    .is_ok_and(|out| fs::canonicalize(fs_path).is_ok_and(|input| input == out));
-            let split_part_match =
-                crate::split::parse_split_part_path(fs_path).is_some_and(|(cand_base, _)| {
-                    cand_base.file_name() == path.file_name()
-                        && match (path.parent(), cand_base.parent()) {
-                            (Some(p1), Some(p2)) => {
-                                let d1 = if p1.as_os_str().is_empty() {
-                                    Path::new(".")
-                                } else {
-                                    p1
-                                };
-                                let d2 = if p2.as_os_str().is_empty() {
-                                    Path::new(".")
-                                } else {
-                                    p2
-                                };
-                                fs::canonicalize(d1).ok() == fs::canonicalize(d2).ok()
-                            }
-                            _ => cand_base == path,
-                        }
-                });
-            if exact_match || split_part_match {
-                return Ok(());
-            }
+        // Skip only exact output/staging files registered by the active writer for this run.
+        if excluded.is_some_and(|ex| ex.is_excluded(fs_path, parent_key)) {
+            return Ok(());
         }
         let mut f = File::open(fs_path)?;
         builder.append_file(arc_path, &mut f)?;
@@ -252,7 +326,11 @@ fn append_recursive<W: Write>(
     }
 
     if meta.is_dir() {
+        if excluded.is_some_and(|ex| ex.is_excluded(fs_path, parent_key)) {
+            return Ok(());
+        }
         builder.append_dir(arc_path, fs_path)?;
+        let dir_key = excluded.map(|_| path_dedup_key(fs_path));
         let mut children: Vec<_> = fs::read_dir(fs_path)?
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -261,7 +339,15 @@ fn append_recursive<W: Write>(
         for child in children {
             let name = child.file_name().unwrap_or_default().to_string_lossy();
             let next_arc = format!("{arc_path}/{name}");
-            append_recursive(builder, &child, &next_arc, cancel, excluded, on_skip)?;
+            append_recursive(
+                builder,
+                &child,
+                &next_arc,
+                cancel,
+                excluded,
+                dir_key.as_ref(),
+                on_skip,
+            )?;
         }
     }
     Ok(())
@@ -284,7 +370,7 @@ pub(crate) fn pack_sources_excluding<W: Write>(
     writer: W,
     compress: bool,
     cancel: Option<&AtomicBool>,
-    excluded: Option<&Path>,
+    excluded: Option<&OutputExclusion>,
     mut on_skip: impl FnMut(&str),
 ) -> Result<(), StorageError> {
     let roots = assign_unique_roots(sources);
@@ -298,6 +384,7 @@ pub(crate) fn pack_sources_excluding<W: Write>(
                 &arc_root,
                 cancel,
                 excluded,
+                None,
                 &mut on_skip,
             )?;
         }
@@ -313,6 +400,7 @@ pub(crate) fn pack_sources_excluding<W: Write>(
                 &arc_root,
                 cancel,
                 excluded,
+                None,
                 &mut on_skip,
             )?;
         }

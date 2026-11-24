@@ -1,15 +1,16 @@
 //! Encrypt tab UI + recovery phrase modal confirmation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 use rpm_core::{entropy_to_mnemonic, generate_recovery_entropy};
 use rpm_storage::config::AppLanguage;
+use rpm_storage::{check_compartment_sources, check_wipe_targets, StorageError, MAX_SPLIT_PARTS};
 use zeroize::Zeroizing;
 
-use crate::estimator::{ContainerFitStatus, SplitEstimateStatus};
+use crate::estimator::{rs_wire_size, ContainerFitStatus, SplitEstimateStatus};
 use crate::i18n::Strings;
 use crate::progress::format_bytes;
 use crate::queue::QueuedJobKind;
@@ -31,10 +32,11 @@ fn split_size_error_msg(err: SplitSizeError, s: &'static Strings) -> &'static st
     match err {
         SplitSizeError::InvalidCustomValue => s.err_split_invalid_mb,
         SplitSizeError::OutOfRange => s.err_split_out_of_range,
+        SplitSizeError::TooManyParts => s.err_split_too_many_parts,
     }
 }
 
-fn validate_encrypt_inputs(
+pub fn validate_encrypt_inputs(
     state: &AppState,
     s: &'static Strings,
 ) -> Result<(Option<u64>, Option<u64>), &'static str> {
@@ -47,12 +49,19 @@ fn validate_encrypt_inputs(
     if state.encrypt.password != state.encrypt.confirm_password {
         return Err(s.err_pw_mismatch);
     }
-    if !state.encrypt.save_next_to_source {
+    let resolved_out_dir = if !state.encrypt.save_next_to_source {
         let p = PathBuf::from(state.encrypt.output_dir.trim());
         if !p.is_dir() {
             return Err(s.err_invalid_out_dir);
         }
-    }
+        p
+    } else {
+        state.encrypt.sources[0]
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     let container_size = state
         .encrypt
         .resolve_container_size()
@@ -61,6 +70,25 @@ fn validate_encrypt_inputs(
         .encrypt
         .resolve_split_size()
         .map_err(|e| split_size_error_msg(e, s))?;
+    if let Some(s_bytes) = split_part_size {
+        let min_inner = container_size.or_else(|| {
+            (!state.encrypt.compress
+                && !state.encrypt.preflight_scanning
+                && state.encrypt.preflight_scanned_key.0 == state.encrypt.sources
+                && state.encrypt.preflight_outer.raw_bytes > 0)
+                .then_some(state.encrypt.preflight_outer.raw_bytes)
+        });
+        if let Some(inner_bytes) = min_inner {
+            let disk_bytes = if state.encrypt.reed_solomon {
+                rs_wire_size(inner_bytes)
+            } else {
+                inner_bytes
+            };
+            if disk_bytes.div_ceil(s_bytes) > MAX_SPLIT_PARTS as u64 {
+                return Err(s.err_split_too_many_parts);
+            }
+        }
+    }
     if state.encrypt.enable_hidden {
         if state.encrypt.hidden_sources.is_empty() {
             return Err(s.err_hidden_add_source);
@@ -73,6 +101,34 @@ fn validate_encrypt_inputs(
         }
         if state.encrypt.hidden_password == state.encrypt.password {
             return Err(s.err_hidden_same_pw);
+        }
+        if matches!(
+            check_compartment_sources(&state.encrypt.sources, &state.encrypt.hidden_sources),
+            Err(StorageError::InvalidPath(_))
+        ) {
+            return Err(s.err_compartment_overlap);
+        }
+    }
+    if state.encrypt.secure_wipe {
+        let hidden_slice: &[PathBuf] = if state.encrypt.enable_hidden {
+            &state.encrypt.hidden_sources
+        } else {
+            &[]
+        };
+        let hidden_kf = if state.encrypt.enable_hidden {
+            state.encrypt.hidden_keyfile.as_ref()
+        } else {
+            None
+        };
+        if matches!(
+            check_wipe_targets(
+                state.encrypt.sources.iter().chain(hidden_slice),
+                &resolved_out_dir,
+                state.encrypt.keyfile.iter().chain(hidden_kf),
+            ),
+            Err(StorageError::InvalidPath(_))
+        ) {
+            return Err(s.err_wipe_protected_target);
         }
     }
     Ok((container_size, split_part_size))
@@ -297,6 +353,24 @@ fn render_preflight_card(ui: &mut egui::Ui, state: &AppState, s: &'static String
                     egui::Color32::from_rgb(230, 80, 80),
                     split_size_error_msg(err, s),
                 );
+            }
+            SplitEstimateStatus::TooManyParts {
+                part_bytes,
+                estimated_parts,
+            } => {
+                let warn = match lang {
+                    AppLanguage::Tr => format!(
+                        "{} (~{estimated_parts} parça, {} boyutunda — sınır: {MAX_SPLIT_PARTS})",
+                        s.err_split_too_many_parts,
+                        format_bytes(part_bytes)
+                    ),
+                    AppLanguage::En => format!(
+                        "{} (~{estimated_parts} parts at {} each — max: {MAX_SPLIT_PARTS})",
+                        s.err_split_too_many_parts,
+                        format_bytes(part_bytes)
+                    ),
+                };
+                ui.colored_label(egui::Color32::from_rgb(230, 80, 80), warn);
             }
             SplitEstimateStatus::Parts {
                 part_bytes,

@@ -20,12 +20,12 @@ use crate::atomic::{atomic_write, write_vault};
 use crate::error::StorageError;
 use crate::packager::{
     collect_manifest, normalize_archive_selector, pack_sources_excluding, unpack_vault_stream,
-    unpack_vault_stream_selected, UnpackLimits,
+    unpack_vault_stream_selected, OutputExclusion, UnpackLimits,
 };
 use crate::pipe::bounded_pipe;
 use crate::split::{
-    discover_split_parts, open_vault_reader, vault_display_stem, write_split_vault,
-    write_split_vault_replacing, SplitVolumeReader,
+    discover_split_parts, open_vault_reader, path_conflicts_with_split_set, validate_split_bounds,
+    vault_display_stem, write_split_vault, write_split_vault_replacing, SplitVolumeReader,
 };
 
 #[derive(Clone, Debug)]
@@ -33,6 +33,83 @@ pub struct DecryptSummary {
     pub metadata: VaultMetadata,
     pub files_extracted: u64,
     pub output_path: PathBuf,
+}
+
+/// Reject overlapping outer/decoy and hidden compartment source trees so hidden
+/// files can never leak into the outer vault or conflict during secure wiping.
+pub fn check_compartment_sources(
+    outer: &[PathBuf],
+    hidden: &[PathBuf],
+) -> Result<(), StorageError> {
+    let mut first_io_err: Option<io::Error> = None;
+    let mut outer_canon = Vec::with_capacity(outer.len());
+    for p in outer {
+        match fs::canonicalize(p) {
+            Ok(c) => outer_canon.push(c),
+            Err(e) if first_io_err.is_none() => first_io_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    for source in hidden {
+        match fs::canonicalize(source) {
+            Ok(source) => {
+                if outer_canon
+                    .iter()
+                    .any(|path| path.starts_with(&source) || source.starts_with(path))
+                {
+                    return Err(StorageError::InvalidPath(
+                        "outer and hidden source paths overlap; select separate files or directories"
+                            .into(),
+                    ));
+                }
+            }
+            Err(e) if first_io_err.is_none() => first_io_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_io_err {
+        return Err(StorageError::Io(err));
+    }
+    Ok(())
+}
+
+/// Reject secure-wipe configurations where any source path is an ancestor of (or identical to)
+/// the vault output directory or a required keyfile.
+pub fn check_wipe_targets<'a>(
+    sources: impl Iterator<Item = &'a PathBuf>,
+    output_dir: &Path,
+    keyfiles: impl Iterator<Item = &'a PathBuf>,
+) -> Result<(), StorageError> {
+    let mut first_io_err: Option<io::Error> = None;
+    let mut protected = Vec::new();
+    match fs::canonicalize(output_dir) {
+        Ok(c) => protected.push(c),
+        Err(e) => first_io_err = Some(e),
+    }
+    for keyfile in keyfiles {
+        match fs::canonicalize(keyfile) {
+            Ok(c) => protected.push(c),
+            Err(e) if first_io_err.is_none() => first_io_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    for source in sources {
+        match fs::canonicalize(source) {
+            Ok(source) => {
+                if protected.iter().any(|path| path.starts_with(&source)) {
+                    return Err(StorageError::InvalidPath(
+                        "--wipe would remove the output directory or a required keyfile".into(),
+                    ));
+                }
+            }
+            Err(e) if first_io_err.is_none() => first_io_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_io_err {
+        return Err(StorageError::Io(err));
+    }
+    Ok(())
 }
 
 /// Choose a collision-free output path (`name_1.ext`, `name_2.ext`, ...).
@@ -48,7 +125,7 @@ pub fn unique_path(base: &Path) -> PathBuf {
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
 
-    while candidate.exists() {
+    while fs::symlink_metadata(&candidate).is_ok() {
         candidate = base.with_file_name(format!("{stem}_{idx}{ext}"));
         idx += 1;
     }
@@ -68,46 +145,60 @@ fn random_hex_6() -> String {
 #[allow(clippy::too_many_arguments)]
 fn encrypt_sources_v5_with_sink<F>(
     sources: &[PathBuf],
-    out_vault: &Path,
+    split_part_bytes: Option<u64>,
     password: &[u8],
     opts: &EncryptOptions,
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
-    mut on_skip: impl FnMut(&str) + Send + 'static,
+    on_skip: impl FnMut(&str) + Send + 'static,
     write_sink: F,
 ) -> Result<(EncryptSummary, VaultMetadata), StorageError>
 where
     F: FnOnce(
+        Arc<OutputExclusion>,
         &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
     ) -> Result<(), StorageError>,
 {
+    if let Some(part_size) = split_part_bytes {
+        validate_split_bounds(part_size, opts.container_size_bytes, opts.reed_solomon)?;
+    }
+
     let metadata = collect_manifest(sources, opts.compressed, Some(&cancel))?;
+    if let Some(part_size) = split_part_bytes {
+        if !opts.compressed {
+            let min_inner = metadata
+                .original_size
+                .max(opts.container_size_bytes.unwrap_or(0));
+            validate_split_bounds(part_size, Some(min_inner), opts.reed_solomon)?;
+        }
+    }
+
     let total_expected = metadata.original_size;
-    let (writer, reader) = bounded_pipe(8);
-
-    let sources_owned = sources.to_vec();
-    let compress = opts.compressed;
-    let cancel_pack = Arc::clone(&cancel);
-    let output = opts.stealth.then(|| out_vault.to_path_buf());
-    let packer_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources_excluding(
-            &sources_owned,
-            writer,
-            compress,
-            Some(&cancel_pack),
-            output.as_deref(),
-            |msg| {
-                on_skip(msg);
-            },
-        )
-    });
-
-    let mut reader_opt = Some(reader);
-    let mut packer_opt = Some(packer_handle);
+    let exclusion = Arc::new(OutputExclusion::new());
+    let exclusion_pack = Arc::clone(&exclusion);
+    let mut on_skip_opt = Some(on_skip);
     let mut summary_out: Option<EncryptSummary> = None;
 
     let mut run_enc = |mut vault_writer: &mut dyn Write| -> Result<(), StorageError> {
-        let mut reader = reader_opt.take().expect("reader taken once");
+        let (writer, mut reader) = bounded_pipe(8);
+        let sources_owned = sources.to_vec();
+        let compress = opts.compressed;
+        let cancel_pack = Arc::clone(&cancel);
+        let exclusion_pack = Arc::clone(&exclusion_pack);
+        let mut on_skip = on_skip_opt.take().expect("on_skip taken once");
+        let packer_handle = thread::spawn(move || -> Result<(), StorageError> {
+            pack_sources_excluding(
+                &sources_owned,
+                writer,
+                compress,
+                Some(&cancel_pack),
+                Some(&exclusion_pack),
+                |msg| {
+                    on_skip(msg);
+                },
+            )
+        });
+
         let enc_attempt = encrypt_stream(
             &mut reader,
             &mut vault_writer,
@@ -119,9 +210,7 @@ where
         );
         // Drop reader BEFORE joining so early encryption/cancel errors unblock packer cleanly.
         drop(reader);
-        let pack_attempt = packer_opt
-            .take()
-            .expect("packer taken once")
+        let pack_attempt = packer_handle
             .join()
             .map_err(|_| StorageError::Io(std::io::Error::other("packer thread panicked")))?;
         let summary = enc_attempt?;
@@ -130,15 +219,7 @@ where
         Ok(())
     };
 
-    let enc_res = write_sink(&mut run_enc);
-
-    // Clean up if sink creation failed before invoking `run_enc`.
-    drop(reader_opt.take());
-    if let Some(handle) = packer_opt.take() {
-        let _ = handle.join();
-    }
-
-    enc_res?;
+    write_sink(exclusion, &mut run_enc)?;
     Ok((summary_out.expect("summary set on Ok"), metadata))
 }
 
@@ -155,13 +236,13 @@ pub fn encrypt_sources_v5(
 ) -> Result<(EncryptSummary, VaultMetadata), StorageError> {
     encrypt_sources_v5_with_sink(
         sources,
-        out_vault,
+        None,
         password,
         opts,
         progress,
         cancel,
         on_skip,
-        |run| write_vault(out_vault, opts.stealth, |w| run(w)),
+        |exclusion, run| write_vault(out_vault, opts.stealth, Some(&exclusion), |w| run(w)),
     )
 }
 
@@ -181,15 +262,20 @@ pub fn encrypt_sources_v5_split(
     let mut created_parts = Vec::new();
     let (summary, meta) = encrypt_sources_v5_with_sink(
         sources,
-        out_vault_base,
+        Some(part_size_bytes),
         password,
         opts,
         progress,
         cancel,
         on_skip,
-        |run| {
-            created_parts =
-                write_split_vault(out_vault_base, part_size_bytes, opts.stealth, |w| run(w))?;
+        |exclusion, run| {
+            created_parts = write_split_vault(
+                out_vault_base,
+                part_size_bytes,
+                opts.stealth,
+                Some(exclusion),
+                |w| run(w),
+            )?;
             Ok(())
         },
     )?;
@@ -200,7 +286,7 @@ pub fn encrypt_sources_v5_split(
 fn encrypt_hidden_sources_v5_with_sink<F>(
     decoy_sources: &[PathBuf],
     hidden_sources: &[PathBuf],
-    out_vault: &Path,
+    split_part_bytes: Option<u64>,
     decoy_password: &[u8],
     hidden_password: &[u8],
     opts: &HiddenEncryptOptions,
@@ -211,9 +297,18 @@ fn encrypt_hidden_sources_v5_with_sink<F>(
 ) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError>
 where
     F: FnOnce(
+        Arc<OutputExclusion>,
         &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
     ) -> Result<(), StorageError>,
 {
+    if let Some(part_size) = split_part_bytes {
+        validate_split_bounds(
+            part_size,
+            Some(opts.container_size_bytes),
+            opts.reed_solomon,
+        )?;
+    }
+
     let decoy_meta = collect_manifest(decoy_sources, opts.decoy_compressed, Some(&cancel))?;
     let hidden_meta = collect_manifest(hidden_sources, opts.hidden_compressed, Some(&cancel))?;
     let total_expected = decoy_meta
@@ -221,61 +316,56 @@ where
         .saturating_add(hidden_meta.original_size);
 
     let on_skip = Arc::new(Mutex::new(on_skip));
-    let (decoy_writer, decoy_reader) = bounded_pipe(8);
-    let (hidden_writer, hidden_reader) = bounded_pipe(8);
-
-    let decoy_owned = decoy_sources.to_vec();
-    let decoy_compress = opts.decoy_compressed;
-    let cancel_decoy = Arc::clone(&cancel);
-    let skip_decoy = Arc::clone(&on_skip);
-    let output = opts.stealth.then(|| out_vault.to_path_buf());
-    let decoy_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources_excluding(
-            &decoy_owned,
-            decoy_writer,
-            decoy_compress,
-            Some(&cancel_decoy),
-            output.as_deref(),
-            |msg| {
-                if let Ok(mut cb) = skip_decoy.lock() {
-                    cb(msg);
-                }
-            },
-        )
-    });
-
-    let hidden_owned = hidden_sources.to_vec();
-    let hidden_compress = opts.hidden_compressed;
-    let cancel_hidden = Arc::clone(&cancel);
-    let skip_hidden = Arc::clone(&on_skip);
-    let output = opts.stealth.then(|| out_vault.to_path_buf());
-    let hidden_handle = thread::spawn(move || -> Result<(), StorageError> {
-        pack_sources_excluding(
-            &hidden_owned,
-            hidden_writer,
-            hidden_compress,
-            Some(&cancel_hidden),
-            output.as_deref(),
-            |msg| {
-                if let Ok(mut cb) = skip_hidden.lock() {
-                    cb(msg);
-                }
-            },
-        )
-    });
-
-    let mut decoy_reader_opt = Some(decoy_reader);
-    let mut hidden_reader_opt = Some(hidden_reader);
-    let mut decoy_handle_opt = Some(decoy_handle);
-    let mut hidden_handle_opt = Some(hidden_handle);
+    let exclusion = Arc::new(OutputExclusion::new());
+    let exclusion_for_packers = Arc::clone(&exclusion);
     let mut summary_out: Option<HiddenEncryptSummary> = None;
 
     let decoy_done = Arc::new(AtomicU64::new(0));
     let hidden_done = Arc::new(AtomicU64::new(0));
 
     let mut run_enc = |mut vault_writer: &mut dyn Write| -> Result<(), StorageError> {
-        let mut d_reader = decoy_reader_opt.take().expect("decoy reader taken once");
-        let mut h_reader = hidden_reader_opt.take().expect("hidden reader taken once");
+        let (decoy_writer, mut d_reader) = bounded_pipe(8);
+        let (hidden_writer, mut h_reader) = bounded_pipe(8);
+
+        let decoy_owned = decoy_sources.to_vec();
+        let decoy_compress = opts.decoy_compressed;
+        let cancel_decoy = Arc::clone(&cancel);
+        let skip_decoy = Arc::clone(&on_skip);
+        let exclusion_decoy = Arc::clone(&exclusion_for_packers);
+        let decoy_handle = thread::spawn(move || -> Result<(), StorageError> {
+            pack_sources_excluding(
+                &decoy_owned,
+                decoy_writer,
+                decoy_compress,
+                Some(&cancel_decoy),
+                Some(&exclusion_decoy),
+                |msg| {
+                    if let Ok(mut cb) = skip_decoy.lock() {
+                        cb(msg);
+                    }
+                },
+            )
+        });
+
+        let hidden_owned = hidden_sources.to_vec();
+        let hidden_compress = opts.hidden_compressed;
+        let cancel_hidden = Arc::clone(&cancel);
+        let skip_hidden = Arc::clone(&on_skip);
+        let exclusion_hidden = Arc::clone(&exclusion_for_packers);
+        let hidden_handle = thread::spawn(move || -> Result<(), StorageError> {
+            pack_sources_excluding(
+                &hidden_owned,
+                hidden_writer,
+                hidden_compress,
+                Some(&cancel_hidden),
+                Some(&exclusion_hidden),
+                |msg| {
+                    if let Ok(mut cb) = skip_hidden.lock() {
+                        cb(msg);
+                    }
+                },
+            )
+        });
 
         let d1 = Arc::clone(&decoy_done);
         let h1 = Arc::clone(&hidden_done);
@@ -316,14 +406,10 @@ where
         drop(d_reader);
         drop(h_reader);
 
-        let decoy_pack = decoy_handle_opt
-            .take()
-            .expect("decoy packer taken once")
+        let decoy_pack = decoy_handle
             .join()
             .map_err(|_| StorageError::Io(std::io::Error::other("decoy packer panicked")))?;
-        let hidden_pack = hidden_handle_opt
-            .take()
-            .expect("hidden packer taken once")
+        let hidden_pack = hidden_handle
             .join()
             .map_err(|_| StorageError::Io(std::io::Error::other("hidden packer panicked")))?;
 
@@ -334,18 +420,7 @@ where
         Ok(())
     };
 
-    let enc_res = write_sink(&mut run_enc);
-
-    drop(decoy_reader_opt.take());
-    drop(hidden_reader_opt.take());
-    if let Some(h) = decoy_handle_opt.take() {
-        let _ = h.join();
-    }
-    if let Some(h) = hidden_handle_opt.take() {
-        let _ = h.join();
-    }
-
-    enc_res?;
+    write_sink(exclusion, &mut run_enc)?;
     Ok((
         summary_out.expect("summary set on Ok"),
         decoy_meta,
@@ -370,14 +445,14 @@ pub fn encrypt_hidden_sources_v5(
     encrypt_hidden_sources_v5_with_sink(
         decoy_sources,
         hidden_sources,
-        out_vault,
+        None,
         decoy_password,
         hidden_password,
         opts,
         progress,
         cancel,
         on_skip,
-        |run| write_vault(out_vault, opts.stealth, |w| run(w)),
+        |exclusion, run| write_vault(out_vault, opts.stealth, Some(&exclusion), |w| run(w)),
     )
 }
 
@@ -407,16 +482,21 @@ pub fn encrypt_hidden_sources_v5_split(
     let (summary, decoy_meta, hidden_meta) = encrypt_hidden_sources_v5_with_sink(
         decoy_sources,
         hidden_sources,
-        out_vault_base,
+        Some(part_size_bytes),
         decoy_password,
         hidden_password,
         opts,
         progress,
         cancel,
         on_skip,
-        |run| {
-            created_parts =
-                write_split_vault(out_vault_base, part_size_bytes, opts.stealth, |w| run(w))?;
+        |exclusion, run| {
+            created_parts = write_split_vault(
+                out_vault_base,
+                part_size_bytes,
+                opts.stealth,
+                Some(exclusion),
+                |w| run(w),
+            )?;
             Ok(())
         },
     )?;
@@ -643,6 +723,12 @@ pub fn rekey_vault_v5(
     new_kdf: Option<KdfParams>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), StorageError> {
+    if !vault_path.is_file() {
+        return Err(StorageError::InvalidPath(format!(
+            "vault file not found: {}",
+            vault_path.display()
+        )));
+    }
     let rekey_opts = RekeyOptions {
         old_password,
         new_password,
@@ -651,16 +737,27 @@ pub fn rekey_vault_v5(
         new_kdf,
     };
     if let Some(set) = discover_split_parts(vault_path)? {
-        let old_parts = set.part_paths();
-        let part_size = set.part_size_hint();
-        let base = set.base.clone();
-        write_split_vault_replacing(&base, &old_parts, part_size, false, |out_writer| {
-            let mut src_reader = SplitVolumeReader::new(set.clone());
+        if set.part_count() > 1 {
+            let old_parts = set.part_paths();
+            let part_size = set.part_size_hint();
+            let base = set.base.clone();
+            write_split_vault_replacing(&base, &old_parts, part_size, false, None, |out_writer| {
+                let mut src_reader = SplitVolumeReader::new(set.clone());
+                rekey_stream(&mut src_reader, out_writer, &rekey_opts, cancel)?;
+                drop(src_reader); // Crucial on Windows before promoting over existing part files.
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        // Single-part `.vault.001` has no established split boundary; rewrite in place
+        // atomically so a larger KDF header never splits it into a spurious `.002`.
+        let single_part = set.first_part().to_path_buf();
+        return atomic_write(&single_part, |out_writer| {
+            let mut src_reader = BufReader::with_capacity(256 * 1024, File::open(&single_part)?);
             rekey_stream(&mut src_reader, out_writer, &rekey_opts, cancel)?;
-            drop(src_reader); // Crucial on Windows before promoting over existing part files.
+            drop(src_reader);
             Ok(())
-        })?;
-        return Ok(());
+        });
     }
     atomic_write(vault_path, |out_writer| {
         let mut src_reader = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
@@ -677,10 +774,47 @@ pub fn repair_vault_v5(
     output_path: Option<&Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<rpm_core::RepairReport, StorageError> {
-    let mut report = None;
+    if !vault_path.is_file() {
+        return Err(StorageError::InvalidPath(format!(
+            "vault file not found: {}",
+            vault_path.display()
+        )));
+    }
     if let Some(out) = output_path {
+        if out.is_dir() {
+            return Err(StorageError::InvalidPath(format!(
+                "repair output path is a directory: {}",
+                out.display()
+            )));
+        }
+    }
+
+    let split_set = discover_split_parts(vault_path)?;
+    let mut report = None;
+
+    if let Some(out) = output_path {
+        if let Some(set) = split_set {
+            if path_conflicts_with_split_set(out, &set) {
+                return Err(StorageError::InvalidPath(
+                    "repair output path cannot overwrite or extend the input split volume set"
+                        .into(),
+                ));
+            }
+            atomic_write(out, |writer| {
+                let mut input = SplitVolumeReader::new(set.clone());
+                report = Some(rpm_core::repair_vault_stream(
+                    &mut input,
+                    writer,
+                    Some(&cancel),
+                )?);
+                drop(input);
+                Ok(())
+            })?;
+            return Ok(report.expect("atomic write completed"));
+        }
+
         atomic_write(out, |writer| {
-            let mut input = open_vault_reader(vault_path)?;
+            let mut input = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
             report = Some(rpm_core::repair_vault_stream(
                 &mut input,
                 writer,
@@ -692,12 +826,26 @@ pub fn repair_vault_v5(
         return Ok(report.expect("atomic write completed"));
     }
 
-    if let Some(set) = discover_split_parts(vault_path)? {
-        let old_parts = set.part_paths();
-        let part_size = set.part_size_hint();
-        let base = set.base.clone();
-        write_split_vault_replacing(&base, &old_parts, part_size, false, |writer| {
-            let mut input = SplitVolumeReader::new(set.clone());
+    if let Some(set) = split_set {
+        if set.part_count() > 1 {
+            let old_parts = set.part_paths();
+            let part_size = set.part_size_hint();
+            let base = set.base.clone();
+            write_split_vault_replacing(&base, &old_parts, part_size, false, None, |writer| {
+                let mut input = SplitVolumeReader::new(set.clone());
+                report = Some(rpm_core::repair_vault_stream(
+                    &mut input,
+                    writer,
+                    Some(&cancel),
+                )?);
+                drop(input);
+                Ok(())
+            })?;
+            return Ok(report.expect("split write completed"));
+        }
+        let single_part = set.first_part().to_path_buf();
+        atomic_write(&single_part, |writer| {
+            let mut input = BufReader::with_capacity(256 * 1024, File::open(&single_part)?);
             report = Some(rpm_core::repair_vault_stream(
                 &mut input,
                 writer,
@@ -706,7 +854,7 @@ pub fn repair_vault_v5(
             drop(input);
             Ok(())
         })?;
-        return Ok(report.expect("split write completed"));
+        return Ok(report.expect("atomic write completed"));
     }
 
     atomic_write(vault_path, |writer| {

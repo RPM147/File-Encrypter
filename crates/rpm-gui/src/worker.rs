@@ -15,10 +15,11 @@ use rpm_core::{
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
-    check_vault_integrity, decrypt_vault_selected_v5, decrypt_vault_v5, discover_split_parts,
-    encrypt_hidden_sources_v5, encrypt_hidden_sources_v5_split, encrypt_sources_v5,
-    encrypt_sources_v5_split, join_vault_parts, open_vault_reader, rekey_vault_v5,
-    split_vault_file, unique_path, unique_split_base, SecureWiper, StorageError,
+    check_compartment_sources, check_vault_integrity_with_parts, check_wipe_targets,
+    decrypt_vault_selected_v5, decrypt_vault_v5, discover_split_parts, encrypt_hidden_sources_v5,
+    encrypt_hidden_sources_v5_split, encrypt_sources_v5, encrypt_sources_v5_split,
+    join_vault_parts, open_vault_reader, rekey_vault_v5, split_vault_file, unique_path,
+    unique_split_base, SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -105,13 +106,28 @@ fn yes_no(flag: bool, lang: AppLanguage) -> &'static str {
 
 /// Format a passwordless structural integrity report for localized GUI display.
 pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> String {
+    format_integrity_report_with_split(rep, None, lang)
+}
+
+/// Format a passwordless structural integrity report with optional split volume part count
+/// aligned inside the header summary block.
+pub fn format_integrity_report_with_split(
+    rep: &IntegrityReport,
+    split_parts: Option<usize>,
+    lang: AppLanguage,
+) -> String {
     if rep.sha256_only {
         let size_label = match lang {
             AppLanguage::Tr => "Dosya boyutu",
             AppLanguage::En => "File size",
         };
+        let split_line = match (split_parts, lang) {
+            (Some(parts), AppLanguage::Tr) => format!("\nBölünmüş parça: {parts}"),
+            (Some(parts), AppLanguage::En) => format!("\nSplit Parts: {parts}"),
+            (None, _) => String::new(),
+        };
         return format!(
-            "{size_label}: {} B\nSHA-256: {}\n{}",
+            "{size_label}: {} B{split_line}\nSHA-256: {}\n{}",
             rep.file_size,
             rep.sha256_hex,
             crate::i18n::strings(lang).digest_computed
@@ -123,22 +139,28 @@ pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> Stri
     let rec = yes_no(rep.has_recovery, lang);
     match lang {
         AppLanguage::Tr => {
-            let extra = if rep.has_reed_solomon {
+            let mut extra = if rep.has_reed_solomon {
                 format!("\n{:<17} : {}", s.rs_bytes, rep.rs_repaired_bytes)
             } else {
                 String::new()
             };
+            if let Some(parts) = split_parts {
+                extra.push_str(&format!("\nBölünmüş Parça    : {parts}"));
+            }
             format!(
-                "BÜTÜNLÜK KONTROLÜ\nDosya Boyutu      : {} bayt\nSürüm             : v{}\nParça Sayısı      : {}\nAnahtar Dosyası   : {kf}\nKurtarma Slotu    : {rec}\nReed-Solomon      : {rs}{extra}\n\n{}",
+                "BÜTÜNLÜK KONTROLÜ\nDosya Boyutu      : {} bayt\nSürüm             : v{}\nAEAD Blok Sayısı  : {}\nAnahtar Dosyası   : {kf}\nKurtarma Slotu    : {rec}\nReed-Solomon      : {rs}{extra}\n\n{}",
                 rep.file_size, rep.version, rep.chunk_count, rep.message
             )
         }
         AppLanguage::En => {
-            let extra = if rep.has_reed_solomon {
+            let mut extra = if rep.has_reed_solomon {
                 format!("\n{:<16} : {}", s.rs_bytes, rep.rs_repaired_bytes)
             } else {
                 String::new()
             };
+            if let Some(parts) = split_parts {
+                extra.push_str(&format!("\nSplit Parts      : {parts}"));
+            }
             format!(
                 "INTEGRITY CHECK\nFile Size        : {} bytes\nVersion          : v{}\nChunks           : {}\nKeyfile Slot     : {kf}\nRecovery Slot    : {rec}\nReed-Solomon     : {rs}{extra}\n\n{}",
                 rep.file_size, rep.version, rep.chunk_count, rep.message
@@ -149,6 +171,16 @@ pub fn format_integrity_report(rep: &IntegrityReport, lang: AppLanguage) -> Stri
 
 /// Format unlocked Vault v5 metadata & file manifest summary for localized GUI display.
 pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
+    format_inspect_report_with_split(info, None, lang)
+}
+
+/// Format unlocked Vault v5 metadata & file manifest summary with optional split part count
+/// aligned inside the header block (before the file manifest listing).
+pub fn format_inspect_report_with_split(
+    info: &VaultInfo,
+    split_parts: Option<usize>,
+    lang: AppLanguage,
+) -> String {
     let m = &info.metadata;
     let mib = (m.original_size as f64) / (1024.0 * 1024.0);
     let kf = yes_no(info.has_keyfile, lang);
@@ -253,6 +285,12 @@ pub fn format_inspect_report(info: &VaultInfo, lang: AppLanguage) -> String {
                 "Bölme           : Gizli Kasa (Makul İnkâr Edilebilirlik)".to_string()
             }
             AppLanguage::En => "Compartment    : Hidden Vault (Plausible Deniability)".to_string(),
+        });
+    }
+    if let Some(parts) = split_parts {
+        lines.push(match lang {
+            AppLanguage::Tr => format!("Bölünmüş Parça  : {parts}"),
+            AppLanguage::En => format!("Split Parts    : {parts}"),
         });
     }
 
@@ -432,19 +470,23 @@ pub fn format_diff_report(diff: &VaultDiff, lang: AppLanguage) -> String {
     lines.join("\n")
 }
 
-fn resolve_output_vault_path(
-    sources: &[PathBuf],
-    output_dir: Option<PathBuf>,
-    split_mode: bool,
-) -> PathBuf {
-    let base_dir = output_dir.unwrap_or_else(|| {
+fn resolve_output_dir(sources: &[PathBuf], output_dir: Option<PathBuf>) -> PathBuf {
+    output_dir.unwrap_or_else(|| {
         sources
             .first()
             .and_then(|s| s.parent())
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
-    });
+    })
+}
+
+fn resolve_output_vault_path(
+    sources: &[PathBuf],
+    output_dir: Option<PathBuf>,
+    split_mode: bool,
+) -> PathBuf {
+    let base_dir = resolve_output_dir(sources, output_dir);
     let base_name = if sources.len() == 1 {
         sources[0]
             .file_name()
@@ -459,6 +501,18 @@ fn resolve_output_vault_path(
     } else {
         unique_path(&candidate)
     }
+}
+
+fn format_safety_error(err: StorageError, overlap: bool, lang: AppLanguage) -> String {
+    if matches!(err, StorageError::InvalidPath(_)) {
+        let s = crate::i18n::strings(lang);
+        return if overlap {
+            s.err_compartment_overlap.to_string()
+        } else {
+            s.err_wipe_protected_target.to_string()
+        };
+    }
+    err.to_string()
 }
 
 fn wipe_sources(
@@ -546,6 +600,18 @@ pub fn spawn_encrypt_with_split(
     lang: AppLanguage,
 ) {
     thread::spawn(move || {
+        let base_dir = resolve_output_dir(&sources, output_dir.clone());
+        if secure_wipe {
+            if let Err(e) = check_wipe_targets(sources.iter(), &base_dir, keyfile.iter()) {
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::Error(format_safety_error(e, false, lang)),
+                );
+                return;
+            }
+        }
+
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
@@ -739,6 +805,30 @@ pub fn spawn_encrypt_hidden_with_split(
     lang: AppLanguage,
 ) {
     thread::spawn(move || {
+        if let Err(e) = check_compartment_sources(&decoy_sources, &hidden_sources) {
+            send(
+                &tx,
+                &ctx,
+                WorkerUpdate::Error(format_safety_error(e, true, lang)),
+            );
+            return;
+        }
+        let base_dir = resolve_output_dir(&decoy_sources, output_dir.clone());
+        if secure_wipe {
+            if let Err(e) = check_wipe_targets(
+                decoy_sources.iter().chain(&hidden_sources),
+                &base_dir,
+                decoy_keyfile.iter().chain(&hidden_keyfile),
+            ) {
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::Error(format_safety_error(e, false, lang)),
+                );
+                return;
+            }
+        }
+
         let decoy_keyfile_hash = match load_optional_keyfile(decoy_keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
@@ -1007,37 +1097,20 @@ pub fn spawn_integrity_check(
     vault: PathBuf,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
-        let split_parts = match discover_split_parts(&vault) {
-            Ok(Some(set)) => Some(set.part_count()),
-            Ok(None) => None,
-            Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
-                return;
-            }
-        };
-        match check_vault_integrity(&vault) {
-            Ok(rep) => {
-                let mut text = format_integrity_report(&rep, lang);
-                if let Some(parts) = split_parts {
-                    let line = match lang {
-                        AppLanguage::Tr => format!("\nBölünmüş Parçalar : {parts}"),
-                        AppLanguage::En => format!("\nSplit Parts      : {parts}"),
-                    };
-                    text.push_str(&line);
-                }
-                send(
-                    &tx,
-                    &ctx,
-                    WorkerUpdate::IntegrityDone {
-                        text,
-                        ok: rep.ok,
-                        sha256_only: rep.sha256_only,
-                    },
-                );
-            }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+    thread::spawn(move || match check_vault_integrity_with_parts(&vault) {
+        Ok((rep, split_parts)) => {
+            let text = format_integrity_report_with_split(&rep, split_parts, lang);
+            send(
+                &tx,
+                &ctx,
+                WorkerUpdate::IntegrityDone {
+                    text,
+                    ok: rep.ok,
+                    sha256_only: rep.sha256_only,
+                },
+            );
         }
+        Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
     });
 }
 
@@ -1089,14 +1162,7 @@ pub fn spawn_inspect(
 
         match inspect_header_seekable(&mut reader, auth) {
             Ok(info) => {
-                let mut text = format_inspect_report(&info, lang);
-                if let Some(parts) = split_parts {
-                    let line = match lang {
-                        AppLanguage::Tr => format!("\nBölünmüş Parçalar: {parts}"),
-                        AppLanguage::En => format!("\nSplit Parts    : {parts}"),
-                    };
-                    text.push_str(&line);
-                }
+                let text = format_inspect_report_with_split(&info, split_parts, lang);
                 let status = match (lang, info.is_hidden_compartment) {
                     (AppLanguage::Tr, true) => "Gizli kasa meta verisi açıldı",
                     (AppLanguage::Tr, false) => "Kasa meta verisi açıldı",
@@ -1336,8 +1402,17 @@ pub fn spawn_rekey(
             }
         };
 
+        let primary_vault = match discover_split_parts(&vault) {
+            Ok(Some(set)) => set.first_part().to_path_buf(),
+            Ok(None) => vault,
+            Err(e) => {
+                send(&tx, &ctx, WorkerUpdate::Error(format_rekey_error(&e, lang)));
+                return;
+            }
+        };
+
         match rekey_vault_v5(
-            &vault,
+            &primary_vault,
             old_password.as_bytes(),
             new_password.as_bytes(),
             old_kf.as_ref(),
@@ -1348,16 +1423,16 @@ pub fn spawn_rekey(
             Ok(()) => {
                 let status = match lang {
                     AppLanguage::Tr => {
-                        format!("Anahtar güncelleme tamamlandı: {}", vault.display())
+                        format!("Anahtar güncelleme tamamlandı: {}", primary_vault.display())
                     }
-                    AppLanguage::En => format!("Re-key complete: {}", vault.display()),
+                    AppLanguage::En => format!("Re-key complete: {}", primary_vault.display()),
                 };
                 send(
                     &tx,
                     &ctx,
                     WorkerUpdate::RekeyDone {
                         status,
-                        vault_path: vault,
+                        vault_path: primary_vault,
                     },
                 );
             }
@@ -1443,7 +1518,23 @@ pub fn spawn_repair(
 ) {
     thread::spawn(move || {
         let s = crate::i18n::strings(lang);
-        let msg = match rpm_storage::repair_vault_v5(&path, None, cancel) {
+        let primary_path = if path.is_file() {
+            match discover_split_parts(&path) {
+                Ok(Some(set)) => set.first_part().to_path_buf(),
+                Ok(None) => path,
+                Err(e) => {
+                    send(
+                        &tx,
+                        &ctx,
+                        WorkerUpdate::Error(format!("{}: {e}", s.repair_error)),
+                    );
+                    return;
+                }
+            }
+        } else {
+            path
+        };
+        let msg = match rpm_storage::repair_vault_v5(&primary_path, None, cancel) {
             Ok(r) => WorkerUpdate::RepairDone {
                 text: match lang {
                     AppLanguage::Tr => format!(
@@ -1455,7 +1546,7 @@ pub fn spawn_repair(
                         s.repair_done, r.repaired_bytes, r.blocks_checked
                     ),
                 },
-                vault_path: path,
+                vault_path: primary_path,
             },
             Err(StorageError::Crypto(CryptoError::UnsupportedOperation(_))) => {
                 WorkerUpdate::Error(s.repair_requires_rs.into())

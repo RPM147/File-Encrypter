@@ -305,3 +305,150 @@ fn cli_reed_solomon_split_damage_and_in_place_repair() {
     assert_eq!(code, 0, "RS split decrypt failed: {stderr}");
     assert_eq!(fs::read(dec_out.join("data.bin")).unwrap(), payload);
 }
+
+#[test]
+fn cli_split_guards_pre_password_fail_fast_repair_checks_and_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload_path = dir.path().join("guard.bin");
+    let payload = pseudo_random_bytes(1_200_000, 29);
+    fs::write(&payload_path, &payload).unwrap();
+
+    // 1) Upfront MAX_SPLIT_PARTS rejection BEFORE prompting password (empty stdin!).
+    let (code, _stdout, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "encrypt",
+            payload_path.to_str().unwrap(),
+            "--container-mb",
+            "20000",
+            "--split-mb",
+            "1",
+            "--password-stdin",
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("9999"), "stderr: {stderr}");
+
+    // 2) Create a 2-part RS split vault
+    let out_dir = dir.path().join("rs_guards");
+    fs::create_dir(&out_dir).unwrap();
+    let (code, _stdout, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "encrypt",
+            payload_path.to_str().unwrap(),
+            "--reed-solomon",
+            "--no-compress",
+            "--split-mb",
+            "1",
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        "CliGuard!1\n",
+    );
+    assert_eq!(code, 0, "encrypt failed: {stderr}");
+    let part1 = out_dir.join("guard.bin.vault.001");
+    let part2 = out_dir.join("guard.bin.vault.002");
+    assert!(part1.is_file() && part2.is_file());
+
+    // 3) CLI `repair` rejects missing vault, directory as vault, `-o <existing_dir>`, and `-o <own_part>`
+    let (code, _, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "repair",
+            dir.path().join("missing.vault").to_str().unwrap(),
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
+
+    let (code, _, _) = run(
+        &["rpm-encrypter-cli", "repair", out_dir.to_str().unwrap()],
+        "",
+    );
+    assert_eq!(code, 1);
+
+    let (code, _, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "repair",
+            part1.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("directory"), "stderr: {stderr}");
+
+    let (code, _, _) = run(
+        &[
+            "rpm-encrypter-cli",
+            "repair",
+            part1.to_str().unwrap(),
+            "-o",
+            part2.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+
+    // 4) Windows case-variant split part dedup in `decrypt --only`
+    #[cfg(windows)]
+    {
+        let upper_p2 = out_dir.join("GUARD.BIN.VAULT.002");
+        let dec_case = dir.path().join("dec_case");
+        fs::create_dir(&dec_case).unwrap();
+        let (code, _stdout, stderr) = run(
+            &[
+                "rpm-encrypter-cli",
+                "decrypt",
+                part1.to_str().unwrap(),
+                upper_p2.to_str().unwrap(),
+                "--only",
+                "guard.bin",
+                "-o",
+                dec_case.to_str().unwrap(),
+                "--password-stdin",
+            ],
+            "CliGuard!1\n",
+        );
+        assert_eq!(code, 0, "case-variant split dedup failed: {stderr}");
+        assert_eq!(fs::read(dec_case.join("guard.bin")).unwrap(), payload);
+    }
+
+    // 5) Missing `.001` causes `inspect` and `rekey` to fail BEFORE reading password from stdin
+    fs::remove_file(&part1).unwrap();
+    let (code, _, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "inspect",
+            part2.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("missing split volume part"),
+        "inspect must fail on missing part before reading stdin; got: {stderr}"
+    );
+
+    let (code, _, stderr) = run(
+        &[
+            "rpm-encrypter-cli",
+            "rekey",
+            part2.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("missing split volume part"),
+        "rekey must fail on missing part before reading stdin; got: {stderr}"
+    );
+}

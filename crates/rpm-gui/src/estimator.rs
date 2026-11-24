@@ -146,6 +146,10 @@ pub enum ContainerFitStatus {
 pub enum SplitEstimateStatus {
     Off,
     Invalid(SplitSizeError),
+    TooManyParts {
+        part_bytes: u64,
+        estimated_parts: u64,
+    },
     Parts {
         part_bytes: u64,
         estimated_parts: u64,
@@ -282,10 +286,20 @@ pub fn estimate_encrypt_preflight_with_split(
 
     let split = match split_preset.resolve_bytes(split_custom_mb) {
         Ok(None) => SplitEstimateStatus::Off,
-        Ok(Some(part_bytes)) => SplitEstimateStatus::Parts {
-            part_bytes,
-            estimated_parts: estimated_disk_bytes.max(1).div_ceil(part_bytes),
-        },
+        Ok(Some(part_bytes)) => {
+            let estimated_parts = estimated_disk_bytes.max(1).div_ceil(part_bytes);
+            if estimated_parts > rpm_storage::MAX_SPLIT_PARTS as u64 {
+                SplitEstimateStatus::TooManyParts {
+                    part_bytes,
+                    estimated_parts,
+                }
+            } else {
+                SplitEstimateStatus::Parts {
+                    part_bytes,
+                    estimated_parts,
+                }
+            }
+        }
         Err(err) => SplitEstimateStatus::Invalid(err),
     };
 

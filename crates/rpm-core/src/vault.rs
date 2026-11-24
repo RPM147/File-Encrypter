@@ -1001,16 +1001,85 @@ pub fn rekey_stream(
     validate_header(&header)?;
     write_header_and_meta(writer, &header, &enc_meta)?;
 
-    let mut buf = [0u8; 256 * 1024];
+    // Validate every 5-byte chunk frame, final_flag == 1, and exact EOF while streaming
+    // ciphertext untouched so truncated split volumes (e.g. missing tail `.00N` part) or
+    // trailing unauthenticated bytes are rejected before committing.
+    let max_chunk_size = header.chunk_size;
+    let mut chunk_idx: u32 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         if is_cancelled(cancel) {
             return Err(CryptoError::Cancelled);
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
+        let mut frame = [0u8; 5];
+        reader.read_exact(&mut frame).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                CryptoError::InvalidFormat("truncated chunk payload (missing final chunk)".into())
+            } else {
+                CryptoError::Io(e)
+            }
+        })?;
+        let plain_len = u32::from_be_bytes(frame[..4].try_into().unwrap());
+        if plain_len > max_chunk_size {
+            return Err(CryptoError::InvalidFormat(format!(
+                "chunk length {plain_len} exceeds header chunk_size {max_chunk_size}"
+            )));
+        }
+        let final_flag = frame[4];
+        if final_flag > 1 {
+            return Err(CryptoError::InvalidFormat(format!(
+                "invalid chunk final flag {final_flag}"
+            )));
+        }
+        if plain_len == 0 && final_flag == 0 {
+            return Err(CryptoError::InvalidFormat(
+                "empty non-final chunk frame".into(),
+            ));
+        }
+        writer.write_all(&frame)?;
+
+        let mut remaining = (plain_len as u64) + (AES_TAG_SIZE as u64);
+        while remaining > 0 {
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
+            let want = (buf.len() as u64).min(remaining) as usize;
+            let n = loop {
+                match reader.read(&mut buf[..want]) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(CryptoError::Io(e)),
+                }
+            };
+            if n == 0 {
+                return Err(CryptoError::InvalidFormat(
+                    "truncated chunk ciphertext/tag bytes".into(),
+                ));
+            }
+            writer.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+
+        if final_flag == 1 {
+            let mut trailing = [0u8; 1];
+            let extra = loop {
+                match reader.read(&mut trailing) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(CryptoError::Io(e)),
+                }
+            };
+            if extra != 0 {
+                return Err(CryptoError::InvalidFormat(
+                    "trailing unauthenticated bytes after final chunk".into(),
+                ));
+            }
             break;
         }
-        writer.write_all(&buf[..n])?;
+
+        chunk_idx = chunk_idx
+            .checked_add(1)
+            .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
     }
     writer.flush()?;
     Ok(())

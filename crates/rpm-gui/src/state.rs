@@ -17,11 +17,15 @@ use rpm_storage::config::{
     ThemeMode, MAX_ENCRYPT_PROFILES, MAX_IDLE_CLEAR_MINUTES,
 };
 use rpm_storage::shell_integration::{self, ShellIntegrationStatus};
-use rpm_storage::{discover_split_parts, is_vault_or_split_filename, GuiLaunchIntent, LaunchTab};
+use rpm_storage::{
+    is_vault_or_split_filename, path_dedup_key, GuiLaunchIntent, LaunchTab, PathDedupKey,
+    SplitDiscoveryCache, MAX_SPLIT_PARTS,
+};
 use zeroize::Zeroize;
 
 use crate::estimator::{
-    estimate_encrypt_preflight_with_split, EncryptPreflightEstimate, SourceSizeSummary,
+    estimate_encrypt_preflight_with_split, rs_wire_size, EncryptPreflightEstimate,
+    SourceSizeSummary,
 };
 use crate::explorer::{matches_filters, FileCategoryFilter, ManifestViewMode, SizeFilter};
 use crate::i18n::{self, Strings};
@@ -111,6 +115,7 @@ pub enum SplitSizePreset {
 pub enum SplitSizeError {
     InvalidCustomValue,
     OutOfRange,
+    TooManyParts,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -473,9 +478,14 @@ impl EncryptFields {
     }
 
     pub fn add_hidden_sources(&mut self, paths: Vec<PathBuf>) -> usize {
+        let mut seen: HashSet<PathDedupKey> = self
+            .hidden_sources
+            .iter()
+            .map(|p| path_dedup_key(p))
+            .collect();
         let mut added = 0usize;
         for p in paths {
-            if !self.hidden_sources.contains(&p) {
+            if seen.insert(path_dedup_key(&p)) {
                 self.hidden_sources.push(p);
                 added += 1;
             }
@@ -487,16 +497,26 @@ impl EncryptFields {
         &self,
         name: String,
     ) -> Result<EncryptProfile, ProfileSnapshotError> {
-        let container_size_mib = self
+        let container_bytes = self
             .container_preset
             .resolve_bytes(&self.container_custom_mb)
-            .map_err(ProfileSnapshotError::Container)?
-            .map(|bytes| bytes / CONTAINER_MIB);
-        let split_part_mib = self
+            .map_err(ProfileSnapshotError::Container)?;
+        let split_bytes = self
             .split_preset
             .resolve_bytes(&self.split_custom_mb)
-            .map_err(ProfileSnapshotError::Split)?
-            .map(|bytes| bytes / CONTAINER_MIB);
+            .map_err(ProfileSnapshotError::Split)?;
+        if let (Some(c_bytes), Some(s_bytes)) = (container_bytes, split_bytes) {
+            let disk_bytes = if self.reed_solomon {
+                rs_wire_size(c_bytes)
+            } else {
+                c_bytes
+            };
+            if disk_bytes.div_ceil(s_bytes) > MAX_SPLIT_PARTS as u64 {
+                return Err(ProfileSnapshotError::Split(SplitSizeError::TooManyParts));
+            }
+        }
+        let container_size_mib = container_bytes.map(|bytes| bytes / CONTAINER_MIB);
+        let split_part_mib = split_bytes.map(|bytes| bytes / CONTAINER_MIB);
         Ok(EncryptProfile {
             name,
             compress: self.compress,
@@ -1287,6 +1307,9 @@ impl AppState {
                     ProfileSnapshotError::Split(SplitSizeError::OutOfRange) => {
                         s.err_split_out_of_range
                     }
+                    ProfileSnapshotError::Split(SplitSizeError::TooManyParts) => {
+                        s.err_split_too_many_parts
+                    }
                 };
                 self.set_status(msg, true);
                 msg
@@ -1484,8 +1507,13 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
+        let mut split_cache = SplitDiscoveryCache::default();
         let all_vaults = paths.iter().all(|p| {
-            is_vault_or_split_filename(p) || discover_split_parts(p).ok().flatten().is_some()
+            if p.is_dir() {
+                return false;
+            }
+            is_vault_or_split_filename(p)
+                || (p.is_file() && matches!(split_cache.discover(p), Ok(Some(_)) | Err(_)))
         });
 
         let target = forced_tab.unwrap_or(if all_vaults {
@@ -1498,20 +1526,43 @@ impl AppState {
         match target {
             Tab::Decrypt => {
                 self.select_tab(Tab::Decrypt);
+                let mut seen: HashSet<PathDedupKey> = self
+                    .decrypt
+                    .vaults
+                    .iter()
+                    .map(|v| path_dedup_key(v))
+                    .collect();
                 let mut added = 0usize;
                 let mut skipped = 0usize;
+                let mut first_split_err: Option<String> = None;
                 for p in paths {
+                    if p.is_dir() {
+                        skipped += 1;
+                        continue;
+                    }
                     let is_vault = is_vault_or_split_filename(&p);
                     if !is_vault && !p.is_file() {
                         skipped += 1;
                         continue;
                     }
-                    // Deduplicate multiple dropped parts of the same split volume to its `.001` part.
-                    let canonical = match discover_split_parts(&p) {
-                        Ok(Some(set)) => set.first_part().to_path_buf(),
-                        _ => p,
+                    // Deduplicate multiple dropped parts of the same split volume to its `.001` part
+                    // in O(D + N) without swallowing incomplete split volume errors.
+                    let canonical = if p.is_file() {
+                        match split_cache.discover(&p) {
+                            Ok(Some(set)) => set.first_part().to_path_buf(),
+                            Ok(None) => p,
+                            Err(err) => {
+                                if first_split_err.is_none() {
+                                    first_split_err = Some(err.to_string());
+                                }
+                                skipped += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        p
                     };
-                    if !self.decrypt.vaults.contains(&canonical) {
+                    if seen.insert(path_dedup_key(&canonical)) {
                         self.decrypt.vaults.push(canonical);
                         added += 1;
                     }
@@ -1521,7 +1572,21 @@ impl AppState {
                         self.decrypt.output_dir = parent.display().to_string();
                     }
                 }
-                if added > 0 {
+                if let Some(err_msg) = first_split_err {
+                    let msg = if added > 0 {
+                        match lang {
+                            AppLanguage::Tr => {
+                                format!("Çözme için {added} dosya eklendi; hata: {err_msg}")
+                            }
+                            AppLanguage::En => {
+                                format!("Loaded {added} vault(s); error: {err_msg}")
+                            }
+                        }
+                    } else {
+                        err_msg
+                    };
+                    self.set_status(msg, true);
+                } else if added > 0 {
                     let msg = match lang {
                         AppLanguage::Tr => format!("Çözme için {added} dosya eklendi"),
                         AppLanguage::En => format!("Loaded {added} vault(s) for decryption"),
@@ -1551,9 +1616,15 @@ impl AppState {
             }
             _ => {
                 self.select_tab(Tab::Encrypt);
+                let mut seen: HashSet<PathDedupKey> = self
+                    .encrypt
+                    .sources
+                    .iter()
+                    .map(|v| path_dedup_key(v))
+                    .collect();
                 let mut added = 0usize;
                 for p in paths {
-                    if !self.encrypt.sources.contains(&p) {
+                    if seen.insert(path_dedup_key(&p)) {
                         self.encrypt.sources.push(p);
                         added += 1;
                     }

@@ -915,6 +915,9 @@ pub fn ui(
                                 (Err(SplitSizeError::OutOfRange), _) => {
                                     state.set_status(s.err_split_out_of_range, true);
                                 }
+                                (Err(SplitSizeError::TooManyParts), _) => {
+                                    state.set_status(s.err_split_too_many_parts, true);
+                                }
                                 (_, Err(msg)) => {
                                     state.set_status(msg, true);
                                 }
@@ -946,6 +949,7 @@ pub fn ui(
                     if ui.button(s.btn_browse).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("RPM Vault", &["vault"])
+                            .add_filter("All Files", &["*"])
                             .save_file()
                         {
                             state.split_join.join_output_path = p.display().to_string();

@@ -896,3 +896,85 @@ fn encrypt_and_decrypt_cancel_mid_stream() {
     );
     assert!(matches!(res_dec, Err(CryptoError::Cancelled)));
 }
+
+#[test]
+fn rekey_stream_validates_chunk_frames_final_flag_and_exact_eof() {
+    let data = vec![0x3Eu8; 16 * 1024 * 2 + 123]; // 3 chunks
+    let mut vault = Vec::new();
+    encrypt_stream(
+        &mut Cursor::new(&data),
+        &mut vault,
+        &sample_metadata(),
+        b"FramePw!1",
+        &fast_opts(),
+        |_| {},
+        None,
+    )
+    .unwrap();
+
+    let opts = RekeyOptions {
+        old_password: b"FramePw!1",
+        new_password: b"FramePw!2",
+        old_keyfile_hash: None,
+        new_keyfile_hash: None,
+        new_kdf: Some(KdfParams::fast_test()),
+    };
+
+    // 1) Truncating the final chunk / tail bytes (simulating missing tail `.00N` split part)
+    // must be rejected as InvalidFormat rather than blindly copying truncated bytes.
+    let truncated_mid_chunk = &vault[..vault.len() - 10];
+    assert!(matches!(
+        rekey_stream(
+            &mut Cursor::new(truncated_mid_chunk),
+            &mut Vec::new(),
+            &opts,
+            None
+        ),
+        Err(CryptoError::InvalidFormat(_))
+    ));
+
+    // 2) Cutting exactly at a chunk boundary (so final_flag == 1 chunk is completely missing)
+    let hdr_len = u32::from_be_bytes(vault[5..9].try_into().unwrap()) as usize;
+    let hdr: VaultHeader = serde_json::from_slice(&vault[9..9 + hdr_len]).unwrap();
+    let payload_offset = 9 + hdr_len + hdr.encrypted_meta_len as usize;
+    let first_chunk_end = payload_offset + 5 + 16 * 1024 + 16;
+    assert!(matches!(
+        rekey_stream(
+            &mut Cursor::new(&vault[..first_chunk_end]),
+            &mut Vec::new(),
+            &opts,
+            None
+        ),
+        Err(CryptoError::InvalidFormat(_))
+    ));
+
+    // 3) Trailing unauthenticated bytes after final_flag == 1 must be rejected.
+    let mut with_trailing = vault.clone();
+    with_trailing.push(0xFF);
+    assert!(matches!(
+        rekey_stream(
+            &mut Cursor::new(&with_trailing),
+            &mut Vec::new(),
+            &opts,
+            None
+        ),
+        Err(CryptoError::InvalidFormat(_))
+    ));
+
+    // 4) Invalid final flag (> 1) must be rejected.
+    let mut bad_flag = vault.clone();
+    bad_flag[payload_offset + 4] = 2;
+    assert!(matches!(
+        rekey_stream(&mut Cursor::new(&bad_flag), &mut Vec::new(), &opts, None),
+        Err(CryptoError::InvalidFormat(_))
+    ));
+
+    // 5) Oversized chunk length (> header.chunk_size) must be rejected.
+    let mut oversized = vault.clone();
+    oversized[payload_offset..payload_offset + 4]
+        .copy_from_slice(&(hdr.chunk_size + 1).to_be_bytes());
+    assert!(matches!(
+        rekey_stream(&mut Cursor::new(&oversized), &mut Vec::new(), &opts, None),
+        Err(CryptoError::InvalidFormat(_))
+    ));
+}

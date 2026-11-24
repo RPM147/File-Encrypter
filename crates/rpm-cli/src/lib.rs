@@ -3,6 +3,7 @@
 mod diff;
 pub mod progress;
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -19,10 +20,12 @@ use rpm_core::{
 };
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    check_vault_integrity, decrypt_vault_v5_with_stealth_kdf, discover_split_parts,
-    encrypt_hidden_sources_v5, encrypt_hidden_sources_v5_split, encrypt_sources_v5,
-    encrypt_sources_v5_split, join_vault_parts, open_vault_reader, rekey_vault_v5,
-    split_vault_file, unique_path, unique_split_base, SecureWiper, StorageError,
+    check_compartment_sources, check_vault_integrity_with_parts, check_wipe_targets,
+    decrypt_vault_v5_with_stealth_kdf, discover_split_parts, encrypt_hidden_sources_v5,
+    encrypt_hidden_sources_v5_split, encrypt_sources_v5, encrypt_sources_v5_split,
+    join_vault_parts, open_vault_reader, path_dedup_key, rekey_vault_v5, split_vault_file,
+    unique_path, unique_split_base, validate_split_bounds, PathDedupKey, SecureWiper,
+    SplitDiscoveryCache, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -236,47 +239,6 @@ fn load_keyfile(path: Option<&Path>) -> Result<Option<SecretKey>, String> {
     }
 }
 
-fn check_compartment_sources(outer: &[PathBuf], hidden: &[PathBuf]) -> std::io::Result<()> {
-    let outer = outer
-        .iter()
-        .map(fs::canonicalize)
-        .collect::<Result<Vec<_>, _>>()?;
-    for source in hidden {
-        let source = fs::canonicalize(source)?;
-        if outer
-            .iter()
-            .any(|path| path.starts_with(&source) || source.starts_with(path))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "outer and hidden source paths overlap; select separate files or directories",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn check_wipe_targets<'a>(
-    sources: impl Iterator<Item = &'a PathBuf>,
-    output_dir: &Path,
-    keyfiles: impl Iterator<Item = &'a PathBuf>,
-) -> std::io::Result<()> {
-    let mut protected = vec![fs::canonicalize(output_dir)?];
-    for keyfile in keyfiles {
-        protected.push(fs::canonicalize(keyfile)?);
-    }
-    for source in sources {
-        let source = fs::canonicalize(source)?;
-        if protected.iter().any(|path| path.starts_with(&source)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--wipe would remove the output directory or a required keyfile",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn format_metadata_plain(meta: &VaultMetadata) -> String {
     let mib = (meta.original_size as f64) / (1024.0 * 1024.0);
     let mut lines = vec![
@@ -408,6 +370,15 @@ where
             if let Some(dir) = output_dir.as_deref() {
                 if !dir.is_dir() {
                     let _ = writeln!(stderr, "Error: output directory missing: {}", dir.display());
+                    return 1;
+                }
+            }
+
+            if let Some(s_mb) = split_mb {
+                if let Err(err) =
+                    validate_split_bounds(s_mb * MIB, container_mb.map(|c| c * MIB), reed_solomon)
+                {
+                    let _ = writeln!(stderr, "Error: {err}");
                     return 1;
                 }
             }
@@ -666,13 +637,15 @@ where
                 }
             }
             // Collapse multiple parts of the same split volume (e.g. shell glob `archive.vault.*`)
-            // to a single canonical `.001` target.
+            // to a single canonical `.001` target in O(D + N) with platform-aware canonical dedup.
+            let mut split_cache = SplitDiscoveryCache::default();
+            let mut seen_splits: HashSet<PathDedupKey> = HashSet::new();
             let mut normalized_vaults = Vec::with_capacity(vaults.len());
             for v in vaults {
-                match discover_split_parts(&v) {
+                match split_cache.discover(&v) {
                     Ok(Some(set)) => {
                         let first = set.first_part().to_path_buf();
-                        if !normalized_vaults.contains(&first) {
+                        if seen_splits.insert(path_dedup_key(&first)) {
                             normalized_vaults.push(first);
                         }
                     }
@@ -819,16 +792,8 @@ where
                 return 1;
             }
             if integrity_only {
-                let split_parts = match discover_split_parts(&vault) {
-                    Ok(Some(set)) => Some(set.part_count()),
-                    Ok(None) => None,
-                    Err(e) => {
-                        let _ = writeln!(stderr, "Error: {e}");
-                        return 1;
-                    }
-                };
-                match check_vault_integrity(&vault) {
-                    Ok(rep) => {
+                match check_vault_integrity_with_parts(&vault) {
+                    Ok((rep, split_parts)) => {
                         if json {
                             let val = serde_json::json!({
                                 "path": vault,
@@ -879,6 +844,16 @@ where
                     }
                 }
             }
+
+            // Validate split volume completeness before prompting for credentials.
+            let mut reader = match open_vault_reader(&vault) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(stderr, "Error: {e}");
+                    return 1;
+                }
+            };
+            let split_parts = reader.is_split().then_some(reader.part_count());
 
             let keyfile_hash = match load_keyfile(keyfile.as_deref()) {
                 Ok(k) => k,
@@ -933,14 +908,6 @@ where
                 }
             };
 
-            let mut reader = match open_vault_reader(&vault) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = writeln!(stderr, "Error: {e}");
-                    return 1;
-                }
-            };
-            let split_parts = reader.is_split().then_some(reader.part_count());
             match inspect_header_seekable_with_kdf(&mut reader, auth, &kdf) {
                 Ok(info) => {
                     if json {
@@ -1003,24 +970,31 @@ where
             vault,
             output,
             json,
-        } => match rpm_storage::repair_vault_v5(&vault, output.as_deref(), cancel) {
-            Ok(report) => {
-                if json {
-                    let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&report).unwrap());
-                } else {
-                    let _ = writeln!(
-                        stdout,
-                        "Checked {} blocks, repaired {} bytes (header repaired: {}).",
-                        report.blocks_checked, report.repaired_bytes, report.header_repaired
-                    );
+        } => {
+            if !vault.is_file() {
+                let _ = writeln!(stderr, "Error: vault not found: {}", vault.display());
+                return 1;
+            }
+            match rpm_storage::repair_vault_v5(&vault, output.as_deref(), cancel) {
+                Ok(report) => {
+                    if json {
+                        let _ =
+                            writeln!(stdout, "{}", serde_json::to_string_pretty(&report).unwrap());
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            "Checked {} blocks, repaired {} bytes (header repaired: {}).",
+                            report.blocks_checked, report.repaired_bytes, report.header_repaired
+                        );
+                    }
+                    0
                 }
-                0
+                Err(e) => {
+                    let _ = writeln!(stderr, "Repair failed: {e}");
+                    1
+                }
             }
-            Err(e) => {
-                let _ = writeln!(stderr, "Repair failed: {e}");
-                1
-            }
-        },
+        }
         Commands::Rekey {
             vault,
             keyfile,
@@ -1031,6 +1005,11 @@ where
             if !vault.is_file() {
                 let _ = writeln!(stderr, "Error: vault not found: {}", vault.display());
                 return 1;
+            }
+            // Validate split volume completeness before prompting for passwords.
+            if let Err(err) = discover_split_parts(&vault) {
+                let _ = writeln!(stderr, "Error re-keying: {err}");
+                return exit_code_for_storage_error(&err);
             }
             let old_kf = match load_keyfile(keyfile.as_deref()) {
                 Ok(k) => k,

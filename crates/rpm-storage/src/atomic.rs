@@ -8,6 +8,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use crate::error::StorageError;
+use crate::packager::{create_dir_all_tracked, OutputExclusion};
 
 /// Write `target` via a sibling `.rpm_tmp_<hex>.part` file, flush + `sync_all`,
 /// close the handle, and atomically rename into place.
@@ -15,11 +16,22 @@ pub fn atomic_write<F>(target: &Path, write_fn: F) -> Result<(), StorageError>
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<(), StorageError>,
 {
+    atomic_write_tracked(target, None, write_fn)
+}
+
+pub(crate) fn atomic_write_tracked<F>(
+    target: &Path,
+    exclusion: Option<&OutputExclusion>,
+    write_fn: F,
+) -> Result<(), StorageError>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<(), StorageError>,
+{
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    create_dir_all_tracked(parent, exclusion)?;
 
     let mut rand_bytes = [0u8; 6];
     OsRng.fill_bytes(&mut rand_bytes);
@@ -27,11 +39,12 @@ where
     for b in rand_bytes {
         hex.push_str(&format!("{b:02x}"));
     }
-    let stem = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "vault".into());
-    let temp_path = parent.join(format!(".rpm_tmp_{stem}_{hex}.part"));
+    // Keep staging filename short (26 bytes) so long target names never breach the 255-byte
+    // filesystem component limit.
+    let temp_path = parent.join(format!(".rpm_tmp_{hex}.part"));
+    if let Some(ex) = exclusion {
+        ex.register_path(&temp_path);
+    }
 
     let res = (|| -> Result<(), StorageError> {
         let file = OpenOptions::new()
@@ -59,13 +72,17 @@ where
 pub(crate) fn write_vault(
     target: &Path,
     stealth: bool,
+    exclusion: Option<&OutputExclusion>,
     write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     if !stealth {
-        return atomic_write(target, write_fn);
+        return atomic_write_tracked(target, exclusion, write_fn);
     }
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+        create_dir_all_tracked(parent, exclusion)?;
+    }
+    if let Some(ex) = exclusion {
+        ex.register_path(target);
     }
     let file = File::create_new(target)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
