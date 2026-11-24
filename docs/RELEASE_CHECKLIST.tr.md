@@ -1,6 +1,6 @@
 # v4.6.0 sürüm kontrol listesi
 
-> English: [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)
+> [English](RELEASE_CHECKLIST.md) (varsayılan) · **Türkçe**
 
 ## Etiketten önce
 

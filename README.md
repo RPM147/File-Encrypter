@@ -2,11 +2,13 @@
 
 [![CI](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
 
+**Language / Dil:** **English** (default) · [Türkçe](README.tr.md)
+
 RPM Encrypter is a **Pure-Rust, local-only** file encryption utility using **Chunked AES-256-GCM** (`Vault Format v5`), **Argon2id** key derivation, optional **keyfile two-factor binding**, and deterministic in-memory secret scrubbing (`zeroize` + `VirtualLock`/`mlock`).
 
 Everything runs locally with zero telemetry, cloud accounts, or network dependencies. The retired Python + Flet (Vault Format v4) codebase is preserved in earlier Git history.
 
-[User Guide (English)](docs/USER_GUIDE.md) · [Kullanım Kılavuzu (Türkçe)](docs/USER_GUIDE.tr.md) · [Changelog](CHANGELOG.md)
+[User Guide (English)](docs/USER_GUIDE.md) ([Türkçe](docs/USER_GUIDE.tr.md)) · [Changelog (English)](CHANGELOG.md) ([Türkçe](CHANGELOG.tr.md))
 
 ## Key Features
 
@@ -82,9 +84,9 @@ cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./selected 
 
 ## Architecture & Security
 
-- Architecture overview and wire formats: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Architecture overview and wire formats: [ARCHITECTURE.md](ARCHITECTURE.md) ([Türkçe](ARCHITECTURE.tr.md))
 - Non-negotiable design invariants: [docs/DESIGN_INVARIANTS.md](docs/DESIGN_INVARIANTS.md) ([Türkçe](docs/DESIGN_INVARIANTS.tr.md))
-- Threat model, swap/OS limitations, and SSD wipe caveats: [SECURITY.md](SECURITY.md)
+- Threat model, swap/OS limitations, and SSD wipe caveats: [SECURITY.md](SECURITY.md) ([Türkçe](SECURITY.tr.md))
 - Combinatorial valid-feature test kit: [docs/TEST_KIT.md](docs/TEST_KIT.md) ([Türkçe](docs/TEST_KIT.tr.md))
 
 ## License

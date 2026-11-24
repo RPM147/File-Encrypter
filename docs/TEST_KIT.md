@@ -1,6 +1,6 @@
 # Combinatorial Valid-Feature Test Kit
 
-> Türkçe: [TEST_KIT.tr.md](TEST_KIT.tr.md)
+> **English** (default) · [Türkçe](TEST_KIT.tr.md)
 
 The RPM Encrypter combinatorial test kit systematically validates every **valid feature combination** across all four workspace crates (`rpm-core`, `rpm-storage`, `rpm-cli`, `rpm-gui`). By scope, negative/forced-constraint failure modes (such as combining `--stealth` with `--reed-solomon` or running `rekey` on padded containers) are intentionally excluded here and continue to live in their dedicated security/resilience suites.
 

@@ -1,5 +1,7 @@
 # Changelog
 
+> **English** (default) · [Türkçe](CHANGELOG.tr.md)
+
 ## v4.6.0
 
 - **Split / Join Multi-Part Volumes & Zero-Temp-Merge Virtual Reader (`rpm-storage`, CLI, GUI):** Added streaming multi-part volume splitting (`.vault.001`, `.vault.002`, ...) with zero changes to Vault Format v5 and zero new external crates. Supports CLI `encrypt --split-mb <MiB>`, standalone `split --part-mb <MiB>` and `join` subcommands, GUI **Split Volume** presets (`25 / 100 / 500 / 2000 / 4000 MiB (FAT32 Safe)` and custom MiB), saved **Encryption Profile** persistence (`split_part_mib`), pre-flight part count estimation, drag-and-drop `.001/.002` deduplication, and a collapsible **Split / Join Vault Volumes** utility in **Inspect**. `decrypt`, selective extraction, RAM-only preview, `inspect`, `diff`, `rekey`, and Reed-Solomon `repair` read split volumes transparently via a single-file-handle virtual `Read + Seek` reader (`SplitVolumeReader`) without writing temporary merged files to disk.

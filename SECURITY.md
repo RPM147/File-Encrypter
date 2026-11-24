@@ -1,5 +1,7 @@
 # Security Model & Limitations
 
+> **English** (default) · [Türkçe](SECURITY.tr.md)
+
 RPM Encrypter is a **local-only, single-user file encryption tool** written in Pure Rust (`Vault Format v5`). It is not a service, has no server, and makes no network connections. This document explains what it protects against and what limits remain.
 
 ## Threat model (what it is designed for)

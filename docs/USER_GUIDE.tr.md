@@ -1,6 +1,6 @@
 # RPM Encrypter kullanım kılavuzu
 
-> English: [USER_GUIDE.md](USER_GUIDE.md)
+> [English](USER_GUIDE.md) (varsayılan) · **Türkçe**
 
 RPM Encrypter, dosya ve klasörlerinizi bilgisayarınızda şifreleyip `.vault` uzantılı bir kasaya kaydeder. Bu kılavuz Vault Format v5 içindir.
 
@@ -143,8 +143,8 @@ Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. 
 winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.6.0
 ```
 
-WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)
+WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.tr.md)
 
 ## SSD ve güvenli silme
 
-SSD ve USB belleklerde **güvenli silme** seçeneği eski verilerin fiziksel olarak silinmesini garanti edemez. Yedekler ve eşitlenen klasörler de şifresiz kopyalar içerebilir. Hassas dosyalarla çalışıyorsanız en baştan tam disk şifrelemesi kullanın. [Güvenlik ayrıntıları](../SECURITY.md)
+SSD ve USB belleklerde **güvenli silme** seçeneği eski verilerin fiziksel olarak silinmesini garanti edemez. Yedekler ve eşitlenen klasörler de şifresiz kopyalar içerebilir. Hassas dosyalarla çalışıyorsanız en baştan tam disk şifrelemesi kullanın. [Güvenlik ayrıntıları](../SECURITY.tr.md)

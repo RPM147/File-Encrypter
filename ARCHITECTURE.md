@@ -1,6 +1,6 @@
 # RPM Encrypter — Architecture & Compatibility Policy
 
-> Design invariants & non-negotiable engineering rules: [docs/DESIGN_INVARIANTS.md](docs/DESIGN_INVARIANTS.md) · [Türkçe](docs/DESIGN_INVARIANTS.tr.md)
+> **English** (default) · [Türkçe](ARCHITECTURE.tr.md) · Design invariants & non-negotiable engineering rules: [docs/DESIGN_INVARIANTS.md](docs/DESIGN_INVARIANTS.md) ([Türkçe](docs/DESIGN_INVARIANTS.tr.md))
 
 ## Package Layout
 
@@ -99,6 +99,6 @@ RPM Encrypter migrated from Python + Flet to **Pure Rust** with **Vault Format v
 
 ## Related Documents
 
-- [SECURITY.md](SECURITY.md) — Threat model, memory locking, SSD/swap caveats, and feature guarantees
+- [SECURITY.md](SECURITY.md) ([Türkçe](SECURITY.tr.md)) — Threat model, memory locking, SSD/swap caveats, and feature guarantees
 - [docs/DESIGN_INVARIANTS.md](docs/DESIGN_INVARIANTS.md) ([Türkçe](docs/DESIGN_INVARIANTS.tr.md)) — Non-negotiable architectural and security invariants
 - [docs/TEST_KIT.md](docs/TEST_KIT.md) ([Türkçe](docs/TEST_KIT.tr.md)) — Combinatorial valid-feature matrix across all four crates

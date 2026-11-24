@@ -1,6 +1,6 @@
 # Tasarım Değişmezleri ve Mühendislik Kuralları
 
-> English: [DESIGN_INVARIANTS.md](DESIGN_INVARIANTS.md) · Format Yapısı: [ARCHITECTURE.md](../ARCHITECTURE.md) · Tehdit Modeli: [SECURITY.md](../SECURITY.md)
+> [English](DESIGN_INVARIANTS.md) (varsayılan) · **Türkçe** · Format Yapısı: [ARCHITECTURE.tr.md](../ARCHITECTURE.tr.md) · Tehdit Modeli: [SECURITY.tr.md](../SECURITY.tr.md)
 
 Bu belge, RPM Encrypter (`v4.4.0+`) için **taviz verilemez mimari, kriptografik ve yönetim değişmezlerini** kayıt altına alır. Yeni özellikler, refaktörler veya otomatik ajan değişiklikleri; bilinçli ve onaylı bir ana biçim sürüm artışı (`VAULT_VERSION > 5`) yapılmadığı sürece aşağıdaki tüm kuralları korumak zorundadır.
 

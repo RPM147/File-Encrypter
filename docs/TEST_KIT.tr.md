@@ -1,6 +1,6 @@
 # Kombinasyonel Geçerli Özellik Test Kiti
 
-> English: [TEST_KIT.md](TEST_KIT.md)
+> [English](TEST_KIT.md) (varsayılan) · **Türkçe**
 
 RPM Encrypter kombinasyonel test kiti, dört workspace paketindeki (`rpm-core`, `rpm-storage`, `rpm-cli`, `rpm-gui`) **tüm geçerli özellik kombinasyonlarını** sistematik biçimde doğrular. Kapsam gereği zorunlu kısıtlar ve negatif senaryolar (örneğin `--stealth` ile `--reed-solomon` birlikte seçimi veya dolgulu kasalarda `rekey`) bu kitin dışında bırakılmış olup mevcut güvenlik/dayanıklılık testlerinde test edilmeye devam eder.
 

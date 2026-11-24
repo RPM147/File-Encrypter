@@ -1,5 +1,7 @@
 # WinGet Manifest Generation
 
+> **English** (default) · [Türkçe](README.tr.md)
+
 `generate-manifests.ps1` generates WinGet (`1.9.0` schema) portable ZIP manifests for `RPM147.RPMEncrypter` without mutating tracked repository files.
 
 ## Generate manifests

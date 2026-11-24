@@ -1,6 +1,6 @@
 # Design Invariants & Engineering Guardrails
 
-> Türkçe: [DESIGN_INVARIANTS.tr.md](DESIGN_INVARIANTS.tr.md) · Wire Layout: [ARCHITECTURE.md](../ARCHITECTURE.md) · Threat Model: [SECURITY.md](../SECURITY.md)
+> **English** (default) · [Türkçe](DESIGN_INVARIANTS.tr.md) · Wire Layout: [ARCHITECTURE.md](../ARCHITECTURE.md) · Threat Model: [SECURITY.md](../SECURITY.md)
 
 This document records the **non-negotiable architectural, cryptographic, and governance invariants** for RPM Encrypter (`v4.4.0+`). New features, refactors, or automated changes must preserve every rule below unless an intentional major format bump (`VAULT_VERSION > 5`) is explicitly planned and approved.
 

@@ -1,6 +1,6 @@
 # v4.6.0 Release Checklist
 
-> Türkçe: [RELEASE_CHECKLIST.tr.md](RELEASE_CHECKLIST.tr.md)
+> **English** (default) · [Türkçe](RELEASE_CHECKLIST.tr.md)
 
 ## Before tagging
 

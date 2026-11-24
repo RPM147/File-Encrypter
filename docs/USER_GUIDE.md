@@ -1,6 +1,6 @@
 # RPM Encrypter User Guide
 
-> Türkçe: [USER_GUIDE.tr.md](USER_GUIDE.tr.md)
+> **English** (default) · [Türkçe](USER_GUIDE.tr.md)
 
 RPM Encrypter encrypts files and folders locally on your computer and saves them into a `.vault` archive. This guide covers Vault Format v5.
 
