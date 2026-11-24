@@ -52,7 +52,8 @@ Drag and drop `.vault` files onto the window. On the **Decrypt** tab, enter the 
 Use the **Inspect** tab to verify integrity or restore specific files without writing the whole archive to disk:
 
 - **Integrity Check (No Password) & Repair:** Click **Integrity Check (No Password)** to verify the vault header, chunk framing, exact EOF/container-size boundary, Reed-Solomon repairable bytes (if enabled), and full-file SHA-256 digest without needing credentials. For Reed-Solomon protected vaults with disk damage, click **Repair (Reed-Solomon)** (or run `rpm-encrypter-cli repair <vault> [-o <copy>]`) to atomically write corrected blocks without a password.
-- **Inspect Metadata, RAM-Only Preview & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase, click **Preview** beside any file (up to `16 MiB`) to view UTF-8 text or images (`PNG/JPEG/WebP/GIF/BMP`) purely in RAM after full AEAD authentication completes with zero temporary files on disk (closing, `Esc`, switching tabs, or changing vaults scrubs the preview buffer), or check files/folders and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before anything is returned or written to disk.)*
+- **Inspect Metadata, Vault Explorer, RAM-Only Preview & Extract Selected:** Unlock the encrypted manifest with a password or recovery phrase to browse files in **Folder Tree** or **Flat List** view with tri-state folder checkboxes, category/size filters, and search. Click **Preview** beside any file (up to `16 MiB`) to view UTF-8 text (with line numbers and `Ctrl+F` search), images (`PNG/JPEG/WebP/GIF/BMP` with zoom and `90°` rotation), or a read-only Hex + ASCII view for binary files purely in RAM after full AEAD authentication completes with zero temporary files on disk (closing, `Esc`, switching tabs, or changing vaults scrubs the preview buffer), or check files/folders and click **Extract Selected**. *(Every chunk in that compartment is still authenticated before anything is returned or written to disk.)*
+- **Split / Join Multi-Part Volumes:** Select a **Split Volume** size on the **Encrypt** tab (including `4000 MiB (FAT32 Safe)` or custom MiB, savable in profiles) or pass `--split-mb <MiB>` in CLI to write `.vault.001`, `.vault.002`, ... directly. Use **Inspect → Split / Join Vault Volumes** (or CLI `split` / `join`) to split an existing `.vault` or reassemble parts. Opening any `.vault.001` part in **Decrypt**, **Inspect**, **Vault Diff**, **Re-Key**, or **Repair** reads all parts virtually with zero temporary merged files on disk.
 
 ## Comparing two vaults (Vault Diff)
 
@@ -94,6 +95,13 @@ Examples below assume a terminal opened in the extracted release folder with `./
 # Encrypt a folder with Reed-Solomon bit-rot protection (~7% parity)
 ./rpm-encrypter-cli encrypt ./Docs --reed-solomon
 
+# Encrypt and split into FAT32-safe 4000 MiB volumes (.vault.001, .002, ...)
+./rpm-encrypter-cli encrypt ./Docs --split-mb 4000
+
+# Split an existing vault or join split parts back into a single .vault
+./rpm-encrypter-cli split ./Docs.vault --part-mb 100
+./rpm-encrypter-cli join ./Docs.vault.001 -o ./Docs.joined.vault
+
 # Repair a damaged Reed-Solomon vault without a password (in place or to a copy)
 ./rpm-encrypter-cli repair ./Docs.vault
 ./rpm-encrypter-cli repair ./Docs.vault -o ./Docs.repaired.vault
@@ -125,11 +133,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.5.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.6.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.5.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.5.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.6.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.6.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.

@@ -18,7 +18,8 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 - **O(1) Re-Key:** Rotate passwords and/or keyfiles by re-wrapping only the 32-byte DEK envelope without decrypting gigabytes of payload chunks.
 - **Native Desktop GUI + OS Drag-and-Drop (`rpm-encrypter`):** Built with `eframe`/`egui` and `rfd`, featuring a bilingual Turkish/English UI (`TR`/`EN`), external file/folder drag-and-drop, and an opt-in 30-second auto-clearing clipboard timer for copied secrets.
 - **Operational Safety, Presets & Batch Workflow (GUI):** Includes clipboard-safe idle auto-lock & manual session clear (`Ctrl+L`, leaving the OS clipboard untouched), built-in and custom non-secret **Encryption Profiles**, a pre-flight source size / RS parity / container fit estimator, post-op **Show in Folder** / **Verify Now** quick actions, and a zeroizing sequential **Batch Job Queue**.
-- **Selective File Extraction & RAM-Only Preview:** Restore individual files or subfolders using the GUI **Inspect** tab checklist or repeatable `decrypt --only <PATH>` flags in the CLI (guarded by stage-and-swap authentication), or preview UTF-8 text and image files up to `16 MiB` purely in RAM without touching disk.
+- **Vault Explorer, Selective Extraction & Enhanced RAM-Only Preview:** Browse unlocked manifests in the GUI **Inspect** tab via a **Folder Tree / Flat List** with tri-state folder checkboxes, type/size filters, and selective extraction (or repeatable `decrypt --only <PATH>` flags in the CLI, guarded by stage-and-swap authentication). Preview files up to `16 MiB` purely in RAM without touching disk — including UTF-8 text with line numbers and `Ctrl+F` search, images with zoom and lossless `90°` rotation, and a read-only Hex + ASCII viewer for binary files.
+- **Split / Join Multi-Part Volumes (Virtual Read + Seek):** Split large vaults into numbered parts (`.vault.001`, `.vault.002`, ...) for FAT32 (`4000 MiB`) or upload limits via CLI `--split-mb` / `split` / `join` or GUI **Encrypt** & **Inspect** tools. `decrypt`, selective extract, RAM preview, `inspect`, `diff`, `rekey`, and Reed-Solomon `repair` read split volumes virtually using at most one open file handle and zero temporary merged files on disk.
 - **Headless CLI (`rpm-encrypter-cli`):** Scriptable encryption, decryption, inspection, re-keying, password generation, and Windows shell integration without passing passwords on the command line.
 - **Container Padding & Hidden Vault (Plausible Deniability):** Pad vaults to fixed MiB container sizes with `OsRng` random bytes (`--container-mb` or GUI Container Size selector) and optionally embed an indistinguishable secondary hidden compartment (`--hidden` or GUI Hidden Vault panel) with independent credentials.
 - **Optional Stealth Mode (Encrypted Header):** Encrypt the outer password/recovery slots and frame prefixes with no plaintext `RPMV` header (`--stealth` or GUI Encrypt checkbox), using a fixed OWASP Argon2id profile (`64 MiB / 3 / 4`) so the entire file appears indistinguishable from uniform random bytes regardless of extension.
@@ -57,8 +58,11 @@ Passwords are never accepted as CLI flags; interactive secure prompts or `--pass
 ```bash
 cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-out recovery.txt
 cargo run -p rpm-cli -- encrypt ./folder --reed-solomon
+cargo run -p rpm-cli -- encrypt ./folder --split-mb 4000
 cargo run -p rpm-cli -- encrypt ./folder --stealth --container-mb 50
 cargo run -p rpm-cli -- encrypt ./decoy --container-mb 50 --hidden ./secret --hidden-keyfile ./hidden.key
+cargo run -p rpm-cli -- split ./folder.vault --part-mb 100
+cargo run -p rpm-cli -- join ./folder.vault.001 -o ./folder.joined.vault
 cargo run -p rpm-cli -- repair ./folder.vault
 cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored
 cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json

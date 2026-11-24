@@ -52,7 +52,8 @@ Gizli bölmeyi çözmek veya incelemek için `decrypt`, `inspect` veya `diff` ko
 Tüm kasayı açmadan içeriği kontrol etmek veya yalnızca belirli dosyaları çıkarmak için **İncele** sekmesini kullanın:
 
 - **Bütünlük Kontrolü (Parolasız) ve Onarım:** **Bütünlük Kontrolü (Parolasız)** düğmesi kasa başlığını, tüm veri parçalarının (chunk) çerçeve yapısını, sonda bozuk/artık bayt bulunmadığını (veya konteyner boyutunu), Reed-Solomon ile onarılabilir bayt sayısını ve dosyanın SHA-256 özetini parola girmeden doğrular. Disk hasarı almış Reed-Solomon korumalı kasalarda parolasız atomik onarım için **Onar (Reed-Solomon)** düğmesini (veya CLI’da `rpm-encrypter-cli repair <kasa> [-o <kopya>]` komutunu) kullanabilirsiniz.
-- **Meta Veriyi İncele, RAM-İçi Önizleme ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra herhangi bir dosyanın yanındaki **Önizle** düğmesiyle (`16 MiB` sınırına kadar) UTF-8 metin veya görselleri (`PNG/JPEG/WebP/GIF/BMP`) diske tek bayt geçici dosya yazmadan yalnızca RAM içinde görüntüleyebilirsiniz (önizleme yalnızca tüm bölme AEAD doğrulamasından geçtikten sonra açılır; pencere kapatma, `Esc`, sekme veya kasa değişiminde bellek sıfırlanır). Dilerseniz onay kutularıyla seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda seçilen bölmenin tüm şifreli parçaları yine doğrulanır.)*
+- **Meta Veriyi İncele, Kasa Gezgini, RAM-İçi Önizleme ve Seçilenleri Çıkar:** Parola veya kurtarma cümlesiyle şifreli dosya listesini açtıktan sonra dosyaları **Klasör Ağacı** veya **Düz Liste** görünümünde üç durumlu klasör seçimi, tür/boyut filtreleri ve arama kutusuyla gezebilirsiniz. Herhangi bir dosyanın yanındaki **Önizle** düğmesiyle (`16 MiB` sınırına kadar) UTF-8 metinleri (satır numarası ve `Ctrl+F` aramasıyla), görselleri (`PNG/JPEG/WebP/GIF/BMP`, yakınlaştırma ve `90°` döndürmeyle) veya ikili dosyaları salt-okunur Hex + ASCII görünümünde diske tek bayt geçici dosya yazmadan yalnızca RAM içinde görüntüleyebilirsiniz (önizleme yalnızca tüm bölme AEAD doğrulamasından geçtikten sonra açılır; pencere kapatma, `Esc`, sekme veya kasa değişiminde bellek sıfırlanır). Dilerseniz onay kutularıyla seçip **Seçilenleri Çıkar** düğmesine basın. *(Arka planda seçilen bölmenin tüm şifreli parçaları yine doğrulanır.)*
+- **Parçalı Kasa Bölme / Birleştirme (Split / Join):** **Şifrele** sekmesinden **Parçalı Bölme (Split)** boyutunu (`4000 MiB (FAT32 Güvenli)` veya özel MiB; profillere kaydedilebilir) seçerek ya da CLI’da `--split-mb <MiB>` vererek çıktıyı doğrudan `.vault.001`, `.vault.002`, ... parçalarına bölebilirsiniz. Mevcut bir `.vault` dosyasını bölmek veya parçaları yeniden birleştirmek için **İncele → Parçalı Kasa Böl / Birleştir** aracını (ya da CLI `split` / `join`) kullanabilirsiniz. **Çöz**, **İncele**, **Kasa Karşılaştırma**, **Anahtar Değiştir** ve **Onar** `.vault.001` açıldığında tüm parçaları diske geçici birleştirme dosyası yazmadan sanal olarak okur.
 
 ## İki kasayı karşılaştırma
 
@@ -97,6 +98,13 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 # Reed-Solomon bit-rot koruması (~%7 parite) ile şifrele
 ./rpm-encrypter-cli encrypt ./Belgeler --reed-solomon
 
+# FAT32 uyumlu 4000 MiB parçalar hâlinde şifrele (.vault.001, .002, ...)
+./rpm-encrypter-cli encrypt ./Belgeler --split-mb 4000
+
+# Mevcut kasayı böl veya parçaları tek .vault dosyasında birleştir
+./rpm-encrypter-cli split ./Belgeler.vault --part-mb 100
+./rpm-encrypter-cli join ./Belgeler.vault.001 -o ./Belgeler.birlesik.vault
+
 # Hasarlı Reed-Solomon kasasını parolasız atomik olarak onar (yerinde veya kopyaya)
 ./rpm-encrypter-cli repair ./Belgeler.vault
 ./rpm-encrypter-cli repair ./Belgeler.vault -o ./Belgeler.onarildi.vault
@@ -128,11 +136,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.5.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.6.0/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.5.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.5.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.6.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.6.0
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.md)
