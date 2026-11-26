@@ -2834,3 +2834,45 @@ fn gui_split_audit_regressions_drop_guards_wipe_overlap_reports_and_canonical_do
         }
     }
 }
+
+#[test]
+fn printable_recovery_sheet_modal_and_i18n_render_cleanly_in_tr_and_en() {
+    let tr = i18n::strings(AppLanguage::Tr);
+    let en = i18n::strings(AppLanguage::En);
+    for (t, e) in [
+        (tr.btn_save_recovery_sheet, en.btn_save_recovery_sheet),
+        (tr.modal_rec_sheet_note, en.modal_rec_sheet_note),
+        (tr.status_rec_sheet_saved, en.status_rec_sheet_saved),
+        (tr.err_rec_sheet_save, en.err_rec_sheet_save),
+    ] {
+        assert!(!t.trim().is_empty() && !e.trim().is_empty());
+        assert_ne!(t, e);
+    }
+
+    let entropy = rpm_core::generate_recovery_entropy();
+    let phrase = rpm_core::entropy_to_mnemonic(&entropy).unwrap();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    for (lang, enable_hidden) in [(AppLanguage::Tr, false), (AppLanguage::En, true)] {
+        let mut st = fresh_state();
+        st.config.language = lang;
+        st.encrypt.enable_hidden = enable_hidden;
+        st.encrypt.recovery_prompt = Some(RecoveryPrompt {
+            phrase: phrase.to_string(),
+            entropy: entropy.clone(),
+            confirmed: false,
+            queue_after_confirm: false,
+        });
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::encrypt::ui(ui, &ctx, &mut st, &tx, &cancel);
+        });
+        out.textures_delta.clear();
+        assert!(
+            st.encrypt.recovery_prompt.is_some(),
+            "recovery modal should remain open until user confirms or cancels"
+        );
+    }
+}

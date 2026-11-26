@@ -11,6 +11,7 @@ pub use preview::{
     extract_entry_to_memory_v5, extract_entry_to_memory_v5_with_stealth_kdf,
     DEFAULT_PREVIEW_MAX_BYTES,
 };
+pub mod recovery_sheet;
 pub mod shell_integration;
 pub mod split;
 pub mod wiper;
@@ -21,6 +22,10 @@ pub use config::{load_config_from, save_config_to, AppConfig, EncryptProfile, Th
 pub use error::StorageError;
 pub use launch::{parse_gui_launch_args, GuiLaunchIntent, LaunchTab};
 pub use packager::UnpackLimits;
+pub use recovery_sheet::{
+    render_recovery_sheet_html, suggested_recovery_sheet_filename, write_recovery_sheet_html,
+    RecoverySheetInfo,
+};
 pub use split::{
     check_vault_integrity, check_vault_integrity_with_parts, discover_split_parts,
     is_vault_or_split_filename, join_vault_parts, open_vault_reader, parse_split_part_path,

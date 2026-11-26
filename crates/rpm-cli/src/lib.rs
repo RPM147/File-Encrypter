@@ -18,14 +18,15 @@ use rpm_core::{
     inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
     HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
 };
+use rpm_storage::config::AppLanguage;
 use rpm_storage::shell_integration;
 use rpm_storage::{
     check_compartment_sources, check_vault_integrity_with_parts, check_wipe_targets,
     decrypt_vault_v5_with_stealth_kdf, discover_split_parts, encrypt_hidden_sources_v5,
     encrypt_hidden_sources_v5_split, encrypt_sources_v5, encrypt_sources_v5_split,
     join_vault_parts, open_vault_reader, path_dedup_key, rekey_vault_v5, split_vault_file,
-    unique_path, unique_split_base, validate_split_bounds, PathDedupKey, SecureWiper,
-    SplitDiscoveryCache, StorageError,
+    unique_path, unique_split_base, validate_split_bounds, write_recovery_sheet_html, PathDedupKey,
+    RecoverySheetInfo, SecureWiper, SplitDiscoveryCache, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -80,6 +81,17 @@ pub enum Commands {
         wipe: bool,
         #[arg(long)]
         recovery_out: Option<PathBuf>,
+        /// Write an offline printable HTML recovery sheet (24-word card) to this path.
+        #[arg(long, value_name = "PATH")]
+        recovery_sheet: Option<PathBuf>,
+        /// Language for the printable HTML recovery sheet (requires --recovery-sheet).
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = RecoverySheetLang::En,
+            requires = "recovery_sheet"
+        )]
+        recovery_sheet_lang: RecoverySheetLang,
         /// Read the outer password on line one and, with --hidden, the hidden password on line two.
         #[arg(long)]
         password_stdin: bool,
@@ -166,6 +178,24 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
     },
+    /// Generate an offline printable HTML recovery sheet from an existing 24-word recovery phrase.
+    RecoverySheet {
+        /// Output path for the self-contained HTML recovery sheet.
+        #[arg(short, long, value_name = "PATH")]
+        output: PathBuf,
+        /// Optional vault filename or label printed on the sheet.
+        #[arg(long, value_name = "NAME")]
+        vault_name: Option<String>,
+        /// Note on the sheet that a keyfile is bound to password unlock (not required for recovery).
+        #[arg(long)]
+        has_keyfile: bool,
+        /// Sheet language (en or tr).
+        #[arg(long, value_enum, default_value_t = RecoverySheetLang::En)]
+        lang: RecoverySheetLang,
+        /// Read the 24-word recovery phrase from stdin instead of an interactive hidden prompt.
+        #[arg(long)]
+        recovery_stdin: bool,
+    },
     /// Generate a cryptographically random password and report zxcvbn strength.
     Password {
         #[arg(long, default_value_t = 24)]
@@ -181,6 +211,21 @@ pub enum Commands {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum RecoverySheetLang {
+    En,
+    Tr,
+}
+
+impl From<RecoverySheetLang> for AppLanguage {
+    fn from(value: RecoverySheetLang) -> Self {
+        match value {
+            RecoverySheetLang::En => AppLanguage::En,
+            RecoverySheetLang::Tr => AppLanguage::Tr,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ShellAction {
     Status,
     Install,
@@ -189,6 +234,68 @@ pub enum ShellAction {
 
 const MIB: u64 = 1024 * 1024;
 const MAX_CONTAINER_MIB: u64 = rpm_core::constants::MAX_CONTAINER_SIZE / MIB;
+
+fn resolve_target_path_for_guard(path: &Path) -> Result<PathBuf, String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve working directory: {e}"))?
+            .join(path)
+    };
+    let mut cursor = abs.as_path();
+    let mut suffix = Vec::new();
+    let base = loop {
+        if cursor.exists() {
+            break fs::canonicalize(cursor)
+                .map_err(|e| format!("invalid target path {}: {e}", path.display()))?;
+        }
+        if let Some(comp) = cursor.components().next_back() {
+            suffix.push(comp);
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() && parent != cursor => cursor = parent,
+            _ => {
+                break cursor.to_path_buf();
+            }
+        }
+    };
+    let mut full = base;
+    for comp in suffix.into_iter().rev() {
+        match comp {
+            std::path::Component::Normal(part) => full.push(part),
+            std::path::Component::ParentDir => {
+                full.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    Ok(full)
+}
+
+fn check_wipe_nonexistent_targets<'a>(
+    sources: impl Iterator<Item = &'a PathBuf>,
+    targets: impl Iterator<Item = &'a PathBuf>,
+) -> Result<(), String> {
+    let mut resolved_targets = Vec::new();
+    for target in targets {
+        resolved_targets.push(resolve_target_path_for_guard(target)?);
+    }
+    if resolved_targets.is_empty() {
+        return Ok(());
+    }
+    for source in sources {
+        let src_canon = fs::canonicalize(source)
+            .map_err(|e| format!("cannot canonicalize source {}: {e}", source.display()))?;
+        if resolved_targets.iter().any(|t| t.starts_with(&src_canon)) {
+            return Err(
+                "--wipe would remove a recovery output or recovery sheet target path".into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 fn read_secret_line<R: BufRead>(
     prompt: &str,
@@ -358,6 +465,8 @@ where
             no_compress,
             wipe,
             recovery_out,
+            recovery_sheet,
+            recovery_sheet_lang,
             password_stdin,
             progress,
         } => {
@@ -371,6 +480,42 @@ where
                 if !dir.is_dir() {
                     let _ = writeln!(stderr, "Error: output directory missing: {}", dir.display());
                     return 1;
+                }
+            }
+            if let Some(rec_path) = recovery_out.as_deref() {
+                if rec_path.is_dir() {
+                    let _ = writeln!(
+                        stderr,
+                        "Error: recovery output path is a directory: {}",
+                        rec_path.display()
+                    );
+                    return 1;
+                }
+            }
+            if let Some(sheet_path) = recovery_sheet.as_deref() {
+                if sheet_path.is_dir() {
+                    let _ = writeln!(
+                        stderr,
+                        "Error: recovery sheet path is a directory: {}",
+                        sheet_path.display()
+                    );
+                    return 1;
+                }
+            }
+            if let (Some(rec_path), Some(sheet_path)) =
+                (recovery_out.as_deref(), recovery_sheet.as_deref())
+            {
+                if let (Ok(a), Ok(b)) = (
+                    resolve_target_path_for_guard(rec_path),
+                    resolve_target_path_for_guard(sheet_path),
+                ) {
+                    if a == b {
+                        let _ = writeln!(
+                            stderr,
+                            "Error: --recovery-out and --recovery-sheet cannot point to the same path"
+                        );
+                        return 1;
+                    }
                 }
             }
 
@@ -444,6 +589,13 @@ where
                     sources.iter().chain(&hidden),
                     base_dir,
                     keyfile.iter().chain(&hidden_keyfile),
+                ) {
+                    let _ = writeln!(stderr, "Error: {err}");
+                    return 1;
+                }
+                if let Err(err) = check_wipe_nonexistent_targets(
+                    sources.iter().chain(&hidden),
+                    recovery_out.iter().chain(&recovery_sheet),
                 ) {
                     let _ = writeln!(stderr, "Error: {err}");
                     return 1;
@@ -597,11 +749,11 @@ where
             } else {
                 "Outer vault recovery phrase"
             };
-            if let Some(rec_path) = recovery_out {
+            if let Some(rec_path) = recovery_out.as_deref() {
                 if let Some(parent) = rec_path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     let _ = fs::create_dir_all(parent);
                 }
-                if let Err(e) = fs::write(&rec_path, format!("{}\n", phrase.as_str())) {
+                if let Err(e) = fs::write(rec_path, format!("{}\n", phrase.as_str())) {
                     let _ = writeln!(stderr, "Error writing recovery file: {e}");
                     return 1;
                 }
@@ -610,7 +762,30 @@ where
                     "{recovery_label} written to: {}",
                     rec_path.display()
                 );
-            } else {
+            }
+            if let Some(sheet_path) = recovery_sheet.as_deref() {
+                let vault_label = created_outputs
+                    .first()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned());
+                let info = RecoverySheetInfo {
+                    phrase: phrase.as_str(),
+                    vault_label: vault_label.as_deref(),
+                    created_at_utc: None,
+                    has_keyfile: keyfile.is_some(),
+                    language: recovery_sheet_lang.into(),
+                };
+                if let Err(err) = write_recovery_sheet_html(sheet_path, &info) {
+                    let _ = writeln!(stderr, "Error writing recovery sheet: {err}");
+                    return exit_code_for_storage_error(&err);
+                }
+                let _ = writeln!(
+                    stdout,
+                    "Recovery sheet (HTML) written to: {} (print offline and delete the HTML file)",
+                    sheet_path.display()
+                );
+            }
+            if recovery_out.is_none() && recovery_sheet.is_none() {
                 let _ = writeln!(
                     stdout,
                     "\nIMPORTANT - {recovery_label} (save these 24 words):"
@@ -1130,6 +1305,52 @@ where
                 }
                 Err(err) => {
                     let _ = writeln!(stderr, "Error joining vault: {err}");
+                    exit_code_for_storage_error(&err)
+                }
+            }
+        }
+
+        Commands::RecoverySheet {
+            output,
+            vault_name,
+            has_keyfile,
+            lang,
+            recovery_stdin,
+        } => {
+            if output.is_dir() {
+                let _ = writeln!(
+                    stderr,
+                    "Error: recovery sheet output path is a directory: {}",
+                    output.display()
+                );
+                return 1;
+            }
+            let phrase =
+                match read_secret_line("24-word recovery phrase: ", recovery_stdin, false, stdin) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = writeln!(stderr, "Error: {e}");
+                        return 1;
+                    }
+                };
+            let info = RecoverySheetInfo {
+                phrase: phrase.as_str(),
+                vault_label: vault_name.as_deref(),
+                created_at_utc: None,
+                has_keyfile,
+                language: lang.into(),
+            };
+            match write_recovery_sheet_html(&output, &info) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        stdout,
+                        "Recovery sheet (HTML) written to: {} (print offline and delete the HTML file)",
+                        output.display()
+                    );
+                    0
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "Error writing recovery sheet: {err}");
                     exit_code_for_storage_error(&err)
                 }
             }

@@ -352,6 +352,12 @@ pub struct Strings {
     pub status_joining: &'static str,
     pub err_split_select_vault: &'static str,
     pub err_join_select_part: &'static str,
+
+    // Printable Recovery Sheet (HTML)
+    pub btn_save_recovery_sheet: &'static str,
+    pub modal_rec_sheet_note: &'static str,
+    pub status_rec_sheet_saved: &'static str,
+    pub err_rec_sheet_save: &'static str,
 }
 
 pub const TR: Strings = Strings {
@@ -685,6 +691,11 @@ pub const TR: Strings = Strings {
     status_joining: "Parçalı kasa birleştiriliyor...",
     err_split_select_vault: "Bölmek için mevcut bir kasa dosyası seçin",
     err_join_select_part: "Birleştirmek için mevcut bir parça dosyası (.001) seçin",
+
+    btn_save_recovery_sheet: "Yazdırılabilir Kart Kaydet (.html)...",
+    modal_rec_sheet_note: "İsteğe bağlı: Kartı HTML olarak kaydedip çevrimdışı yazdırın; yazdırdıktan sonra HTML dosyasını diskten silin.",
+    status_rec_sheet_saved: "Yazdırılabilir kurtarma kartı kaydedildi — çevrimdışı yazdırıp HTML dosyasını silin",
+    err_rec_sheet_save: "Kurtarma kartı kaydedilemedi",
 };
 
 pub const EN: Strings = Strings {
@@ -1018,6 +1029,11 @@ pub const EN: Strings = Strings {
     status_joining: "Joining split volume parts...",
     err_split_select_vault: "Select an existing vault file to split",
     err_join_select_part: "Select an existing split volume part (.001) to join",
+
+    btn_save_recovery_sheet: "Save Printable Sheet (.html)...",
+    modal_rec_sheet_note: "Optional: Save a printable HTML sheet, print offline, then delete the HTML file from disk.",
+    status_rec_sheet_saved: "Printable recovery sheet saved — print offline and delete the HTML file",
+    err_rec_sheet_save: "Failed to save recovery sheet",
 };
 
 pub fn strings(lang: AppLanguage) -> &'static Strings {

@@ -7,7 +7,10 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 use rpm_core::{entropy_to_mnemonic, generate_recovery_entropy};
 use rpm_storage::config::AppLanguage;
-use rpm_storage::{check_compartment_sources, check_wipe_targets, StorageError, MAX_SPLIT_PARTS};
+use rpm_storage::{
+    check_compartment_sources, check_wipe_targets, suggested_recovery_sheet_filename,
+    write_recovery_sheet_html, RecoverySheetInfo, StorageError, MAX_SPLIT_PARTS,
+};
 use zeroize::Zeroizing;
 
 use crate::estimator::{rs_wire_size, ContainerFitStatus, SplitEstimateStatus};
@@ -33,6 +36,22 @@ fn split_size_error_msg(err: SplitSizeError, s: &'static Strings) -> &'static st
         SplitSizeError::InvalidCustomValue => s.err_split_invalid_mb,
         SplitSizeError::OutOfRange => s.err_split_out_of_range,
         SplitSizeError::TooManyParts => s.err_split_too_many_parts,
+    }
+}
+
+fn suggested_vault_label_for_sheet(sources: &[PathBuf], is_split: bool) -> String {
+    let base_name = if sources.len() == 1 {
+        sources[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Archive".into())
+    } else {
+        "Archive".into()
+    };
+    if is_split {
+        format!("{base_name}.vault.001")
+    } else {
+        format!("{base_name}.vault")
     }
 }
 
@@ -806,6 +825,7 @@ pub fn ui(
     let mut launch = false;
     let mut close_modal = false;
     let mut copy_phrase_now: Option<String> = None;
+    let mut save_sheet_phrase: Option<Zeroizing<String>> = None;
     let enable_hidden_now = state.encrypt.enable_hidden;
     if let Some(prompt) = state.encrypt.recovery_prompt.as_mut() {
         egui::Window::new(s.modal_rec_title)
@@ -826,15 +846,20 @@ pub fn ui(
                         .desired_rows(3)
                         .font(egui::TextStyle::Monospace),
                 );
+                ui.add_space(4.0);
+                ui.weak(s.modal_rec_sheet_note);
                 ui.add_space(6.0);
                 ui.checkbox(&mut prompt.confirmed, s.modal_rec_confirm);
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button(s.btn_cancel).clicked() {
                         close_modal = true;
                     }
                     if ui.button(s.btn_copy_phrase).clicked() {
                         copy_phrase_now = Some(prompt.phrase.clone());
+                    }
+                    if ui.button(s.btn_save_recovery_sheet).clicked() {
+                        save_sheet_phrase = Some(Zeroizing::new(prompt.phrase.clone()));
                     }
                     ui.add_enabled_ui(prompt.confirmed, |ui| {
                         if ui
@@ -850,6 +875,32 @@ pub fn ui(
 
     if let Some(phrase) = copy_phrase_now {
         state.copy_secret_with_autoclear(ctx, phrase, s.status_rec_copied);
+    }
+
+    if let Some(phrase) = save_sheet_phrase {
+        let is_split = !matches!(state.encrypt.split_preset, SplitSizePreset::None);
+        let vault_label = suggested_vault_label_for_sheet(&state.encrypt.sources, is_split);
+        let default_name = suggested_recovery_sheet_filename(Some(&vault_label));
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("HTML Printable Sheet", &["html"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            let info = RecoverySheetInfo {
+                phrase: phrase.as_str(),
+                vault_label: Some(&vault_label),
+                created_at_utc: None,
+                has_keyfile: state.encrypt.keyfile.is_some(),
+                language: state.config.language,
+            };
+            match write_recovery_sheet_html(&path, &info) {
+                Ok(()) => state.set_status(
+                    format!("{}: {}", s.status_rec_sheet_saved, path.display()),
+                    false,
+                ),
+                Err(err) => state.set_status(format!("{}: {err}", s.err_rec_sheet_save), true),
+            }
+        }
     }
 
     if close_modal {

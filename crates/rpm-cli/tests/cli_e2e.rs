@@ -514,3 +514,234 @@ fn cli_progress_modes_and_meter_formatting() {
     assert_eq!(format_eta(Duration::from_secs(125)), "2m 05s");
     assert_eq!(format_eta(Duration::from_secs(3660)), "1h 01m");
 }
+
+fn extract_words_from_recovery_sheet(html: &str) -> Vec<String> {
+    let marker = r#"<span class="word-text">"#;
+    let mut words = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find(marker) {
+        let after = &rest[pos + marker.len()..];
+        let end = after.find("</span>").expect("closing </span> for word");
+        words.push(after[..end].to_owned());
+        rest = &after[end + "</span>".len()..];
+    }
+    words
+}
+
+#[test]
+fn cli_recovery_sheet_encrypt_round_trip_and_standalone_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("secret.txt");
+    let payload = b"recovery sheet offline round-trip payload!";
+    fs::write(&src, payload).unwrap();
+
+    let vaults_dir = dir.path().join("vaults");
+    fs::create_dir_all(&vaults_dir).unwrap();
+    let sheet_tr = dir.path().join("cards").join("secret-tr.html");
+
+    // 1. Help must never expose a --phrase / --recovery-phrase flag (INV-02)
+    let mut rs_help_out = Vec::new();
+    let mut rs_help_err = Vec::new();
+    let help_code = run_cli_args(
+        ["rpm-encrypter-cli", "recovery-sheet", "--help"],
+        &mut Cursor::new(Vec::new()),
+        &mut rs_help_out,
+        &mut rs_help_err,
+        None,
+    );
+    assert_eq!(help_code, 0);
+    let help_txt = String::from_utf8(rs_help_out).unwrap();
+    assert!(!help_txt.contains("--phrase"));
+    assert!(!help_txt.contains("--recovery-phrase"));
+
+    // 2. --recovery-sheet-lang without --recovery-sheet is rejected by clap (exit 2)
+    let mut lang_err = Vec::new();
+    let lang_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "--recovery-sheet-lang",
+            "tr",
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"Pw123!@#\n".to_vec()),
+        &mut Vec::new(),
+        &mut lang_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(lang_code, 2);
+
+    // 3. Encrypt with --recovery-sheet + --recovery-sheet-lang tr
+    let mut enc_out = Vec::new();
+    let mut enc_err = Vec::new();
+    let enc_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "-o",
+            vaults_dir.to_str().unwrap(),
+            "--recovery-sheet",
+            sheet_tr.to_str().unwrap(),
+            "--recovery-sheet-lang",
+            "tr",
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"SheetPw!2026\n".to_vec()),
+        &mut enc_out,
+        &mut enc_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(enc_code, 0, "stderr: {}", String::from_utf8_lossy(&enc_err));
+    let enc_stdout = String::from_utf8(enc_out).unwrap();
+    assert!(enc_stdout.contains("Recovery sheet (HTML) written to:"));
+    assert!(
+        !enc_stdout.contains("IMPORTANT -"),
+        "phrase must not be printed to stdout when --recovery-sheet is set: {enc_stdout}"
+    );
+
+    let html_tr = fs::read_to_string(&sheet_tr).unwrap();
+    assert!(html_tr.contains(r#"<html lang="tr">"#));
+    assert!(html_tr.contains("default-src 'none'; style-src 'unsafe-inline';"));
+    assert!(!html_tr.contains("<script"));
+    assert!(!html_tr.contains("http://") && !html_tr.contains("https://"));
+    assert!(html_tr.contains("secret.txt.vault"));
+
+    let words = extract_words_from_recovery_sheet(&html_tr);
+    assert_eq!(words.len(), 24);
+    let phrase = words.join(" ");
+    assert!(!enc_stdout.contains(&phrase));
+
+    // 4. Decrypt the created vault using ONLY the 24 words extracted from the HTML sheet
+    let vault = vaults_dir.join("secret.txt.vault");
+    assert!(vault.is_file());
+    let dec_dir = dir.path().join("restored");
+    fs::create_dir_all(&dec_dir).unwrap();
+    let mut dec_err = Vec::new();
+    let dec_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "decrypt",
+            vault.to_str().unwrap(),
+            "-o",
+            dec_dir.to_str().unwrap(),
+            "--recovery-stdin",
+        ],
+        &mut Cursor::new(format!("{phrase}\n").into_bytes()),
+        &mut Vec::new(),
+        &mut dec_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(dec_code, 0, "stderr: {}", String::from_utf8_lossy(&dec_err));
+    assert_eq!(fs::read(dec_dir.join("secret.txt")).unwrap(), payload);
+
+    // 5. Standalone `recovery-sheet` subcommand (EN + --has-keyfile)
+    let sheet_en = dir.path().join("backup-en.html");
+    let mut standalone_out = Vec::new();
+    let mut standalone_err = Vec::new();
+    let st_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "recovery-sheet",
+            "-o",
+            sheet_en.to_str().unwrap(),
+            "--vault-name",
+            "Backup.vault",
+            "--has-keyfile",
+            "--lang",
+            "en",
+            "--recovery-stdin",
+        ],
+        &mut Cursor::new(format!("{phrase}\n").into_bytes()),
+        &mut standalone_out,
+        &mut standalone_err,
+        None,
+    );
+    assert_eq!(
+        st_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&standalone_err)
+    );
+    let html_en = fs::read_to_string(&sheet_en).unwrap();
+    assert!(html_en.contains(r#"<html lang="en">"#));
+    assert!(html_en.contains("Backup.vault"));
+    assert!(html_en.contains("Bound for password unlock — NOT required for 24-word recovery"));
+    assert_eq!(extract_words_from_recovery_sheet(&html_en), words);
+
+    // 6. Invalid mnemonic rejected cleanly without creating the file
+    let bad_sheet = dir.path().join("bad.html");
+    let bad_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "recovery-sheet",
+            "-o",
+            bad_sheet.to_str().unwrap(),
+            "--recovery-stdin",
+        ],
+        &mut Cursor::new(b"not a valid bip39 phrase\n".to_vec()),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        None,
+    );
+    assert_ne!(bad_code, 0);
+    assert!(!bad_sheet.exists());
+
+    // 7. --wipe refuses a --recovery-sheet target inside a wiped source folder without wiping
+    let wipe_dir = dir.path().join("wipe_src");
+    fs::create_dir_all(&wipe_dir).unwrap();
+    let victim = wipe_dir.join("keep.txt");
+    fs::write(&victim, b"must survive").unwrap();
+    let safe_out = dir.path().join("safe_out");
+    fs::create_dir_all(&safe_out).unwrap();
+    let bad_target = wipe_dir.join("nested").join("sheet.html");
+    let mut wipe_err = Vec::new();
+    let wipe_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            wipe_dir.to_str().unwrap(),
+            "-o",
+            safe_out.to_str().unwrap(),
+            "--wipe",
+            "--recovery-sheet",
+            bad_target.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"WipeGuard!1\n".to_vec()),
+        &mut Vec::new(),
+        &mut wipe_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_ne!(wipe_code, 0);
+    assert!(String::from_utf8_lossy(&wipe_err).contains("--wipe"));
+    assert!(
+        victim.is_file(),
+        "source file must not be wiped on guard failure"
+    );
+
+    // 8. --recovery-out and --recovery-sheet pointing to the same path is rejected
+    let dup = dir.path().join("same_target.html");
+    let mut dup_err = Vec::new();
+    let dup_code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "-o",
+            safe_out.to_str().unwrap(),
+            "--recovery-out",
+            dup.to_str().unwrap(),
+            "--recovery-sheet",
+            dup.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"DupGuard!1\n".to_vec()),
+        &mut Vec::new(),
+        &mut dup_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_ne!(dup_code, 0);
+    assert!(String::from_utf8_lossy(&dup_err).contains("same path"));
+}
