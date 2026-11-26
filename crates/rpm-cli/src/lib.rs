@@ -15,18 +15,20 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use rpm_core::{
     entropy_to_mnemonic, generate_recovery_entropy, hash_keyfile_reader,
-    inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, CryptoError, EncryptOptions,
-    HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
+    inspect_header_seekable_with_kdf_and_threads, mnemonic_to_entropy, Auth, CryptoError,
+    EncryptOptions, HiddenEncryptOptions, KdfParams, SecretKey, VaultMetadata,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::shell_integration;
 use rpm_storage::{
-    check_compartment_sources, check_vault_integrity_with_parts, check_wipe_targets,
-    decrypt_vault_v5_with_stealth_kdf, discover_split_parts, encrypt_hidden_sources_v5,
-    encrypt_hidden_sources_v5_split, encrypt_sources_v5, encrypt_sources_v5_split,
-    join_vault_parts, open_vault_reader, path_dedup_key, rekey_vault_v5, split_vault_file,
-    unique_path, unique_split_base, validate_split_bounds, write_recovery_sheet_html, PathDedupKey,
-    RecoverySheetInfo, SecureWiper, SplitDiscoveryCache, StorageError,
+    check_compartment_sources, check_vault_integrity_with_parts_and_threads, check_wipe_targets,
+    decrypt_vault_v5_with_stealth_kdf_and_threads, discover_split_parts,
+    encrypt_hidden_sources_v5_split_with_threads, encrypt_hidden_sources_v5_with_threads,
+    encrypt_sources_v5_split_with_threads, encrypt_sources_v5_with_threads, join_vault_parts,
+    open_vault_reader, path_dedup_key, rekey_vault_v5, repair_vault_v5_with_threads,
+    split_vault_file, unique_path, unique_split_base, validate_split_bounds,
+    write_recovery_sheet_html, PathDedupKey, RecoverySheetInfo, SecureWiper, SplitDiscoveryCache,
+    StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -98,6 +100,9 @@ pub enum Commands {
         /// Progress display on stderr: auto (TTY only), always, or never.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
+        /// Worker threads for parallel AEAD/RS pipeline (0 = auto-detect CPU cores, 1 = single-threaded).
+        #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=MAX_PIPELINE_THREADS_I64))]
+        threads: u16,
     },
     /// Decrypt one or more .vault files using streaming Chunked AEAD authentication.
     Decrypt {
@@ -119,6 +124,9 @@ pub enum Commands {
         /// Progress display on stderr: auto (TTY only), always, or never.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
+        /// Worker threads for parallel AEAD/RS pipeline (0 = auto-detect CPU cores, 1 = single-threaded).
+        #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=MAX_PIPELINE_THREADS_I64))]
+        threads: u16,
     },
     /// Inspect vault integrity (passwordless) or encrypted metadata (header-only).
     Inspect {
@@ -135,6 +143,9 @@ pub enum Commands {
         recovery: bool,
         #[arg(long, conflicts_with_all = ["password_stdin", "recovery"])]
         recovery_stdin: bool,
+        /// Worker threads for parallel Reed-Solomon scanning/header decoding (0 = auto-detect CPU cores, 1 = single-threaded).
+        #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=MAX_PIPELINE_THREADS_I64))]
+        threads: u16,
     },
     /// Repair a Reed-Solomon envelope without a password (in place by default).
     Repair {
@@ -143,6 +154,9 @@ pub enum Commands {
         output: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Worker threads for parallel Reed-Solomon block repair (0 = auto-detect CPU cores, 1 = single-threaded).
+        #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=MAX_PIPELINE_THREADS_I64))]
+        threads: u16,
     },
     /// Rotate a vault password (and optionally keyfile) in O(1) without decrypting payload.
     Rekey {
@@ -234,6 +248,7 @@ pub enum ShellAction {
 
 const MIB: u64 = 1024 * 1024;
 const MAX_CONTAINER_MIB: u64 = rpm_core::constants::MAX_CONTAINER_SIZE / MIB;
+const MAX_PIPELINE_THREADS_I64: i64 = rpm_core::MAX_PIPELINE_THREADS as i64;
 
 fn resolve_target_path_for_guard(path: &Path) -> Result<PathBuf, String> {
     let abs = if path.is_absolute() {
@@ -469,6 +484,7 @@ where
             recovery_sheet_lang,
             password_stdin,
             progress,
+            threads,
         } => {
             for s in sources.iter().chain(&hidden) {
                 if !s.exists() {
@@ -617,23 +633,25 @@ where
                     ..Default::default()
                 };
                 if let Some(part_bytes) = split_part_bytes {
-                    encrypt_sources_v5_split(
+                    encrypt_sources_v5_split_with_threads(
                         &sources,
                         &out_vault,
                         part_bytes,
                         password.as_bytes(),
                         &opts,
+                        usize::from(threads),
                         reporter.callback(),
                         Arc::clone(&cancel),
                         |_| {},
                     )
                     .map(|(_, _, parts)| parts)
                 } else {
-                    encrypt_sources_v5(
+                    encrypt_sources_v5_with_threads(
                         &sources,
                         &out_vault,
                         password.as_bytes(),
                         &opts,
+                        usize::from(threads),
                         reporter.callback(),
                         Arc::clone(&cancel),
                         |_| {},
@@ -674,7 +692,7 @@ where
                     ..Default::default()
                 };
                 if let Some(part_bytes) = split_part_bytes {
-                    encrypt_hidden_sources_v5_split(
+                    encrypt_hidden_sources_v5_split_with_threads(
                         &sources,
                         &hidden,
                         &out_vault,
@@ -682,19 +700,21 @@ where
                         password.as_bytes(),
                         hidden_password.as_bytes(),
                         &opts,
+                        usize::from(threads),
                         reporter.callback(),
                         Arc::clone(&cancel),
                         |_| {},
                     )
                     .map(|(_, _, _, parts)| parts)
                 } else {
-                    encrypt_hidden_sources_v5(
+                    encrypt_hidden_sources_v5_with_threads(
                         &sources,
                         &hidden,
                         &out_vault,
                         password.as_bytes(),
                         hidden_password.as_bytes(),
                         &opts,
+                        usize::from(threads),
                         reporter.callback(),
                         Arc::clone(&cancel),
                         |_| {},
@@ -804,6 +824,7 @@ where
             recovery,
             recovery_stdin,
             progress,
+            threads,
         } => {
             for v in &vaults {
                 if !v.is_file() {
@@ -924,12 +945,13 @@ where
                     "Decrypting".to_string()
                 };
                 let reporter = CliProgressReporter::new(progress, stderr_is_tty, label);
-                let dec_res = decrypt_vault_v5_with_stealth_kdf(
+                let dec_res = decrypt_vault_v5_with_stealth_kdf_and_threads(
                     v,
                     target_root,
                     auth_for_vault,
                     (!only.is_empty()).then_some(only.as_slice()),
                     &kdf,
+                    usize::from(threads),
                     reporter.callback(),
                     Arc::clone(&cancel),
                 );
@@ -961,13 +983,14 @@ where
             password_stdin,
             recovery,
             recovery_stdin,
+            threads,
         } => {
             if !vault.is_file() {
                 let _ = writeln!(stderr, "Error: vault not found: {}", vault.display());
                 return 1;
             }
             if integrity_only {
-                match check_vault_integrity_with_parts(&vault) {
+                match check_vault_integrity_with_parts_and_threads(&vault, usize::from(threads)) {
                     Ok((rep, split_parts)) => {
                         if json {
                             let val = serde_json::json!({
@@ -1083,7 +1106,12 @@ where
                 }
             };
 
-            match inspect_header_seekable_with_kdf(&mut reader, auth, &kdf) {
+            match inspect_header_seekable_with_kdf_and_threads(
+                &mut reader,
+                auth,
+                &kdf,
+                usize::from(threads),
+            ) {
                 Ok(info) => {
                     if json {
                         let val = serde_json::json!({
@@ -1145,12 +1173,18 @@ where
             vault,
             output,
             json,
+            threads,
         } => {
             if !vault.is_file() {
                 let _ = writeln!(stderr, "Error: vault not found: {}", vault.display());
                 return 1;
             }
-            match rpm_storage::repair_vault_v5(&vault, output.as_deref(), cancel) {
+            match repair_vault_v5_with_threads(
+                &vault,
+                output.as_deref(),
+                usize::from(threads),
+                cancel,
+            ) {
                 Ok(report) => {
                     if json {
                         let _ =

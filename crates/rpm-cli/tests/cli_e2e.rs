@@ -745,3 +745,202 @@ fn cli_recovery_sheet_encrypt_round_trip_and_standalone_subcommand() {
     assert_ne!(dup_code, 0);
     assert!(String::from_utf8_lossy(&dup_err).contains("same path"));
 }
+
+#[test]
+fn cli_threads_flag_works_across_encrypt_decrypt_inspect_and_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    let data: Vec<u8> = (0..(256 * 1024 + 517)).map(|i| (i % 241) as u8).collect();
+    fs::write(&src, &data).unwrap();
+
+    let out_dir = dir.path().join("vaults");
+    fs::create_dir(&out_dir).unwrap();
+
+    // 1. Encrypt with RS + explicit --threads 4
+    let mut enc_out = Vec::new();
+    let mut enc_err = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--reed-solomon",
+            "--no-compress",
+            "--threads",
+            "4",
+            "--password-stdin",
+        ],
+        &mut Cursor::new(b"ThreadPw!1\n".to_vec()),
+        &mut enc_out,
+        &mut enc_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(
+        code,
+        0,
+        "encrypt failed: {}",
+        String::from_utf8_lossy(&enc_err)
+    );
+    let vault = out_dir.join("payload.bin.vault");
+    assert!(vault.is_file());
+
+    // 2. Corrupt 512 bytes in block 1 and verify inspect --integrity-only --threads 2 detects & counts repairs
+    let mut damaged = fs::read(&vault).unwrap();
+    for b in &mut damaged[48 + 16320 + 10..48 + 16320 + 522] {
+        *b ^= 0xA5;
+    }
+    fs::write(&vault, &damaged).unwrap();
+
+    let mut ins_out = Vec::new();
+    let mut ins_err = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "inspect",
+            vault.to_str().unwrap(),
+            "--integrity-only",
+            "--json",
+            "--threads",
+            "2",
+        ],
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut ins_out,
+        &mut ins_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(
+        code,
+        0,
+        "inspect failed: {}",
+        String::from_utf8_lossy(&ins_err)
+    );
+    let val: serde_json::Value = serde_json::from_slice(&ins_out).unwrap();
+    assert_eq!(val["ok"], true);
+    assert_eq!(val["rs_repaired_bytes"], 512);
+
+    // 3. Repair with --threads 4
+    let repaired = dir.path().join("repaired.vault");
+    let mut rep_out = Vec::new();
+    let mut rep_err = Vec::new();
+    let code = run_cli_args(
+        [
+            "rpm-encrypter-cli",
+            "repair",
+            vault.to_str().unwrap(),
+            "-o",
+            repaired.to_str().unwrap(),
+            "--json",
+            "--threads",
+            "4",
+        ],
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut rep_out,
+        &mut rep_err,
+        Some(KdfParams::fast_test()),
+    );
+    assert_eq!(
+        code,
+        0,
+        "repair failed: {}",
+        String::from_utf8_lossy(&rep_err)
+    );
+    let rval: serde_json::Value = serde_json::from_slice(&rep_out).unwrap();
+    assert_eq!(rval["repaired_bytes"], 512);
+
+    // 4. Decrypt with --threads 1 and --threads 4 and verify identical payload
+    for threads in ["1", "4"] {
+        let dec_dir = dir.path().join(format!("dec_{threads}"));
+        fs::create_dir(&dec_dir).unwrap();
+        let mut dec_out = Vec::new();
+        let mut dec_err = Vec::new();
+        let code = run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "decrypt",
+                repaired.to_str().unwrap(),
+                "-o",
+                dec_dir.to_str().unwrap(),
+                "--threads",
+                threads,
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"ThreadPw!1\n".to_vec()),
+            &mut dec_out,
+            &mut dec_err,
+            Some(KdfParams::fast_test()),
+        );
+        assert_eq!(
+            code,
+            0,
+            "decrypt threads={threads} failed: {}",
+            String::from_utf8_lossy(&dec_err)
+        );
+        assert_eq!(fs::read(dec_dir.join("payload.bin")).unwrap(), data);
+    }
+
+    // 5. Diff damaged vs repaired RS vault with --threads 1 and --threads 4
+    for threads in ["1", "4"] {
+        let mut diff_out = Vec::new();
+        let mut diff_err = Vec::new();
+        let code = run_cli_args(
+            [
+                "rpm-encrypter-cli",
+                "diff",
+                vault.to_str().unwrap(),
+                repaired.to_str().unwrap(),
+                "--json",
+                "--threads",
+                threads,
+                "--password-stdin",
+            ],
+            &mut Cursor::new(b"ThreadPw!1\nThreadPw!1\n".to_vec()),
+            &mut diff_out,
+            &mut diff_err,
+            Some(KdfParams::fast_test()),
+        );
+        assert_eq!(
+            code,
+            0,
+            "diff threads={threads} failed: {}",
+            String::from_utf8_lossy(&diff_err)
+        );
+        let dval: serde_json::Value = serde_json::from_slice(&diff_out).unwrap();
+        assert_eq!(dval["unchanged"][0]["path"], "payload.bin");
+        assert!(dval["added"].as_array().unwrap().is_empty());
+        assert!(dval["removed"].as_array().unwrap().is_empty());
+        assert!(dval["changed"].as_array().unwrap().is_empty());
+    }
+
+    // 6. Out-of-range --threads rejected by clap with exit code 2
+    for args in [
+        vec![
+            "rpm-encrypter-cli",
+            "encrypt",
+            src.to_str().unwrap(),
+            "--threads",
+            "999",
+            "--password-stdin",
+        ],
+        vec![
+            "rpm-encrypter-cli",
+            "diff",
+            vault.to_str().unwrap(),
+            repaired.to_str().unwrap(),
+            "--threads",
+            "999",
+            "--password-stdin",
+        ],
+    ] {
+        let mut bad_err = Vec::new();
+        let bad_code = run_cli_args(
+            args,
+            &mut Cursor::new(b"pw\npw\n".to_vec()),
+            &mut Vec::new(),
+            &mut bad_err,
+            Some(KdfParams::fast_test()),
+        );
+        assert_eq!(bad_code, 2);
+    }
+}

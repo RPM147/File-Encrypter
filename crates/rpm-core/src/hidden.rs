@@ -31,13 +31,11 @@ use crate::header::{
     decrypt_metadata, random_dek, read_header_and_meta, unlock_dek, Auth, VaultHeader,
     VaultMetadata,
 };
-use crate::kdf::{
-    derive_hidden_frame_mask, derive_hidden_kek, derive_stream_nonce_prefix, KdfParams,
-};
+use crate::kdf::{derive_hidden_kek, derive_stream_nonce_prefix, KdfParams};
 use crate::mem::SecretKey;
+use crate::pipeline::{decrypt_chunks_pipeline, encrypt_chunks_pipeline, FrameMaskMode};
 use crate::vault::{
-    chunk_aad, chunk_nonce, decrypt_chunks_with_key_at, encrypt_outer_stream_raw, is_cancelled,
-    read_chunk_with_eof, write_random_padding, CountingWriter, EncryptOptions, EncryptSummary,
+    encrypt_outer_stream_raw, write_random_padding, CountingWriter, EncryptOptions, EncryptSummary,
     VaultInfo,
 };
 
@@ -325,9 +323,41 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
     hidden_progress: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<HiddenEncryptSummary, CryptoError> {
+    encrypt_hidden_stream_with_threads(
+        decoy_reader,
+        hidden_reader,
+        writer,
+        decoy_metadata,
+        hidden_metadata,
+        decoy_password,
+        hidden_password,
+        opts,
+        0,
+        decoy_progress,
+        hidden_progress,
+        cancel,
+    )
+}
+
+/// Encrypt decoy (outer) and hidden compartments using `threads` pipeline workers (`0` = auto).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_stream_with_threads<R1: Read, R2: Read, W: Write>(
+    decoy_reader: &mut R1,
+    hidden_reader: &mut R2,
+    writer: &mut W,
+    decoy_metadata: &VaultMetadata,
+    hidden_metadata: &VaultMetadata,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    threads: usize,
+    decoy_progress: impl FnMut(u64),
+    hidden_progress: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<HiddenEncryptSummary, CryptoError> {
     if opts.reed_solomon {
         crate::rs::validate_mode(opts.stealth)?;
-        let mut rs = crate::RsEncoderWriter::new(writer)?;
+        let mut rs = crate::RsEncoderWriter::with_threads(writer, threads)?;
         let summary = encrypt_hidden_inner(
             decoy_reader,
             hidden_reader,
@@ -337,6 +367,7 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
             decoy_password,
             hidden_password,
             opts,
+            threads,
             decoy_progress,
             hidden_progress,
             cancel,
@@ -353,6 +384,7 @@ pub fn encrypt_hidden_stream<R1: Read, R2: Read, W: Write>(
             decoy_password,
             hidden_password,
             opts,
+            threads,
             decoy_progress,
             hidden_progress,
             cancel,
@@ -370,8 +402,9 @@ fn encrypt_hidden_inner<R1: Read, R2: Read, W: Write>(
     decoy_password: &[u8],
     hidden_password: &[u8],
     opts: &HiddenEncryptOptions,
+    threads: usize,
     decoy_progress: impl FnMut(u64),
-    mut hidden_progress: impl FnMut(u64),
+    hidden_progress: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<HiddenEncryptSummary, CryptoError> {
     if decoy_password.is_empty() || hidden_password.is_empty() {
@@ -416,6 +449,7 @@ fn encrypt_hidden_inner<R1: Read, R2: Read, W: Write>(
         decoy_metadata,
         decoy_password,
         &outer_opts,
+        threads,
         decoy_progress,
         cancel,
     )?;
@@ -485,62 +519,20 @@ fn encrypt_hidden_inner<R1: Read, R2: Read, W: Write>(
     cw.write_all(&enc_hidden_meta)?;
 
     let stream_prefix = derive_stream_nonce_prefix(&hidden_dek, &hidden_ctx)?;
-    let mut plain_buf = Zeroizing::new(vec![0u8; opts.chunk_size as usize]);
-    let mut pending: Option<u8> = None;
-    let mut chunk_idx: u32 = 0;
-    let mut hidden_total_bytes: u64 = 0;
-
-    loop {
-        if is_cancelled(cancel) {
-            return Err(CryptoError::Cancelled);
-        }
-
-        let (len, is_final) = read_chunk_with_eof(hidden_reader, &mut plain_buf, &mut pending)?;
-        let final_flag = u8::from(is_final);
-        let plain_len_u32 = len as u32;
-        let frame_wire_len = 5u64 + (len as u64) + (AES_TAG_SIZE as u64);
-        if cw.written.saturating_add(frame_wire_len) > hidden_end_limit {
-            plain_buf[..len].zeroize();
-            return Err(CryptoError::InvalidFormat(format!(
-                "decoy + hidden compartments exceed {} byte container capacity",
-                opts.container_size_bytes
-            )));
-        }
-
-        let nonce_bytes = chunk_nonce(&stream_prefix, chunk_idx, final_flag);
-        let aad = chunk_aad(&hidden_ctx, chunk_idx, final_flag, plain_len_u32);
-        let ct = hidden_cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &plain_buf[..len],
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| CryptoError::CryptoFailure)?;
-
-        let mask = derive_hidden_frame_mask(&hidden_dek, &hidden_ctx, chunk_idx)?;
-        let mut frame = [0u8; 5];
-        frame[0..4].copy_from_slice(&plain_len_u32.to_be_bytes());
-        frame[4] = final_flag;
-        for i in 0..5 {
-            frame[i] ^= mask[i];
-        }
-
-        cw.write_all(&frame)?;
-        cw.write_all(&ct)?;
-
-        plain_buf[..len].zeroize();
-        hidden_total_bytes += len as u64;
-        hidden_progress(hidden_total_bytes);
-
-        chunk_idx = chunk_idx
-            .checked_add(1)
-            .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
-        if is_final {
-            break;
-        }
-    }
+    let remaining_for_hidden = hidden_end_limit - cw.written;
+    let (hidden_total_bytes, chunk_idx) = encrypt_chunks_pipeline(
+        hidden_reader,
+        &mut cw,
+        &hidden_dek,
+        &hidden_ctx,
+        &stream_prefix,
+        opts.chunk_size,
+        FrameMaskMode::Hidden,
+        Some((remaining_for_hidden, opts.container_size_bytes)),
+        threads,
+        hidden_progress,
+        cancel,
+    )?;
 
     let hidden_data_len = cw.written - hidden_data_offset;
     let trailing_pad = hidden_end_limit.saturating_sub(cw.written);
@@ -746,8 +738,17 @@ pub fn unlock_seekable_with_kdf<R: Read + Seek>(
     auth: Auth<'_>,
     stealth_kdf: &KdfParams,
 ) -> Result<UnlockedVault, CryptoError> {
+    unlock_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, 0)
+}
+
+pub fn unlock_seekable_with_kdf_and_threads<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+) -> Result<UnlockedVault, CryptoError> {
     if crate::rs::probe_rs_header(reader)? {
-        let mut rs = crate::RsSeekableReader::new(reader)?;
+        let mut rs = crate::RsSeekableReader::with_threads(reader, threads)?;
         let inner = unlock_inner(&mut rs, auth, stealth_kdf, true)?;
         Ok(UnlockedVault::ReedSolomon {
             inner: Box::new(inner),
@@ -842,7 +843,16 @@ pub fn inspect_header_seekable_with_kdf<R: Read + Seek>(
     auth: Auth<'_>,
     stealth_kdf: &KdfParams,
 ) -> Result<VaultInfo, CryptoError> {
-    Ok(unlock_seekable_with_kdf(reader, auth, stealth_kdf)?.vault_info())
+    inspect_header_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, 0)
+}
+
+pub fn inspect_header_seekable_with_kdf_and_threads<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+) -> Result<VaultInfo, CryptoError> {
+    Ok(unlock_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, threads)?.vault_info())
 }
 
 /// Decrypt the chunked payload of an already-unlocked outer or hidden compartment.
@@ -853,18 +863,32 @@ pub fn decrypt_unlocked_stream<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
+    decrypt_unlocked_stream_with_threads(reader, writer, unlocked, 0, progress_cb, cancel)
+}
+
+/// Decrypt the chunked payload of an already-unlocked vault using `threads` pipeline workers (`0` = auto).
+pub fn decrypt_unlocked_stream_with_threads<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    unlocked: &UnlockedVault,
+    threads: usize,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, CryptoError> {
     if let UnlockedVault::ReedSolomon { inner, .. } = unlocked {
-        let mut rs = crate::RsSeekableReader::new(reader)?;
-        decrypt_inner(&mut rs, writer, inner, progress_cb, cancel)
+        let mut rs = crate::RsSeekableReader::with_threads(reader, threads)?;
+        decrypt_inner(&mut rs, writer, inner, threads, progress_cb, cancel)
     } else {
-        decrypt_inner(reader, writer, unlocked, progress_cb, cancel)
+        decrypt_inner(reader, writer, unlocked, threads, progress_cb, cancel)
     }
 }
+
 fn decrypt_inner<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
     unlocked: &UnlockedVault,
-    mut progress_cb: impl FnMut(u64),
+    threads: usize,
+    progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
     match unlocked {
@@ -878,7 +902,19 @@ fn decrypt_inner<R: Read + Seek, W: Write>(
             ..
         } => {
             reader.seek(SeekFrom::Start(*hdr_len))?;
-            decrypt_chunks_with_key_at(reader, writer, header, *hdr_len, dek, progress_cb, cancel)
+            crate::vault::decrypt_outer_chunks(
+                reader,
+                writer,
+                header.chunk_size,
+                header.container_size,
+                *hdr_len,
+                dek,
+                header.payload_context(),
+                false,
+                threads,
+                progress_cb,
+                cancel,
+            )
         }
         UnlockedVault::Stealth {
             info,
@@ -896,6 +932,7 @@ fn decrypt_inner<R: Read + Seek, W: Write>(
                 dek,
                 *ctx,
                 true,
+                threads,
                 progress_cb,
                 cancel,
             )
@@ -910,91 +947,25 @@ fn decrypt_inner<R: Read + Seek, W: Write>(
             ..
         } => {
             let meta_bytes = *encrypted_meta_len as u64;
+            let payload_len = hidden_data_len
+                .checked_sub(meta_bytes)
+                .ok_or(CryptoError::AuthenticationFailed)?;
             reader.seek(SeekFrom::Start(*hidden_data_offset + meta_bytes))?;
             let prefix = derive_stream_nonce_prefix(hidden_dek, hidden_ctx)?;
-            let cipher = Aes256Gcm::new_from_slice(hidden_dek.as_bytes())
-                .map_err(|_| CryptoError::CryptoFailure)?;
 
-            let mut consumed = meta_bytes;
-            let mut chunk_idx: u32 = 0;
-            let mut total_bytes: u64 = 0;
-            let mut ct_buf: Vec<u8> = Vec::new();
-
-            loop {
-                if is_cancelled(cancel) {
-                    return Err(CryptoError::Cancelled);
-                }
-                if consumed.saturating_add(5) > *hidden_data_len {
-                    return Err(CryptoError::AuthenticationFailed);
-                }
-                let mut frame = [0u8; 5];
-                reader.read_exact(&mut frame).map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        CryptoError::AuthenticationFailed
-                    } else {
-                        CryptoError::Io(e)
-                    }
-                })?;
-
-                let mask = derive_hidden_frame_mask(hidden_dek, hidden_ctx, chunk_idx)?;
-                for i in 0..5 {
-                    frame[i] ^= mask[i];
-                }
-                let plain_len = u32::from_be_bytes(frame[0..4].try_into().unwrap());
-                let final_flag = frame[4];
-                if plain_len > *chunk_size || final_flag > 1 || (plain_len == 0 && final_flag == 0)
-                {
-                    return Err(CryptoError::AuthenticationFailed);
-                }
-
-                let ct_len = (plain_len as usize) + AES_TAG_SIZE;
-                let frame_total = 5u64
-                    .checked_add(ct_len as u64)
-                    .ok_or(CryptoError::AuthenticationFailed)?;
-                if consumed.saturating_add(frame_total) > *hidden_data_len {
-                    return Err(CryptoError::AuthenticationFailed);
-                }
-                consumed += frame_total;
-
-                ct_buf.resize(ct_len, 0);
-                reader.read_exact(&mut ct_buf).map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        CryptoError::AuthenticationFailed
-                    } else {
-                        CryptoError::Io(e)
-                    }
-                })?;
-
-                let nonce_bytes = chunk_nonce(&prefix, chunk_idx, final_flag);
-                let aad = chunk_aad(hidden_ctx, chunk_idx, final_flag, plain_len);
-                let mut plain = Zeroizing::new(
-                    cipher
-                        .decrypt(
-                            Nonce::from_slice(&nonce_bytes),
-                            Payload {
-                                msg: &ct_buf,
-                                aad: &aad,
-                            },
-                        )
-                        .map_err(|_| CryptoError::AuthenticationFailed)?,
-                );
-                if !plain.is_empty() {
-                    writer.write_all(&plain)?;
-                    plain.zeroize();
-                }
-                total_bytes += plain_len as u64;
-                progress_cb(total_bytes);
-
-                if final_flag == 1 {
-                    if consumed != *hidden_data_len {
-                        return Err(CryptoError::AuthenticationFailed);
-                    }
-                    break;
-                }
-                chunk_idx = chunk_idx
-                    .checked_add(1)
-                    .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
-            }
+            let (total_bytes, _consumed) = decrypt_chunks_pipeline(
+                reader,
+                writer,
+                hidden_dek,
+                hidden_ctx,
+                &prefix,
+                *chunk_size,
+                FrameMaskMode::Hidden,
+                Some(payload_len),
+                threads,
+                progress_cb,
+                cancel,
+            )?;
 
             writer.flush()?;
             Ok(total_bytes)
@@ -1010,11 +981,32 @@ pub fn decrypt_stream_seekable<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
-    decrypt_stream_seekable_with_kdf(
+    decrypt_stream_seekable_with_kdf_and_threads(
         reader,
         writer,
         auth,
         &crate::STEALTH_KDF_PARAMS,
+        0,
+        progress_cb,
+        cancel,
+    )
+}
+
+/// Transparently unlock and stream-decrypt using `threads` pipeline workers (`0` = auto).
+pub fn decrypt_stream_seekable_with_threads<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    auth: Auth<'_>,
+    threads: usize,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<VaultMetadata, CryptoError> {
+    decrypt_stream_seekable_with_kdf_and_threads(
+        reader,
+        writer,
+        auth,
+        &crate::STEALTH_KDF_PARAMS,
+        threads,
         progress_cb,
         cancel,
     )
@@ -1028,7 +1020,27 @@ pub fn decrypt_stream_seekable_with_kdf<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
-    let unlocked = unlock_seekable_with_kdf(reader, auth, stealth_kdf)?;
-    decrypt_unlocked_stream(reader, writer, &unlocked, progress_cb, cancel)?;
+    decrypt_stream_seekable_with_kdf_and_threads(
+        reader,
+        writer,
+        auth,
+        stealth_kdf,
+        0,
+        progress_cb,
+        cancel,
+    )
+}
+
+pub fn decrypt_stream_seekable_with_kdf_and_threads<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<VaultMetadata, CryptoError> {
+    let unlocked = unlock_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, threads)?;
+    decrypt_unlocked_stream_with_threads(reader, writer, &unlocked, threads, progress_cb, cancel)?;
     Ok(unlocked.metadata().clone())
 }

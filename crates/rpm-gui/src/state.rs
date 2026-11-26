@@ -282,6 +282,7 @@ impl BuiltinEncryptPreset {
 
 pub const ARGON_ITERATIONS_RANGE: RangeInclusive<u32> = 1..=10;
 pub const ARGON_PARALLELISM_RANGE: RangeInclusive<u32> = 1..=16;
+pub const PIPELINE_THREADS_PRESETS: [u16; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 
 pub const PWGEN_UPPERCASE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 pub const PWGEN_LOWERCASE: &[u8] = b"abcdefghijklmnopqrstuvwxyz";

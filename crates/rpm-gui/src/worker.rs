@@ -9,17 +9,19 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
-    diff_metadata, hash_keyfile_reader, inspect_header_seekable, mnemonic_to_entropy, Auth,
-    CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport, KdfParams, SecretKey,
-    VaultDiff, VaultInfo,
+    diff_metadata, hash_keyfile_reader, inspect_header_seekable_with_kdf_and_threads,
+    mnemonic_to_entropy, Auth, CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport,
+    KdfParams, SecretKey, VaultDiff, VaultInfo, STEALTH_KDF_PARAMS,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
-    check_compartment_sources, check_vault_integrity_with_parts, check_wipe_targets,
-    decrypt_vault_selected_v5, decrypt_vault_v5, discover_split_parts, encrypt_hidden_sources_v5,
-    encrypt_hidden_sources_v5_split, encrypt_sources_v5, encrypt_sources_v5_split,
-    join_vault_parts, open_vault_reader, rekey_vault_v5, split_vault_file, unique_path,
-    unique_split_base, SecureWiper, StorageError,
+    check_compartment_sources, check_vault_integrity_with_parts_and_threads, check_wipe_targets,
+    decrypt_vault_v5_with_stealth_kdf_and_threads, discover_split_parts,
+    encrypt_hidden_sources_v5_split_with_threads, encrypt_hidden_sources_v5_with_threads,
+    encrypt_sources_v5_split_with_threads, encrypt_sources_v5_with_threads,
+    extract_entry_to_memory_v5_with_stealth_kdf_and_threads, join_vault_parts, open_vault_reader,
+    rekey_vault_v5, repair_vault_v5_with_threads, split_vault_file, unique_path, unique_split_base,
+    SecureWiper, StorageError,
 };
 use zeroize::Zeroizing;
 
@@ -599,6 +601,49 @@ pub fn spawn_encrypt_with_split(
     kdf: KdfParams,
     lang: AppLanguage,
 ) {
+    spawn_encrypt_with_split_and_threads(
+        ctx,
+        tx,
+        cancel,
+        sources,
+        password,
+        recovery_entropy,
+        keyfile,
+        output_dir,
+        compress,
+        container_size_bytes,
+        split_part_bytes,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        0,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_encrypt_with_split_and_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    sources: Vec<PathBuf>,
+    password: Zeroizing<String>,
+    recovery_entropy: SecretKey,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    compress: bool,
+    container_size_bytes: Option<u64>,
+    split_part_bytes: Option<u64>,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let base_dir = resolve_output_dir(&sources, output_dir.clone());
         if secure_wipe {
@@ -661,23 +706,25 @@ pub fn spawn_encrypt_with_split(
         };
 
         let res = if let Some(part_bytes) = split_part_bytes {
-            encrypt_sources_v5_split(
+            encrypt_sources_v5_split_with_threads(
                 &sources,
                 &out_vault,
                 part_bytes,
                 password.as_bytes(),
                 &opts,
+                threads,
                 progress,
                 cancel,
                 on_skip,
             )
             .map(|(_summary, meta, parts)| (meta, parts))
         } else {
-            encrypt_sources_v5(
+            encrypt_sources_v5_with_threads(
                 &sources,
                 &out_vault,
                 password.as_bytes(),
                 &opts,
+                threads,
                 progress,
                 cancel,
                 on_skip,
@@ -804,6 +851,57 @@ pub fn spawn_encrypt_hidden_with_split(
     kdf: KdfParams,
     lang: AppLanguage,
 ) {
+    spawn_encrypt_hidden_with_split_and_threads(
+        ctx,
+        tx,
+        cancel,
+        decoy_sources,
+        hidden_sources,
+        decoy_password,
+        hidden_password,
+        decoy_recovery_entropy,
+        decoy_keyfile,
+        hidden_keyfile,
+        output_dir,
+        decoy_compressed,
+        hidden_compressed,
+        container_size_bytes,
+        split_part_bytes,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        0,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_encrypt_hidden_with_split_and_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    decoy_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+    decoy_password: Zeroizing<String>,
+    hidden_password: Zeroizing<String>,
+    decoy_recovery_entropy: SecretKey,
+    decoy_keyfile: Option<PathBuf>,
+    hidden_keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    decoy_compressed: bool,
+    hidden_compressed: bool,
+    container_size_bytes: u64,
+    split_part_bytes: Option<u64>,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         if let Err(e) = check_compartment_sources(&decoy_sources, &hidden_sources) {
             send(
@@ -897,7 +995,7 @@ pub fn spawn_encrypt_hidden_with_split(
         };
 
         let res = if let Some(part_bytes) = split_part_bytes {
-            encrypt_hidden_sources_v5_split(
+            encrypt_hidden_sources_v5_split_with_threads(
                 &decoy_sources,
                 &hidden_sources,
                 &out_vault,
@@ -905,18 +1003,20 @@ pub fn spawn_encrypt_hidden_with_split(
                 decoy_password.as_bytes(),
                 hidden_password.as_bytes(),
                 &opts,
+                threads,
                 progress,
                 cancel,
                 on_skip,
             )
         } else {
-            encrypt_hidden_sources_v5(
+            encrypt_hidden_sources_v5_with_threads(
                 &decoy_sources,
                 &hidden_sources,
                 &out_vault,
                 decoy_password.as_bytes(),
                 hidden_password.as_bytes(),
                 &opts,
+                threads,
                 progress,
                 cancel,
                 on_skip,
@@ -989,6 +1089,33 @@ pub fn spawn_decrypt(
     output_dir: Option<PathBuf>,
     lang: AppLanguage,
 ) {
+    spawn_decrypt_with_threads(
+        ctx,
+        tx,
+        cancel,
+        vaults,
+        use_recovery,
+        secret,
+        keyfile,
+        output_dir,
+        0,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_decrypt_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    vaults: Vec<PathBuf>,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
@@ -1033,7 +1160,16 @@ pub fn spawn_decrypt(
             let item = (vaults.len() > 1).then_some((idx + 1, vaults.len()));
             let progress = make_progress_cb(tx.clone(), ctx.clone(), item);
 
-            match decrypt_vault_v5(vault, &root_out, auth, progress, Arc::clone(&cancel)) {
+            match decrypt_vault_v5_with_stealth_kdf_and_threads(
+                vault,
+                &root_out,
+                auth,
+                None,
+                &rpm_core::STEALTH_KDF_PARAMS,
+                threads,
+                progress,
+                Arc::clone(&cancel),
+            ) {
                 Ok(summary) => {
                     ok_count += 1;
                     if first_output.is_none() {
@@ -1097,21 +1233,33 @@ pub fn spawn_integrity_check(
     vault: PathBuf,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || match check_vault_integrity_with_parts(&vault) {
-        Ok((rep, split_parts)) => {
-            let text = format_integrity_report_with_split(&rep, split_parts, lang);
-            send(
-                &tx,
-                &ctx,
-                WorkerUpdate::IntegrityDone {
-                    text,
-                    ok: rep.ok,
-                    sha256_only: rep.sha256_only,
-                },
-            );
-        }
-        Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
-    });
+    spawn_integrity_check_with_threads(ctx, tx, vault, 0, lang);
+}
+
+pub fn spawn_integrity_check_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    vault: PathBuf,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    thread::spawn(
+        move || match check_vault_integrity_with_parts_and_threads(&vault, threads) {
+            Ok((rep, split_parts)) => {
+                let text = format_integrity_report_with_split(&rep, split_parts, lang);
+                send(
+                    &tx,
+                    &ctx,
+                    WorkerUpdate::IntegrityDone {
+                        text,
+                        ok: rep.ok,
+                        sha256_only: rep.sha256_only,
+                    },
+                );
+            }
+            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+        },
+    );
 }
 
 pub fn spawn_inspect(
@@ -1121,6 +1269,20 @@ pub fn spawn_inspect(
     use_recovery: bool,
     secret: Zeroizing<String>,
     keyfile: Option<PathBuf>,
+    lang: AppLanguage,
+) {
+    spawn_inspect_with_threads(ctx, tx, vault, use_recovery, secret, keyfile, 0, lang);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_inspect_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    vault: PathBuf,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    threads: usize,
     lang: AppLanguage,
 ) {
     thread::spawn(move || {
@@ -1160,7 +1322,12 @@ pub fn spawn_inspect(
             }
         };
 
-        match inspect_header_seekable(&mut reader, auth) {
+        match inspect_header_seekable_with_kdf_and_threads(
+            &mut reader,
+            auth,
+            &STEALTH_KDF_PARAMS,
+            threads,
+        ) {
             Ok(info) => {
                 let text = format_inspect_report_with_split(&info, split_parts, lang);
                 let status = match (lang, info.is_hidden_compartment) {
@@ -1196,6 +1363,7 @@ pub struct VaultDiffTarget {
 fn unlock_vault_header_for_diff(
     label: &str,
     target: &VaultDiffTarget,
+    threads: usize,
     lang: AppLanguage,
 ) -> Result<VaultInfo, String> {
     let prefix = match lang {
@@ -1229,7 +1397,8 @@ fn unlock_vault_header_for_diff(
             keyfile_hash: keyfile_hash.as_ref(),
         }
     };
-    inspect_header_seekable(&mut reader, auth).map_err(|e| format!("{prefix}: {e}"))
+    inspect_header_seekable_with_kdf_and_threads(&mut reader, auth, &STEALTH_KDF_PARAMS, threads)
+        .map_err(|e| format!("{prefix}: {e}"))
 }
 
 pub fn spawn_vault_diff(
@@ -1239,15 +1408,26 @@ pub fn spawn_vault_diff(
     vault_b: VaultDiffTarget,
     lang: AppLanguage,
 ) {
+    spawn_vault_diff_with_threads(ctx, tx, vault_a, vault_b, 0, lang);
+}
+
+pub fn spawn_vault_diff_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    vault_a: VaultDiffTarget,
+    vault_b: VaultDiffTarget,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
-        let info_a = match unlock_vault_header_for_diff("A", &vault_a, lang) {
+        let info_a = match unlock_vault_header_for_diff("A", &vault_a, threads, lang) {
             Ok(info) => info,
             Err(err) => {
                 send(&tx, &ctx, WorkerUpdate::Error(err));
                 return;
             }
         };
-        let info_b = match unlock_vault_header_for_diff("B", &vault_b, lang) {
+        let info_b = match unlock_vault_header_for_diff("B", &vault_b, threads, lang) {
             Ok(info) => info,
             Err(err) => {
                 send(&tx, &ctx, WorkerUpdate::Error(err));
@@ -1294,6 +1474,35 @@ pub fn spawn_selective_extract(
     output_dir: Option<PathBuf>,
     lang: AppLanguage,
 ) {
+    spawn_selective_extract_with_threads(
+        ctx,
+        tx,
+        cancel,
+        vault,
+        use_recovery,
+        secret,
+        keyfile,
+        selected_paths,
+        output_dir,
+        0,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_selective_extract_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    vault: PathBuf,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    selected_paths: Vec<String>,
+    output_dir: Option<PathBuf>,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
@@ -1333,11 +1542,13 @@ pub fn spawn_selective_extract(
 
         let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
 
-        match decrypt_vault_selected_v5(
+        match decrypt_vault_v5_with_stealth_kdf_and_threads(
             &vault,
             &root_out,
             auth,
-            &selected_paths,
+            Some(&selected_paths),
+            &rpm_core::STEALTH_KDF_PARAMS,
+            threads,
             progress,
             Arc::clone(&cancel),
         ) {
@@ -1451,6 +1662,20 @@ pub fn spawn_preview(
     path: String,
     lang: AppLanguage,
 ) {
+    spawn_preview_with_threads(ctx, tx, cancel, gen, target, path, 0, lang);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_preview_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    gen: u64,
+    target: VaultDiffTarget,
+    path: String,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let s = crate::i18n::strings(lang);
         let result = (|| {
@@ -1471,11 +1696,13 @@ pub fn spawn_preview(
                     keyfile_hash: key.as_ref(),
                 },
             };
-            rpm_storage::extract_entry_to_memory_v5(
+            extract_entry_to_memory_v5_with_stealth_kdf_and_threads(
                 &target.path,
                 auth,
                 &path,
                 rpm_storage::DEFAULT_PREVIEW_MAX_BYTES,
+                &rpm_core::STEALTH_KDF_PARAMS,
+                threads,
                 make_progress_cb(tx.clone(), ctx.clone(), None),
                 cancel,
             )
@@ -1516,6 +1743,17 @@ pub fn spawn_repair(
     cancel: Arc<AtomicBool>,
     lang: AppLanguage,
 ) {
+    spawn_repair_with_threads(ctx, tx, path, cancel, 0, lang);
+}
+
+pub fn spawn_repair_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    threads: usize,
+    lang: AppLanguage,
+) {
     thread::spawn(move || {
         let s = crate::i18n::strings(lang);
         let primary_path = if path.is_file() {
@@ -1534,7 +1772,7 @@ pub fn spawn_repair(
         } else {
             path
         };
-        let msg = match rpm_storage::repair_vault_v5(&primary_path, None, cancel) {
+        let msg = match repair_vault_v5_with_threads(&primary_path, None, threads, cancel) {
             Ok(r) => WorkerUpdate::RepairDone {
                 text: match lang {
                     AppLanguage::Tr => format!(
@@ -1686,6 +1924,17 @@ pub fn spawn_queued_job(
     job: QueuedJob,
     lang: AppLanguage,
 ) -> &'static str {
+    spawn_queued_job_with_threads(ctx, tx, cancel, job, 0, lang)
+}
+
+pub fn spawn_queued_job_with_threads(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    job: QueuedJob,
+    threads: usize,
+    lang: AppLanguage,
+) -> &'static str {
     let s = crate::i18n::strings(lang);
     match job.kind {
         QueuedJobKind::Encrypt {
@@ -1703,7 +1952,7 @@ pub fn spawn_queued_job(
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt_with_split(
+            spawn_encrypt_with_split_and_threads(
                 ctx,
                 tx,
                 cancel,
@@ -1720,6 +1969,7 @@ pub fn spawn_queued_job(
                 secure_wipe,
                 wipe_passes,
                 kdf,
+                threads,
                 lang,
             );
             s.status_enc_running
@@ -1743,7 +1993,7 @@ pub fn spawn_queued_job(
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt_hidden_with_split(
+            spawn_encrypt_hidden_with_split_and_threads(
                 ctx,
                 tx,
                 cancel,
@@ -1764,6 +2014,7 @@ pub fn spawn_queued_job(
                 secure_wipe,
                 wipe_passes,
                 kdf,
+                threads,
                 lang,
             );
             s.status_enc_hidden_running
@@ -1775,7 +2026,7 @@ pub fn spawn_queued_job(
             keyfile,
             output_dir,
         } => {
-            spawn_decrypt(
+            spawn_decrypt_with_threads(
                 ctx,
                 tx,
                 cancel,
@@ -1784,16 +2035,17 @@ pub fn spawn_queued_job(
                 secret,
                 keyfile,
                 output_dir,
+                threads,
                 lang,
             );
             s.status_dec_running
         }
         QueuedJobKind::Repair { path } => {
-            spawn_repair(ctx, tx, path, cancel, lang);
+            spawn_repair_with_threads(ctx, tx, path, cancel, threads, lang);
             s.repair_running
         }
         QueuedJobKind::IntegrityCheck { path } => {
-            spawn_integrity_check(ctx, tx, path, lang);
+            spawn_integrity_check_with_threads(ctx, tx, path, threads, lang);
             s.status_checking_integrity
         }
     }

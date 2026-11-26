@@ -7,9 +7,29 @@ use rpm_storage::shell_integration;
 use crate::i18n::Strings;
 use crate::state::{
     AppState, ARGON_ITERATIONS_RANGE, ARGON_PARALLELISM_RANGE, IDLE_CLEAR_PRESET_MINUTES,
-    UI_SCALE_PRESETS,
+    PIPELINE_THREADS_PRESETS, UI_SCALE_PRESETS,
 };
 use crate::theme;
+
+fn pipeline_threads_label(threads: u16, s: &'static Strings, lang: AppLanguage) -> String {
+    if threads == 0 {
+        let detected = rpm_core::default_pipeline_threads();
+        match lang {
+            AppLanguage::Tr => format!("{} ({detected} çekirdek)", s.pipeline_threads_auto),
+            AppLanguage::En => format!("{} ({detected} cores)", s.pipeline_threads_auto),
+        }
+    } else if threads == 1 {
+        match lang {
+            AppLanguage::Tr => "1 (Tek iş parçacığı)".to_owned(),
+            AppLanguage::En => "1 (Single-threaded)".to_owned(),
+        }
+    } else {
+        match lang {
+            AppLanguage::Tr => format!("{threads} iş parçacığı"),
+            AppLanguage::En => format!("{threads} threads"),
+        }
+    }
+}
 
 fn idle_clear_label(minutes: u16, s: &'static Strings, lang: AppLanguage) -> String {
     match minutes {
@@ -135,6 +155,21 @@ pub fn ui(ui: &mut egui::Ui, ctx: &egui::Context, state: &mut AppState) {
             &mut state.config.compress_by_default,
             s.chk_default_compress,
         );
+
+        ui.horizontal(|ui| {
+            ui.label(s.lbl_pipeline_threads);
+            let selected_lbl =
+                pipeline_threads_label(state.config.pipeline_threads, s, state.config.language);
+            egui::ComboBox::from_id_salt("set_pipeline_threads")
+                .selected_text(selected_lbl)
+                .show_ui(ui, |ui| {
+                    for threads in PIPELINE_THREADS_PRESETS {
+                        let lbl = pipeline_threads_label(threads, s, state.config.language);
+                        ui.selectable_value(&mut state.config.pipeline_threads, threads, lbl);
+                    }
+                });
+        });
+        ui.weak(s.pipeline_threads_note);
 
         ui.horizontal(|ui| {
             ui.label(s.lbl_wipe_passes);

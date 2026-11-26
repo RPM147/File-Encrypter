@@ -10,9 +10,10 @@ use std::thread;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rpm_core::{
-    decrypt_unlocked_stream, encrypt_hidden_stream, encrypt_stream, rekey_stream,
-    unlock_seekable_with_kdf, Auth, CryptoError, EncryptOptions, EncryptSummary,
-    HiddenEncryptOptions, HiddenEncryptSummary, KdfParams, RekeyOptions, SecretKey, VaultMetadata,
+    decrypt_unlocked_stream_with_threads, encrypt_hidden_stream_with_threads,
+    encrypt_stream_with_threads, rekey_stream, unlock_seekable_with_kdf_and_threads, Auth,
+    CryptoError, EncryptOptions, EncryptSummary, HiddenEncryptOptions, HiddenEncryptSummary,
+    KdfParams, RekeyOptions, SecretKey, VaultMetadata,
 };
 use zeroize::Zeroizing;
 
@@ -148,6 +149,7 @@ fn encrypt_sources_v5_with_sink<F>(
     split_part_bytes: Option<u64>,
     password: &[u8],
     opts: &EncryptOptions,
+    threads: usize,
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
@@ -199,12 +201,13 @@ where
             )
         });
 
-        let enc_attempt = encrypt_stream(
+        let enc_attempt = encrypt_stream_with_threads(
             &mut reader,
             &mut vault_writer,
             &metadata,
             password,
             opts,
+            threads,
             |done| progress(done, total_expected),
             Some(&cancel),
         );
@@ -234,11 +237,29 @@ pub fn encrypt_sources_v5(
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
 ) -> Result<(EncryptSummary, VaultMetadata), StorageError> {
+    encrypt_sources_v5_with_threads(
+        sources, out_vault, password, opts, 0, progress, cancel, on_skip,
+    )
+}
+
+/// Stream-pack `sources` into a Vault v5 archive using `threads` pipeline workers (`0` = auto).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_sources_v5_with_threads(
+    sources: &[PathBuf],
+    out_vault: &Path,
+    password: &[u8],
+    opts: &EncryptOptions,
+    threads: usize,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(EncryptSummary, VaultMetadata), StorageError> {
     encrypt_sources_v5_with_sink(
         sources,
         None,
         password,
         opts,
+        threads,
         progress,
         cancel,
         on_skip,
@@ -259,12 +280,39 @@ pub fn encrypt_sources_v5_split(
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
 ) -> Result<(EncryptSummary, VaultMetadata, Vec<PathBuf>), StorageError> {
+    encrypt_sources_v5_split_with_threads(
+        sources,
+        out_vault_base,
+        part_size_bytes,
+        password,
+        opts,
+        0,
+        progress,
+        cancel,
+        on_skip,
+    )
+}
+
+/// Stream-pack `sources` into a split Vault v5 volume using `threads` pipeline workers (`0` = auto).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_sources_v5_split_with_threads(
+    sources: &[PathBuf],
+    out_vault_base: &Path,
+    part_size_bytes: u64,
+    password: &[u8],
+    opts: &EncryptOptions,
+    threads: usize,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(EncryptSummary, VaultMetadata, Vec<PathBuf>), StorageError> {
     let mut created_parts = Vec::new();
     let (summary, meta) = encrypt_sources_v5_with_sink(
         sources,
         Some(part_size_bytes),
         password,
         opts,
+        threads,
         progress,
         cancel,
         on_skip,
@@ -290,6 +338,7 @@ fn encrypt_hidden_sources_v5_with_sink<F>(
     decoy_password: &[u8],
     hidden_password: &[u8],
     opts: &HiddenEncryptOptions,
+    threads: usize,
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
@@ -389,7 +438,7 @@ where
             );
         };
 
-        let enc_attempt = encrypt_hidden_stream(
+        let enc_attempt = encrypt_hidden_stream_with_threads(
             &mut d_reader,
             &mut h_reader,
             &mut vault_writer,
@@ -398,6 +447,7 @@ where
             decoy_password,
             hidden_password,
             opts,
+            threads,
             decoy_cb,
             hidden_cb,
             Some(&cancel),
@@ -442,6 +492,34 @@ pub fn encrypt_hidden_sources_v5(
     cancel: Arc<AtomicBool>,
     on_skip: impl FnMut(&str) + Send + 'static,
 ) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError> {
+    encrypt_hidden_sources_v5_with_threads(
+        decoy_sources,
+        hidden_sources,
+        out_vault,
+        decoy_password,
+        hidden_password,
+        opts,
+        0,
+        progress,
+        cancel,
+        on_skip,
+    )
+}
+
+/// Stream-pack decoy and hidden sources using `threads` pipeline workers (`0` = auto).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_sources_v5_with_threads(
+    decoy_sources: &[PathBuf],
+    hidden_sources: &[PathBuf],
+    out_vault: &Path,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    threads: usize,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<(HiddenEncryptSummary, VaultMetadata, VaultMetadata), StorageError> {
     encrypt_hidden_sources_v5_with_sink(
         decoy_sources,
         hidden_sources,
@@ -449,6 +527,7 @@ pub fn encrypt_hidden_sources_v5(
         decoy_password,
         hidden_password,
         opts,
+        threads,
         progress,
         cancel,
         on_skip,
@@ -478,6 +557,44 @@ pub fn encrypt_hidden_sources_v5_split(
     ),
     StorageError,
 > {
+    encrypt_hidden_sources_v5_split_with_threads(
+        decoy_sources,
+        hidden_sources,
+        out_vault_base,
+        part_size_bytes,
+        decoy_password,
+        hidden_password,
+        opts,
+        0,
+        progress,
+        cancel,
+        on_skip,
+    )
+}
+
+/// Stream-pack decoy and hidden sources into a split Vault v5 container using `threads` workers.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_hidden_sources_v5_split_with_threads(
+    decoy_sources: &[PathBuf],
+    hidden_sources: &[PathBuf],
+    out_vault_base: &Path,
+    part_size_bytes: u64,
+    decoy_password: &[u8],
+    hidden_password: &[u8],
+    opts: &HiddenEncryptOptions,
+    threads: usize,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+    on_skip: impl FnMut(&str) + Send + 'static,
+) -> Result<
+    (
+        HiddenEncryptSummary,
+        VaultMetadata,
+        VaultMetadata,
+        Vec<PathBuf>,
+    ),
+    StorageError,
+> {
     let mut created_parts = Vec::new();
     let (summary, decoy_meta, hidden_meta) = encrypt_hidden_sources_v5_with_sink(
         decoy_sources,
@@ -486,6 +603,7 @@ pub fn encrypt_hidden_sources_v5_split(
         decoy_password,
         hidden_password,
         opts,
+        threads,
         progress,
         cancel,
         on_skip,
@@ -554,6 +672,29 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<DecryptSummary, StorageError> {
+    decrypt_vault_v5_with_stealth_kdf_and_threads(
+        vault_path,
+        output_root,
+        auth,
+        selected_paths,
+        stealth_kdf,
+        0,
+        progress,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_vault_v5_with_stealth_kdf_and_threads(
+    vault_path: &Path,
+    output_root: &Path,
+    auth: Auth<'_>,
+    selected_paths: Option<&[String]>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+) -> Result<DecryptSummary, StorageError> {
     let selected_owned = match selected_paths {
         Some(paths) => {
             let cleaned: Vec<String> = paths
@@ -572,7 +713,7 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
     };
 
     let mut reader = open_vault_reader(vault_path)?;
-    let unlocked = unlock_seekable_with_kdf(&mut reader, auth, stealth_kdf)?;
+    let unlocked = unlock_seekable_with_kdf_and_threads(&mut reader, auth, stealth_kdf, threads)?;
     let metadata = unlocked.metadata().clone();
 
     let total_expected = metadata.original_size;
@@ -619,10 +760,11 @@ pub fn decrypt_vault_v5_with_stealth_kdf(
         Ok(count)
     });
 
-    let dec_res = decrypt_unlocked_stream(
+    let dec_res = decrypt_unlocked_stream_with_threads(
         &mut reader,
         &mut pipe_tx,
         &unlocked,
+        threads,
         |done| progress(done, total_expected),
         Some(&cancel),
     );
@@ -774,6 +916,16 @@ pub fn repair_vault_v5(
     output_path: Option<&Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<rpm_core::RepairReport, StorageError> {
+    repair_vault_v5_with_threads(vault_path, output_path, 0, cancel)
+}
+
+/// Repair ciphertext using `threads` Reed-Solomon workers (`0` = auto).
+pub fn repair_vault_v5_with_threads(
+    vault_path: &Path,
+    output_path: Option<&Path>,
+    threads: usize,
+    cancel: Arc<AtomicBool>,
+) -> Result<rpm_core::RepairReport, StorageError> {
     if !vault_path.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "vault file not found: {}",
@@ -802,10 +954,11 @@ pub fn repair_vault_v5(
             }
             atomic_write(out, |writer| {
                 let mut input = SplitVolumeReader::new(set.clone());
-                report = Some(rpm_core::repair_vault_stream(
+                report = Some(rpm_core::repair_vault_stream_with_threads(
                     &mut input,
                     writer,
                     Some(&cancel),
+                    threads,
                 )?);
                 drop(input);
                 Ok(())
@@ -815,10 +968,11 @@ pub fn repair_vault_v5(
 
         atomic_write(out, |writer| {
             let mut input = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
-            report = Some(rpm_core::repair_vault_stream(
+            report = Some(rpm_core::repair_vault_stream_with_threads(
                 &mut input,
                 writer,
                 Some(&cancel),
+                threads,
             )?);
             drop(input);
             Ok(())
@@ -833,10 +987,11 @@ pub fn repair_vault_v5(
             let base = set.base.clone();
             write_split_vault_replacing(&base, &old_parts, part_size, false, None, |writer| {
                 let mut input = SplitVolumeReader::new(set.clone());
-                report = Some(rpm_core::repair_vault_stream(
+                report = Some(rpm_core::repair_vault_stream_with_threads(
                     &mut input,
                     writer,
                     Some(&cancel),
+                    threads,
                 )?);
                 drop(input);
                 Ok(())
@@ -846,10 +1001,11 @@ pub fn repair_vault_v5(
         let single_part = set.first_part().to_path_buf();
         atomic_write(&single_part, |writer| {
             let mut input = BufReader::with_capacity(256 * 1024, File::open(&single_part)?);
-            report = Some(rpm_core::repair_vault_stream(
+            report = Some(rpm_core::repair_vault_stream_with_threads(
                 &mut input,
                 writer,
                 Some(&cancel),
+                threads,
             )?);
             drop(input);
             Ok(())
@@ -859,10 +1015,11 @@ pub fn repair_vault_v5(
 
     atomic_write(vault_path, |writer| {
         let mut input = BufReader::with_capacity(256 * 1024, File::open(vault_path)?);
-        report = Some(rpm_core::repair_vault_stream(
+        report = Some(rpm_core::repair_vault_stream_with_threads(
             &mut input,
             writer,
             Some(&cancel),
+            threads,
         )?);
         drop(input);
         Ok(())

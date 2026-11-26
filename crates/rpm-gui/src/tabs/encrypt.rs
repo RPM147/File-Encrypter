@@ -984,7 +984,7 @@ pub fn ui(
                     let hidden_pw =
                         Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt_hidden_with_split(
+                    worker::spawn_encrypt_hidden_with_split_and_threads(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -1005,13 +1005,14 @@ pub fn ui(
                         state.encrypt.secure_wipe,
                         state.config.wipe_passes,
                         state.config.kdf_params(),
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 } else {
                     state.begin_transfer(s.status_enc_running);
                     let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt_with_split(
+                    worker::spawn_encrypt_with_split_and_threads(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -1028,6 +1029,7 @@ pub fn ui(
                         state.encrypt.secure_wipe,
                         state.config.wipe_passes,
                         state.config.kdf_params(),
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 }

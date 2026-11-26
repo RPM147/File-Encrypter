@@ -2876,3 +2876,41 @@ fn printable_recovery_sheet_modal_and_i18n_render_cleanly_in_tr_and_en() {
         );
     }
 }
+
+#[test]
+fn pipeline_threads_settings_persistence_and_bilingual_render() {
+    let tr = i18n::strings(AppLanguage::Tr);
+    let en = i18n::strings(AppLanguage::En);
+    for (t, e) in [
+        (tr.lbl_pipeline_threads, en.lbl_pipeline_threads),
+        (tr.pipeline_threads_auto, en.pipeline_threads_auto),
+        (tr.pipeline_threads_note, en.pipeline_threads_note),
+    ] {
+        assert!(!t.trim().is_empty() && !e.trim().is_empty());
+        assert_ne!(t, e);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let mut st = AppState::from_config(AppConfig::default(), Some(cfg_path.clone()));
+    assert_eq!(st.config.pipeline_threads, 0);
+
+    st.config.pipeline_threads = 4;
+    st.save_preferences().unwrap();
+    let reloaded = load_config_from(&cfg_path);
+    assert_eq!(reloaded.pipeline_threads, 4);
+
+    let ctx = egui::Context::default();
+    for (lang, threads) in [
+        (AppLanguage::Tr, 0u16),
+        (AppLanguage::En, 1u16),
+        (AppLanguage::En, 8u16),
+    ] {
+        st.config.language = lang;
+        st.config.pipeline_threads = threads;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            rpm_gui::tabs::settings::ui(ui, &ctx, &mut st);
+        });
+        out.textures_delta.clear();
+    }
+}

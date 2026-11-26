@@ -1,8 +1,8 @@
-use super::{load_keyfile, read_secret_line};
+use super::{load_keyfile, read_secret_line, MAX_PIPELINE_THREADS_I64};
 use clap::Args;
 use rpm_core::{
-    diff_metadata, inspect_header_seekable_with_kdf, mnemonic_to_entropy, Auth, KdfParams,
-    VaultMetadata,
+    diff_metadata, inspect_header_seekable_with_kdf_and_threads, mnemonic_to_entropy, Auth,
+    KdfParams, VaultMetadata,
 };
 use rpm_storage::{open_vault_reader, StorageError};
 use std::io::{BufRead, Write};
@@ -27,6 +27,9 @@ pub struct DiffArgs {
     recovery_b: bool,
     #[arg(long)]
     json: bool,
+    /// Worker threads for parallel Reed-Solomon header decoding (0 = auto-detect CPU cores, 1 = single-threaded).
+    #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=MAX_PIPELINE_THREADS_I64))]
+    threads: u16,
 }
 
 impl DiffArgs {
@@ -69,7 +72,13 @@ impl DiffArgs {
                 keyfile_hash: keyfile.as_ref(),
             }
         };
-        Ok(inspect_header_seekable_with_kdf(&mut reader, auth, kdf)?.metadata)
+        Ok(inspect_header_seekable_with_kdf_and_threads(
+            &mut reader,
+            auth,
+            kdf,
+            usize::from(self.threads),
+        )?
+        .metadata)
     }
 
     pub fn run(

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use rpm_core::constants::MAX_CONTAINER_SIZE;
-use rpm_core::KdfParams;
+use rpm_core::{KdfParams, MAX_PIPELINE_THREADS};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
@@ -144,6 +144,9 @@ pub struct AppConfig {
     pub argon_iterations: u32,
     pub argon_parallelism: u32,
     pub compress_by_default: bool,
+    /// Multi-core AEAD & Reed-Solomon pipeline worker count (`0` = auto-detect logical CPUs).
+    #[serde(default)]
+    pub pipeline_threads: u16,
     #[serde(default = "default_idle_clear_minutes")]
     pub idle_clear_minutes: u16,
     #[serde(default = "default_notify_on_complete")]
@@ -164,6 +167,7 @@ impl Default for AppConfig {
             argon_iterations: kdf.iterations,
             argon_parallelism: kdf.parallelism,
             compress_by_default: true,
+            pipeline_threads: 0,
             idle_clear_minutes: default_idle_clear_minutes(),
             notify_on_complete: default_notify_on_complete(),
             encrypt_profiles: Vec::new(),
@@ -192,6 +196,7 @@ pub fn load_config_from(path: &Path) -> AppConfig {
             let mut cfg: AppConfig = serde_json::from_slice(&bytes).unwrap_or_default();
             cfg.ui_scale_percent = cfg.ui_scale_percent.clamp(80, 150);
             cfg.wipe_passes = cfg.wipe_passes.clamp(1, 5);
+            cfg.pipeline_threads = cfg.pipeline_threads.min(MAX_PIPELINE_THREADS as u16);
             cfg.idle_clear_minutes = cfg.idle_clear_minutes.min(MAX_IDLE_CLEAR_MINUTES);
             sanitize_profiles(&mut cfg.encrypt_profiles);
             if cfg.kdf_params().validate().is_err() {
@@ -312,5 +317,30 @@ mod config_loading_tests {
         assert_eq!(loaded.encrypt_profiles[0].container_size_mib, None);
         assert_eq!(loaded.encrypt_profiles[1].name, "TooLarge");
         assert_eq!(loaded.encrypt_profiles[1].container_size_mib, None);
+    }
+
+    #[test]
+    fn pipeline_threads_defaults_to_auto_and_clamps_upper_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"theme":"Dark"}"#).unwrap();
+        assert_eq!(load_config_from(&path).pipeline_threads, 0);
+
+        let cfg = AppConfig {
+            pipeline_threads: 999,
+            ..AppConfig::default()
+        };
+        save_config_to(&path, &cfg).unwrap();
+        assert_eq!(
+            load_config_from(&path).pipeline_threads,
+            MAX_PIPELINE_THREADS as u16
+        );
+
+        let explicit = AppConfig {
+            pipeline_threads: 4,
+            ..AppConfig::default()
+        };
+        save_config_to(&path, &explicit).unwrap();
+        assert_eq!(load_config_from(&path).pipeline_threads, 4);
     }
 }

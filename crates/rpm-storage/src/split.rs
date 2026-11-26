@@ -746,9 +746,17 @@ pub fn open_vault_reader(path: &Path) -> Result<VaultReader, StorageError> {
 pub fn check_vault_integrity_with_parts(
     path: &Path,
 ) -> Result<(IntegrityReport, Option<usize>), StorageError> {
+    check_vault_integrity_with_parts_and_threads(path, 0)
+}
+
+/// Passwordless structural integrity check using `threads` RS pipeline workers (`0` = auto).
+pub fn check_vault_integrity_with_parts_and_threads(
+    path: &Path,
+    threads: usize,
+) -> Result<(IntegrityReport, Option<usize>), StorageError> {
     let mut reader = open_vault_reader(path)?;
     let split_parts = reader.is_split().then_some(reader.part_count());
-    let report = rpm_core::check_integrity_reader(&mut reader)?;
+    let report = rpm_core::check_integrity_reader_with_threads(&mut reader, threads)?;
     Ok((report, split_parts))
 }
 

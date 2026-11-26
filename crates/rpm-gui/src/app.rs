@@ -305,11 +305,12 @@ impl RpmApp {
         };
         self.cancel.store(false, Ordering::Relaxed);
         let label = job.label.clone();
-        let status = worker::spawn_queued_job(
+        let status = worker::spawn_queued_job_with_threads(
             ctx.clone(),
             self.tx.clone(),
             Arc::clone(&self.cancel),
             job,
+            usize::from(self.state.config.pipeline_threads),
             self.state.config.language,
         );
         self.state.active_queue_job = Some(label);
@@ -466,10 +467,11 @@ impl eframe::App for RpmApp {
                                     self.state.busy = true;
                                     self.state.transfer = None;
                                     self.state.set_status(s.status_checking_integrity, false);
-                                    worker::spawn_integrity_check(
+                                    worker::spawn_integrity_check_with_threads(
                                         ctx.clone(),
                                         self.tx.clone(),
                                         vault_path,
+                                        usize::from(self.state.config.pipeline_threads),
                                         self.state.config.language,
                                     );
                                 }

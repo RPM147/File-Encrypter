@@ -343,11 +343,12 @@ pub fn ui(
                         state.busy = true;
                         state.transfer = None;
                         state.set_status(s.repair_running, false);
-                        worker::spawn_repair(
+                        worker::spawn_repair_with_threads(
                             ctx.clone(),
                             tx.clone(),
                             path,
                             cancel.clone(),
+                            usize::from(state.config.pipeline_threads),
                             state.config.language,
                         );
                     } else {
@@ -372,10 +373,11 @@ pub fn ui(
                         state.busy = true;
                         state.transfer = None;
                         state.set_status(s.status_checking_integrity, false);
-                        worker::spawn_integrity_check(
+                        worker::spawn_integrity_check_with_threads(
                             ctx.clone(),
                             tx.clone(),
                             p,
+                            usize::from(state.config.pipeline_threads),
                             state.config.language,
                         );
                     }
@@ -413,13 +415,14 @@ pub fn ui(
                     state.busy = true;
                     state.transfer = None;
                     state.set_status(s.status_inspecting, false);
-                    worker::spawn_inspect(
+                    worker::spawn_inspect_with_threads(
                         ctx.clone(),
                         tx.clone(),
                         p,
                         state.inspect.use_recovery,
                         Zeroizing::new(sec),
                         state.inspect.keyfile.clone(),
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 }
@@ -618,13 +621,14 @@ pub fn ui(
                     };
                     let (gen, preview_cancel) = state.inspect.begin_preview();
                     state.begin_transfer(s.preview_loading);
-                    worker::spawn_preview(
+                    worker::spawn_preview_with_threads(
                         ctx.clone(),
                         tx.clone(),
                         preview_cancel,
                         gen,
                         target,
                         path,
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 }
@@ -690,7 +694,7 @@ pub fn ui(
                     chosen.sort();
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                     state.begin_transfer(s.status_extracting_selected);
-                    worker::spawn_selective_extract(
+                    worker::spawn_selective_extract_with_threads(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -700,6 +704,7 @@ pub fn ui(
                         state.inspect.keyfile.clone(),
                         chosen,
                         out_opt,
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 }
@@ -795,11 +800,12 @@ pub fn ui(
                 state.busy = true;
                 state.transfer = None;
                 state.set_status(s.status_comparing_vaults, false);
-                worker::spawn_vault_diff(
+                worker::spawn_vault_diff_with_threads(
                     ctx.clone(),
                     tx.clone(),
                     target_a,
                     target_b,
+                    usize::from(state.config.pipeline_threads),
                     state.config.language,
                 );
             }

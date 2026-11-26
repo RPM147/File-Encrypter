@@ -814,6 +814,7 @@ fn storage_config_launch_and_shell_integration_matrix() {
                     argon_iterations: iters,
                     argon_parallelism: par,
                     compress_by_default: compress,
+                    pipeline_threads: [0, 1, 4][idx % 3],
                     idle_clear_minutes: if idx == 0 { 0 } else { 15 },
                     notify_on_complete: idx % 2 == 0,
                     encrypt_profiles: vec![EncryptProfile {

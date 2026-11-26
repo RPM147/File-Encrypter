@@ -5,14 +5,11 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::{
     AES_NONCE_SIZE, AES_TAG_SIZE, CHUNKED_CIPHER_NAME, DEFAULT_CHUNK_SIZE, FLAG_COMPRESSED,
@@ -27,6 +24,7 @@ use crate::header::{
 };
 use crate::kdf::{derive_stream_nonce_prefix, KdfParams};
 use crate::mem::SecretKey;
+use crate::pipeline::{decrypt_chunks_pipeline, encrypt_chunks_pipeline, FrameMaskMode};
 
 #[derive(Clone, Debug)]
 pub struct EncryptOptions {
@@ -271,13 +269,15 @@ fn write_standard_header(
     Ok((vault_id, payload_ctx, container_salt_raw))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encrypt_outer_stream_raw(
     reader: &mut impl Read,
     writer: &mut impl Write,
     metadata: &VaultMetadata,
     password: &[u8],
     opts: &EncryptOptions,
-    mut progress_cb: impl FnMut(u64),
+    threads: usize,
+    progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<(EncryptSummary, Option<[u8; SALT_SIZE]>), CryptoError> {
     if opts.chunk_size < MIN_CHUNK_SIZE || opts.chunk_size > MAX_CHUNK_SIZE {
@@ -303,61 +303,31 @@ pub(crate) fn encrypt_outer_stream_raw(
     };
 
     let prefix = derive_stream_nonce_prefix(&dek, &payload_ctx)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
+    let mask_mode = if opts.stealth {
+        FrameMaskMode::Stealth
+    } else {
+        FrameMaskMode::None
+    };
 
-    let mut plain_buf = Zeroizing::new(vec![0u8; opts.chunk_size as usize]);
-    let mut pending: Option<u8> = None;
-    let mut chunk_idx: u32 = 0;
-    let mut total_bytes: u64 = 0;
-
-    loop {
-        if is_cancelled(cancel) {
-            return Err(CryptoError::Cancelled);
-        }
-
-        let (len, is_final) = read_chunk_with_eof(reader, &mut plain_buf, &mut pending)?;
-        let final_flag = u8::from(is_final);
-        let plain_len_u32 = len as u32;
-        let nonce_bytes = chunk_nonce(&prefix, chunk_idx, final_flag);
-        let aad = chunk_aad(&payload_ctx, chunk_idx, final_flag, plain_len_u32);
-
-        let ct = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &plain_buf[..len],
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| CryptoError::CryptoFailure)?;
-
-        let mut frame = [0; 5];
-        frame[..4].copy_from_slice(&plain_len_u32.to_be_bytes());
-        frame[4] = final_flag;
-        if opts.stealth {
-            crate::stealth::mask_frame(&mut frame, &dek, &payload_ctx, chunk_idx)?;
-        }
-        writer.write_all(&frame)?;
-        writer.write_all(&ct)?;
-
-        plain_buf[..len].zeroize();
-        total_bytes += len as u64;
-        progress_cb(total_bytes);
-
-        chunk_idx = chunk_idx
-            .checked_add(1)
-            .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
-        if is_final {
-            break;
-        }
-    }
+    let (total_bytes, chunks_written) = encrypt_chunks_pipeline(
+        reader,
+        writer,
+        &dek,
+        &payload_ctx,
+        &prefix,
+        opts.chunk_size,
+        mask_mode,
+        None,
+        threads,
+        progress_cb,
+        cancel,
+    )?;
 
     Ok((
         EncryptSummary {
             vault_id,
             bytes_encrypted: total_bytes,
-            chunks_written: chunk_idx,
+            chunks_written,
         },
         container_salt_raw,
     ))
@@ -374,15 +344,41 @@ pub fn encrypt_stream(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<EncryptSummary, CryptoError> {
+    encrypt_stream_with_threads(
+        reader,
+        writer,
+        metadata,
+        password,
+        opts,
+        0,
+        progress_cb,
+        cancel,
+    )
+}
+
+/// Encrypt a plaintext byte stream into Vault Format v5 using `threads` pipeline workers
+/// (`0` = auto-detect logical CPU cores, `1` = single-threaded).
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_stream_with_threads(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    metadata: &VaultMetadata,
+    password: &[u8],
+    opts: &EncryptOptions,
+    threads: usize,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<EncryptSummary, CryptoError> {
     if opts.reed_solomon {
         crate::rs::validate_mode(opts.stealth)?;
-        let mut rs = crate::RsEncoderWriter::new(writer)?;
+        let mut rs = crate::RsEncoderWriter::with_threads(writer, threads)?;
         let summary = encrypt_inner(
             reader,
             &mut rs,
             metadata,
             password,
             opts,
+            threads,
             progress_cb,
             cancel,
         )?;
@@ -395,18 +391,21 @@ pub fn encrypt_stream(
             metadata,
             password,
             opts,
+            threads,
             progress_cb,
             cancel,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encrypt_inner(
     reader: &mut impl Read,
     writer: &mut impl Write,
     metadata: &VaultMetadata,
     password: &[u8],
     opts: &EncryptOptions,
+    threads: usize,
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<EncryptSummary, CryptoError> {
@@ -417,6 +416,7 @@ fn encrypt_inner(
         metadata,
         password,
         opts,
+        threads,
         progress_cb,
         cancel,
     )?;
@@ -445,10 +445,34 @@ pub fn decrypt_stream(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
+    decrypt_stream_with_threads(reader, writer, auth, 0, progress_cb, cancel)
+}
+
+/// Decrypt a Vault Format v5 stream using `threads` pipeline workers (`0` = auto).
+pub fn decrypt_stream_with_threads(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    auth: Auth<'_>,
+    threads: usize,
+    progress_cb: impl FnMut(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<VaultMetadata, CryptoError> {
     let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
     let dek = crate::header::unlock_dek(&header, auth)?;
     let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
-    decrypt_chunks_with_key_at(reader, writer, &header, hdr_len, &dek, progress_cb, cancel)?;
+    decrypt_outer_chunks(
+        reader,
+        writer,
+        header.chunk_size,
+        header.container_size,
+        hdr_len,
+        &dek,
+        header.payload_context(),
+        false,
+        threads,
+        progress_cb,
+        cancel,
+    )?;
     Ok(metadata)
 }
 
@@ -490,6 +514,7 @@ pub fn decrypt_chunks_with_key_at(
         dek,
         header.payload_context(),
         false,
+        0,
         progress_cb,
         cancel,
     )
@@ -506,103 +531,43 @@ pub(crate) fn decrypt_outer_chunks(
     dek: &SecretKey,
     payload_ctx: [u8; 32],
     stealth: bool,
-    mut progress_cb: impl FnMut(u64),
+    threads: usize,
+    progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
     let prefix = derive_stream_nonce_prefix(dek, &payload_ctx)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
+    let mask_mode = if stealth {
+        FrameMaskMode::Stealth
+    } else {
+        FrameMaskMode::None
+    };
 
-    let mut chunk_idx: u32 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut payload_bytes_read: u64 = 0;
-    let mut ct_buf: Vec<u8> = Vec::new();
+    let (total_bytes, payload_bytes_read) = decrypt_chunks_pipeline(
+        reader,
+        writer,
+        dek,
+        &payload_ctx,
+        &prefix,
+        chunk_size,
+        mask_mode,
+        None,
+        threads,
+        progress_cb,
+        cancel,
+    )?;
 
-    loop {
-        if is_cancelled(cancel) {
-            return Err(CryptoError::Cancelled);
-        }
-
-        let mut frame = [0; 5];
-        reader
-            .read_exact(&mut frame)
-            .map_err(crate::stealth::map_eof)?;
-        if stealth {
-            crate::stealth::mask_frame(&mut frame, dek, &payload_ctx, chunk_idx)?;
-        }
-        let plain_len = u32::from_be_bytes(frame[..4].try_into().unwrap());
-        if plain_len > chunk_size {
-            return Err(CryptoError::InvalidFormat(format!(
-                "chunk length {plain_len} exceeds header chunk_size {chunk_size}"
-            )));
-        }
-        let final_flag = frame[4];
-        if final_flag > 1 {
-            return Err(CryptoError::InvalidFormat(format!(
-                "invalid chunk final flag {final_flag}"
-            )));
-        }
-        if plain_len == 0 && final_flag == 0 {
-            return Err(CryptoError::InvalidFormat(
-                "empty non-final chunk frame".into(),
-            ));
-        }
-
-        let ct_len = (plain_len as usize) + AES_TAG_SIZE;
-        ct_buf.resize(ct_len, 0);
-        reader.read_exact(&mut ct_buf).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                CryptoError::AuthenticationFailed
-            } else {
-                CryptoError::Io(e)
-            }
-        })?;
-        payload_bytes_read = payload_bytes_read
-            .checked_add(5 + ct_len as u64)
+    if let Some(target_size) = container_size {
+        let total_consumed = hdr_bytes_read
+            .checked_add(payload_bytes_read)
             .ok_or(CryptoError::AuthenticationFailed)?;
-
-        let nonce_bytes = chunk_nonce(&prefix, chunk_idx, final_flag);
-        let aad = chunk_aad(&payload_ctx, chunk_idx, final_flag, plain_len);
-
-        let mut plain = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(&nonce_bytes),
-                    Payload {
-                        msg: &ct_buf,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| CryptoError::AuthenticationFailed)?,
-        );
-
-        if !plain.is_empty() {
-            writer.write_all(&plain)?;
-            plain.zeroize();
+        if total_consumed > target_size {
+            return Err(CryptoError::AuthenticationFailed);
         }
-        total_bytes += plain_len as u64;
-        progress_cb(total_bytes);
-
-        if final_flag == 1 {
-            if let Some(target_size) = container_size {
-                let total_consumed = hdr_bytes_read
-                    .checked_add(payload_bytes_read)
-                    .ok_or(CryptoError::AuthenticationFailed)?;
-                if total_consumed > target_size {
-                    return Err(CryptoError::AuthenticationFailed);
-                }
-                skip_exact(reader, target_size - total_consumed, cancel)?;
-            }
-            let mut trailing = [0u8; 1];
-            if reader.read(&mut trailing)? != 0 {
-                return Err(CryptoError::AuthenticationFailed);
-            }
-            break;
-        }
-
-        chunk_idx = chunk_idx
-            .checked_add(1)
-            .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
+        skip_exact(reader, target_size - total_consumed, cancel)?;
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(CryptoError::AuthenticationFailed);
     }
 
     writer.flush()?;
@@ -786,12 +751,29 @@ fn scan_chunk_frames(
 
 /// Passwordless single-pass structural check (header + chunk frames) + SHA-256 hash.
 pub fn check_integrity(path: &Path) -> Result<IntegrityReport, CryptoError> {
-    check_integrity_reader(&mut File::open(path)?)
+    check_integrity_with_threads(path, 0)
+}
+
+/// Passwordless single-pass structural check using `threads` RS workers (`0` = auto).
+pub fn check_integrity_with_threads(
+    path: &Path,
+    threads: usize,
+) -> Result<IntegrityReport, CryptoError> {
+    check_integrity_reader_with_threads(&mut File::open(path)?, threads)
 }
 
 /// Stream the on-disk digest and structural checks from any seekable source.
 pub fn check_integrity_reader(
     f: &mut (impl Read + std::io::Seek),
+) -> Result<IntegrityReport, CryptoError> {
+    check_integrity_reader_with_threads(f, 0)
+}
+
+/// Stream the on-disk digest and structural checks from any seekable source
+/// using `threads` Reed-Solomon workers (`0` = auto).
+pub fn check_integrity_reader_with_threads(
+    f: &mut (impl Read + std::io::Seek),
+    threads: usize,
 ) -> Result<IntegrityReport, CryptoError> {
     let file_size = f.seek(std::io::SeekFrom::End(0))?;
     let rs = crate::rs::probe_rs_header(f)?;
@@ -799,27 +781,28 @@ pub fn check_integrity_reader(
     let mut hr = HashingReader::new(f);
     if rs {
         let mut repaired = 0;
-        let fields = match crate::rs::Scan::new(&mut hr, file_size) {
-            Ok(mut scan) => {
-                let mut fields = scan_structure(&mut scan);
-                loop {
-                    match scan.next_block() {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(e) => {
-                            fields.0 = false;
-                            fields.2 = e.to_string();
-                            if e.kind() != io::ErrorKind::InvalidData {
-                                break;
+        let fields =
+            match crate::rs::Scan::new_with_options(&mut hr, file_size, threads, false, None) {
+                Ok(mut scan) => {
+                    let mut fields = scan_structure(&mut scan);
+                    loop {
+                        match scan.next_block() {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(e) => {
+                                fields.0 = false;
+                                fields.2 = e.to_string();
+                                if e.kind() != io::ErrorKind::InvalidData {
+                                    break;
+                                }
                             }
                         }
                     }
+                    repaired = scan.report.repaired_bytes;
+                    fields
                 }
-                repaired = scan.report.repaired_bytes;
-                fields
-            }
-            Err(e) => (false, 0, e.to_string(), false, false, 0),
-        };
+                Err(e) => (false, 0, e.to_string(), false, false, 0),
+            };
         let (ok, version, msg, has_keyfile, has_recovery, chunk_count) = fields;
         let sha256_hex = hr.drain_and_finalize()?;
         return Ok(IntegrityReport {

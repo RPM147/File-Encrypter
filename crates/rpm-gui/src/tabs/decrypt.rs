@@ -185,7 +185,7 @@ pub fn ui(
                 if let Some(req) = take_validated_decrypt_request(state, s) {
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                     state.begin_transfer(s.status_dec_running);
-                    worker::spawn_decrypt(
+                    worker::spawn_decrypt_with_threads(
                         ctx.clone(),
                         tx.clone(),
                         Arc::clone(cancel),
@@ -194,6 +194,7 @@ pub fn ui(
                         req.secret,
                         req.keyfile,
                         req.output_dir,
+                        usize::from(state.config.pipeline_threads),
                         state.config.language,
                     );
                 }

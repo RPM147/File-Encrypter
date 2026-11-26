@@ -2,9 +2,12 @@
 //! The envelope protects ciphertext against accidental damage; only the inner AEAD authenticates it.
 #![forbid(unsafe_code)]
 
+use crate::pipeline::resolve_pipeline_threads;
 use crate::{CryptoError, VAULT_MAGIC};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 pub const NSYM: usize = 16;
 const WORD: usize = 255;
@@ -13,6 +16,10 @@ const LANES: usize = 64;
 pub const RS_BLOCK_DATA_CAP: usize = LANES * DATA - 4;
 pub const RS_BLOCK_WIRE_SIZE: usize = LANES * WORD;
 const HEADER: usize = 48;
+
+/// Maximum RS wire blocks decoded or encoded in a single parallel batch.
+/// `64 * 16,320 B = 1,044,480 B` (~1.00 MiB), keeping heap strictly O(1) bounded.
+const MAX_RS_BATCH_BLOCKS: usize = 64;
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -66,6 +73,38 @@ const fn generator() -> [u8; NSYM + 1] {
 }
 const GENERATOR: [u8; NSYM + 1] = generator();
 
+const fn mul_table_for(c: u8) -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut x = 0usize;
+    while x < 256 {
+        t[x] = mul(x as u8, c);
+        x += 1;
+    }
+    t
+}
+
+/// Precomputed GF(2^8) multiply tables for `GENERATOR[1..=NSYM]` (4 KiB, L1-resident).
+const GEN_MUL: [[u8; 256]; NSYM] = {
+    let mut out = [[0u8; 256]; NSYM];
+    let mut i = 0;
+    while i < NSYM {
+        out[i] = mul_table_for(GENERATOR[i + 1]);
+        i += 1;
+    }
+    out
+};
+
+/// Precomputed GF(2^8) multiply tables for syndrome roots `GF.0[0..NSYM]` (4 KiB, L1-resident).
+const ROOT_MUL: [[u8; 256]; NSYM] = {
+    let mut out = [[0u8; 256]; NSYM];
+    let mut i = 0;
+    while i < NSYM {
+        out[i] = mul_table_for(GF.0[i]);
+        i += 1;
+    }
+    out
+};
+
 /// Append systematic parity in the last 16 bytes (leading zero symbols may be shortened).
 pub fn encode_codeword(word: &mut [u8]) -> io::Result<()> {
     if !(NSYM..=WORD).contains(&word.len()) {
@@ -74,28 +113,31 @@ pub fn encode_codeword(word: &mut [u8]) -> io::Result<()> {
     let (data, parity) = word.split_at_mut(word.len() - NSYM);
     parity.fill(0);
     for &symbol in data.iter() {
-        let lead = symbol ^ parity[0];
+        let lead = (symbol ^ parity[0]) as usize;
         for i in 0..NSYM - 1 {
-            parity[i] = parity[i + 1] ^ mul(lead, GENERATOR[i + 1]);
+            parity[i] = parity[i + 1] ^ GEN_MUL[i][lead];
         }
-        parity[NSYM - 1] = mul(lead, GENERATOR[NSYM]);
+        parity[NSYM - 1] = GEN_MUL[NSYM - 1][lead];
     }
     Ok(())
 }
+
 fn syndromes(word: &[u8]) -> [u8; NSYM] {
-    std::array::from_fn(|i| word.iter().fold(0, |acc, &b| mul(acc, GF.0[i]) ^ b))
+    let mut out = [0u8; NSYM];
+    out[0] = word.iter().fold(0, |acc, &b| acc ^ b);
+    for i in 1..NSYM {
+        let tbl = &ROOT_MUL[i];
+        out[i] = word.iter().fold(0, |acc, &b| tbl[acc as usize] ^ b);
+    }
+    out
 }
+
 // Locator/evaluator coefficients are stored in ascending powers.
 fn evaluate(poly: &[u8], x: u8) -> u8 {
     poly.iter().rev().fold(0, |acc, &c| mul(acc, x) ^ c)
 }
 
-/// Locate and correct unknown symbol errors. A failed word is left untouched.
-pub fn correct_codeword(word: &mut [u8]) -> io::Result<usize> {
-    if !(NSYM..=WORD).contains(&word.len()) {
-        return Err(invalid());
-    }
-    let s = syndromes(word);
+fn correct_codeword_with_syndromes(word: &mut [u8], s: [u8; NSYM]) -> io::Result<usize> {
     if s == [0; NSYM] {
         return Ok(0);
     }
@@ -168,6 +210,15 @@ pub fn correct_codeword(word: &mut [u8]) -> io::Result<usize> {
     Ok(roots)
 }
 
+/// Locate and correct unknown symbol errors. A failed word is left untouched.
+pub fn correct_codeword(word: &mut [u8]) -> io::Result<usize> {
+    if !(NSYM..=WORD).contains(&word.len()) {
+        return Err(invalid());
+    }
+    let s = syndromes(word);
+    correct_codeword_with_syndromes(word, s)
+}
+
 const fn crc32(bytes: &[u8], len: usize) -> u32 {
     let mut crc = !0u32;
     let mut i = 0;
@@ -238,57 +289,561 @@ fn block_count(size: u64) -> io::Result<u64> {
     Ok(bytes / RS_BLOCK_WIRE_SIZE as u64)
 }
 
-// Keep only one interleaved block and a single contiguous codeword as scratch.
+#[inline]
+fn block_offset(inner: usize) -> usize {
+    (inner % DATA) * LANES + inner / DATA
+}
+
+fn copy_out_slice(block: &[u8], at: usize, out: &mut [u8]) {
+    let mut row = at % DATA;
+    let mut lane = at / DATA;
+    for b in out.iter_mut() {
+        *b = block[row * LANES + lane];
+        row += 1;
+        if row == DATA {
+            row = 0;
+            lane += 1;
+        }
+    }
+}
+
+/// Transpose linear block data (`4`-byte length prefix + payload + zero tail = `DATA * LANES`)
+/// into the `239 x 64` interleaved wire layout and append `16 x 64` systematic RS parity.
+fn encode_linear_block_in_place(block: &mut [u8]) {
+    debug_assert_eq!(block.len(), RS_BLOCK_WIRE_SIZE);
+    let mut linear = [0u8; DATA * LANES];
+    linear.copy_from_slice(&block[..DATA * LANES]);
+    for lane in 0..LANES {
+        let src = &linear[lane * DATA..(lane + 1) * DATA];
+        for (row, &byte) in src.iter().enumerate() {
+            block[row * LANES + lane] = byte;
+        }
+    }
+    encode_block_slice(block);
+}
+
+/// De-interleave the authenticated inner payload bytes (`len` bytes starting at inner offset 4)
+/// into contiguous linear layout at `block[..len]` so readers can serve via linear `memcpy`.
+fn linearize_decoded_block_in_place(block: &mut [u8], len: usize) {
+    debug_assert!(len <= RS_BLOCK_DATA_CAP);
+    if len == 0 {
+        return;
+    }
+    let mut linear = [0u8; DATA * LANES];
+    let needed_lanes = (4 + len).div_ceil(DATA);
+    for (row, wire_row) in block[..DATA * LANES]
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        for (lane, &byte) in wire_row[..needed_lanes].iter().enumerate() {
+            linear[lane * DATA + row] = byte;
+        }
+    }
+    block[..len].copy_from_slice(&linear[4..4 + len]);
+}
+
+/// Row-interleaved 64-lane systematic RS(255,239) encoder operating directly on
+/// one `RS_BLOCK_WIRE_SIZE` wire block. Produces bit-identical parity to per-lane
+/// [`encode_codeword`] while keeping all 64 lanes contiguous and branchless.
+fn encode_block_slice(block: &mut [u8]) {
+    debug_assert_eq!(block.len(), RS_BLOCK_WIRE_SIZE);
+    let mut parity = [[0u8; LANES]; NSYM];
+    let mut lead = [0u8; LANES];
+
+    for r in 0..DATA {
+        let row = &block[r * LANES..(r + 1) * LANES];
+        for l in 0..LANES {
+            lead[l] = row[l] ^ parity[0][l];
+        }
+        for i in 0..NSYM - 1 {
+            let tbl = &GEN_MUL[i];
+            let (left, right) = parity.split_at_mut(i + 1);
+            let dst = &mut left[i];
+            let src = &right[0];
+            for l in 0..LANES {
+                dst[l] = src[l] ^ tbl[lead[l] as usize];
+            }
+        }
+        let tbl = &GEN_MUL[NSYM - 1];
+        for l in 0..LANES {
+            parity[NSYM - 1][l] = tbl[lead[l] as usize];
+        }
+    }
+
+    for (i, p_row) in parity.iter().enumerate() {
+        let off = (DATA + i) * LANES;
+        block[off..off + LANES].copy_from_slice(p_row);
+    }
+}
+
+/// Row-interleaved 64-lane syndrome evaluation + selective lane correction on
+/// one `RS_BLOCK_WIRE_SIZE` wire block. Zero-error blocks avoid all strided
+/// de-interleaving and Berlekamp-Massey work.
+fn decode_block_words(block: &mut [u8]) -> io::Result<u64> {
+    debug_assert_eq!(block.len(), RS_BLOCK_WIRE_SIZE);
+    let mut syn = [[0u8; LANES]; NSYM];
+
+    // Root 0 is GF.0[0] == 1, so syndrome 0 is pure row-wise XOR across all 64 lanes.
+    for r in 0..WORD {
+        let row = &block[r * LANES..(r + 1) * LANES];
+        for l in 0..LANES {
+            syn[0][l] ^= row[l];
+        }
+    }
+    for i in 1..NSYM {
+        let tbl = &ROOT_MUL[i];
+        let s_row = &mut syn[i];
+        for r in 0..WORD {
+            let row = &block[r * LANES..(r + 1) * LANES];
+            for l in 0..LANES {
+                s_row[l] = tbl[s_row[l] as usize] ^ row[l];
+            }
+        }
+    }
+
+    let mut any_err = [0u8; LANES];
+    for s_row in &syn {
+        for l in 0..LANES {
+            any_err[l] |= s_row[l];
+        }
+    }
+    if any_err == [0u8; LANES] {
+        return Ok(0);
+    }
+
+    let mut repaired = 0u64;
+    for (lane, &err_mask) in any_err.iter().enumerate() {
+        if err_mask == 0 {
+            continue;
+        }
+        let mut word: [u8; WORD] = std::array::from_fn(|i| block[i * LANES + lane]);
+        let lane_syn: [u8; NSYM] = std::array::from_fn(|i| syn[i][lane]);
+        let n = correct_codeword_with_syndromes(&mut word, lane_syn)?;
+        repaired += n as u64;
+        for (i, b) in word.into_iter().enumerate() {
+            block[i * LANES + lane] = b;
+        }
+    }
+    Ok(repaired)
+}
+
+/// Decode, repair, and validate inner length & zero padding for a single wire block.
+fn decode_and_validate_block(
+    block: &mut [u8],
+    is_last: bool,
+    reject_empty_multi: bool,
+) -> io::Result<(usize, u64)> {
+    let repaired = decode_block_words(block)?;
+    let mut raw = [0u8; 4];
+    copy_out_slice(block, 0, &mut raw);
+    let len = u32::from_be_bytes(raw) as usize;
+    if len > RS_BLOCK_DATA_CAP
+        || (!is_last && len != RS_BLOCK_DATA_CAP)
+        || (reject_empty_multi && len == 0)
+        || (len + 4..DATA * LANES).any(|i| block[block_offset(i)] != 0)
+    {
+        return Err(invalid());
+    }
+    Ok((len, repaired))
+}
+
+// Keep a single block helper for lightweight one-off probing.
 struct Block(Vec<u8>);
 impl Block {
     fn new() -> Self {
         Self(vec![0; RS_BLOCK_WIRE_SIZE])
     }
-    fn offset(inner: usize) -> usize {
-        (inner % DATA) * LANES + inner / DATA
-    }
     fn copy_out(&self, at: usize, out: &mut [u8]) {
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = self.0[Self::offset(at + i)];
-        }
-    }
-    fn copy_in(&mut self, at: usize, data: &[u8]) {
-        for (i, &b) in data.iter().enumerate() {
-            self.0[Self::offset(at + i)] = b;
-        }
-    }
-    fn words(&mut self, encode: bool) -> io::Result<u64> {
-        let mut repaired = 0;
-        for lane in 0..LANES {
-            let mut word: [u8; WORD] = std::array::from_fn(|i| self.0[i * LANES + lane]);
-            if encode {
-                encode_codeword(&mut word)?;
-            } else {
-                let n = correct_codeword(&mut word)?;
-                if n == 0 {
-                    continue;
-                }
-                repaired += n as u64;
-            }
-            for (i, b) in word.into_iter().enumerate() {
-                self.0[i * LANES + lane] = b;
-            }
-        }
-        Ok(repaired)
+        copy_out_slice(&self.0, at, out);
     }
     fn read(&mut self, r: &mut impl Read, last: bool) -> io::Result<(usize, u64)> {
         r.read_exact(&mut self.0)?;
-        let repaired = self.words(false)?;
-        let mut raw = [0; 4];
-        self.copy_out(0, &mut raw);
-        let len = u32::from_be_bytes(raw) as usize;
-        if len > RS_BLOCK_DATA_CAP
-            || (!last && len != RS_BLOCK_DATA_CAP)
-            || (len + 4..DATA * LANES).any(|i| self.0[Self::offset(i)] != 0)
-        {
-            return Err(invalid());
+        decode_and_validate_block(&mut self.0, last, false)
+    }
+}
+
+fn rs_batch_cap(threads: usize) -> usize {
+    if threads <= 1 {
+        1
+    } else {
+        (threads * 4).clamp(8, MAX_RS_BATCH_BLOCKS)
+    }
+}
+
+enum SlabTask {
+    Encode {
+        bytes: Vec<u8>,
+    },
+    Decode {
+        bytes: Vec<u8>,
+        first_block_idx: u64,
+        total_blocks: u64,
+        linearize: bool,
+    },
+}
+
+enum SlabResult {
+    Encoded(Vec<u8>),
+    Decoded {
+        bytes: Vec<u8>,
+        outcomes: Vec<Result<(usize, u64), ()>>,
+    },
+}
+
+fn execute_slab_task(task: SlabTask) -> SlabResult {
+    match task {
+        SlabTask::Encode { mut bytes } => {
+            for blk in bytes.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                encode_linear_block_in_place(blk);
+            }
+            SlabResult::Encoded(bytes)
         }
-        Ok((len, repaired))
+        SlabTask::Decode {
+            mut bytes,
+            first_block_idx,
+            total_blocks,
+            linearize,
+        } => {
+            let n = bytes.len() / RS_BLOCK_WIRE_SIZE;
+            let mut outcomes = Vec::with_capacity(n);
+            let reject_empty_multi = total_blocks != 1;
+            for (i, blk) in bytes
+                .as_chunks_mut::<RS_BLOCK_WIRE_SIZE>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                let is_last = first_block_idx + (i as u64) + 1 == total_blocks;
+                match decode_and_validate_block(blk, is_last, reject_empty_multi) {
+                    Ok((len, repaired)) => {
+                        if linearize {
+                            linearize_decoded_block_in_place(blk, len);
+                        }
+                        outcomes.push(Ok((len, repaired)));
+                    }
+                    Err(_) => outcomes.push(Err(())),
+                }
+            }
+            SlabResult::Decoded { bytes, outcomes }
+        }
+    }
+}
+
+struct HelperSlot {
+    task: Option<SlabTask>,
+    result: Option<SlabResult>,
+    shutdown: bool,
+    panicked: bool,
+}
+
+struct HelperExitGuard {
+    state: Arc<(Mutex<HelperSlot>, Condvar)>,
+}
+
+impl Drop for HelperExitGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let (lock, cv) = &*self.state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            slot.panicked = true;
+            slot.shutdown = true;
+            drop(slot);
+            cv.notify_all();
+        }
+    }
+}
+
+struct HelperWorker {
+    state: Arc<(Mutex<HelperSlot>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Reusable, lazily-initialized, `#![forbid(unsafe_code)]` worker pool owned by a
+/// single RS encoder/reader/scanner instance. Avoids per-batch OS thread creation
+/// while keeping zero global state and joining cleanly on drop.
+struct RsWorkerPool {
+    helpers: Vec<HelperWorker>,
+    #[cfg(test)]
+    helper_tasks_executed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RsWorkerPool {
+    fn new(threads: usize) -> Self {
+        let mut pool = Self {
+            helpers: Vec::new(),
+            #[cfg(test)]
+            helper_tasks_executed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        pool.ensure_threads(threads);
+        pool
+    }
+
+    /// Grow the helper pool on demand up to `threads - 1` (capped at `MAX_RS_BATCH_BLOCKS - 1`),
+    /// avoiding over-spawning idle OS threads on small multi-block reads or flushes.
+    fn ensure_threads(&mut self, threads: usize) {
+        let target_helpers = threads.min(MAX_RS_BATCH_BLOCKS).saturating_sub(1);
+        if self.helpers.len() >= target_helpers {
+            return;
+        }
+        self.helpers.reserve(target_helpers - self.helpers.len());
+        for _ in self.helpers.len()..target_helpers {
+            let state = Arc::new((
+                Mutex::new(HelperSlot {
+                    task: None,
+                    result: None,
+                    shutdown: false,
+                    panicked: false,
+                }),
+                Condvar::new(),
+            ));
+            let worker_state = Arc::clone(&state);
+            #[cfg(test)]
+            let task_counter = Arc::clone(&self.helper_tasks_executed);
+            let Ok(handle) = thread::Builder::new().spawn(move || {
+                let _guard = HelperExitGuard {
+                    state: Arc::clone(&worker_state),
+                };
+                let (lock, cv) = &*worker_state;
+                loop {
+                    let task = {
+                        let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if slot.shutdown {
+                                slot.task.take();
+                                return;
+                            }
+                            if let Some(t) = slot.task.take() {
+                                break t;
+                            }
+                            slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let res = execute_slab_task(task);
+                    #[cfg(test)]
+                    task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    slot.result = Some(res);
+                    drop(slot);
+                    cv.notify_one();
+                }
+            }) else {
+                // Gracefully degrade to the helpers already spawned (or inline execution)
+                // if the OS refuses additional threads.
+                break;
+            };
+            self.helpers.push(HelperWorker {
+                state,
+                handle: Some(handle),
+            });
+        }
+    }
+
+    fn run_encode_slabs(&mut self, slabs: &mut [Vec<u8>]) -> io::Result<()> {
+        if slabs.is_empty() {
+            return Ok(());
+        }
+        if slabs.len() == 1 || self.helpers.is_empty() {
+            for slab in slabs {
+                for blk in slab.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                    encode_linear_block_in_place(blk);
+                }
+            }
+            return Ok(());
+        }
+
+        let active_helpers = (slabs.len() - 1).min(self.helpers.len());
+        let mut dispatched = 0usize;
+        let mut first_err: Option<io::Error> = None;
+        for i in 0..active_helpers {
+            let (lock, cv) = &*self.helpers[i].state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.panicked {
+                first_err = Some(io::Error::other("Reed-Solomon worker thread failed"));
+                break;
+            }
+            let bytes = std::mem::take(&mut slabs[i + 1]);
+            slot.task = Some(SlabTask::Encode { bytes });
+            drop(slot);
+            cv.notify_one();
+            dispatched += 1;
+        }
+
+        if first_err.is_none() {
+            // Calling thread encodes slab 0 (and any overflow slabs beyond helper_count) directly.
+            for blk in slabs[0].as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                encode_linear_block_in_place(blk);
+            }
+            for slab in &mut slabs[(active_helpers + 1)..] {
+                for blk in slab.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                    encode_linear_block_in_place(blk);
+                }
+            }
+        }
+
+        // Always collect every dispatched helper so slabs are restored and no stale result lingers.
+        for i in 0..dispatched {
+            let (lock, cv) = &*self.helpers[i].state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(SlabResult::Encoded(bytes)) = slot.result.take() {
+                    slabs[i + 1] = bytes;
+                    break;
+                }
+                if slot.panicked {
+                    if first_err.is_none() {
+                        first_err = Some(io::Error::other("Reed-Solomon worker thread failed"));
+                    }
+                    break;
+                }
+                slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn run_decode_slabs(
+        &mut self,
+        slabs: &mut [Vec<u8>],
+        first_block_idx: u64,
+        total_blocks: u64,
+        linearize: bool,
+    ) -> io::Result<Vec<Result<(usize, u64), ()>>> {
+        let total_in_batch: usize = slabs.iter().map(|s| s.len() / RS_BLOCK_WIRE_SIZE).sum();
+        let mut all_outcomes = Vec::with_capacity(total_in_batch);
+        if total_in_batch == 0 {
+            return Ok(all_outcomes);
+        }
+
+        if slabs.len() == 1 || self.helpers.is_empty() {
+            let mut cursor = first_block_idx;
+            for slab in slabs {
+                let bytes = std::mem::take(slab);
+                let n = bytes.len() / RS_BLOCK_WIRE_SIZE;
+                let SlabResult::Decoded { bytes, outcomes } = execute_slab_task(SlabTask::Decode {
+                    bytes,
+                    first_block_idx: cursor,
+                    total_blocks,
+                    linearize,
+                }) else {
+                    unreachable!()
+                };
+                *slab = bytes;
+                all_outcomes.extend(outcomes);
+                cursor += n as u64;
+            }
+            return Ok(all_outcomes);
+        }
+
+        let active_helpers = (slabs.len() - 1).min(self.helpers.len());
+        let mut slab_starts = Vec::with_capacity(slabs.len());
+        let mut cursor = first_block_idx;
+        for slab in slabs.iter() {
+            slab_starts.push(cursor);
+            cursor += (slab.len() / RS_BLOCK_WIRE_SIZE) as u64;
+        }
+
+        let mut dispatched = 0usize;
+        let mut first_err: Option<io::Error> = None;
+        for i in 0..active_helpers {
+            let (lock, cv) = &*self.helpers[i].state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.panicked {
+                first_err = Some(io::Error::other("Reed-Solomon worker thread failed"));
+                break;
+            }
+            let bytes = std::mem::take(&mut slabs[i + 1]);
+            slot.task = Some(SlabTask::Decode {
+                bytes,
+                first_block_idx: slab_starts[i + 1],
+                total_blocks,
+                linearize,
+            });
+            drop(slot);
+            cv.notify_one();
+            dispatched += 1;
+        }
+
+        if first_err.is_none() {
+            // Calling thread decodes slab 0 directly.
+            let bytes0 = std::mem::take(&mut slabs[0]);
+            let SlabResult::Decoded {
+                bytes: decoded0,
+                outcomes: outcomes0,
+            } = execute_slab_task(SlabTask::Decode {
+                bytes: bytes0,
+                first_block_idx: slab_starts[0],
+                total_blocks,
+                linearize,
+            })
+            else {
+                unreachable!()
+            };
+            slabs[0] = decoded0;
+            all_outcomes.extend(outcomes0);
+        }
+
+        // Always collect every dispatched helper so slabs are restored and no stale result lingers.
+        for i in 0..dispatched {
+            let (lock, cv) = &*self.helpers[i].state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(SlabResult::Decoded { bytes, outcomes }) = slot.result.take() {
+                    slabs[i + 1] = bytes;
+                    if first_err.is_none() {
+                        all_outcomes.extend(outcomes);
+                    }
+                    break;
+                }
+                if slot.panicked {
+                    if first_err.is_none() {
+                        first_err = Some(io::Error::other("Reed-Solomon worker thread failed"));
+                    }
+                    break;
+                }
+                slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+
+        for (idx, slab) in slabs.iter_mut().enumerate().skip(active_helpers + 1) {
+            let bytes = std::mem::take(slab);
+            let SlabResult::Decoded { bytes, outcomes } = execute_slab_task(SlabTask::Decode {
+                bytes,
+                first_block_idx: slab_starts[idx],
+                total_blocks,
+                linearize,
+            }) else {
+                unreachable!()
+            };
+            *slab = bytes;
+            all_outcomes.extend(outcomes);
+        }
+
+        Ok(all_outcomes)
+    }
+}
+
+impl Drop for RsWorkerPool {
+    fn drop(&mut self) {
+        for helper in &self.helpers {
+            let (lock, cv) = &*helper.state;
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            slot.shutdown = true;
+            drop(slot);
+            cv.notify_all();
+        }
+        for helper in &mut self.helpers {
+            if let Some(handle) = helper.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -338,50 +893,159 @@ pub fn probe_rs_header(r: &mut (impl Read + Seek)) -> io::Result<bool> {
 
 pub struct RsEncoderWriter<W> {
     inner: W,
-    block: Block,
+    /// Disjoint byte slabs holding up to `batch_cap` blocks (~1 MiB max), reused across flushes.
+    slabs: Vec<Vec<u8>>,
+    /// Number of completely populated (unencoded) blocks across `slabs`.
+    filled_blocks: usize,
+    /// Bytes written into the current in-progress block (`0..RS_BLOCK_DATA_CAP`).
     used: usize,
     wrote: bool,
+    threads: usize,
+    batch_cap: usize,
+    blocks_per_slab: usize,
+    pool: Option<RsWorkerPool>,
 }
+
 impl<W: Write> RsEncoderWriter<W> {
-    pub fn new(mut inner: W) -> io::Result<Self> {
+    pub fn new(inner: W) -> io::Result<Self> {
+        Self::with_threads(inner, 0)
+    }
+
+    pub fn with_threads(mut inner: W, requested_threads: usize) -> io::Result<Self> {
         inner.write_all(&PREFIX)?;
+        let threads = resolve_pipeline_threads(requested_threads);
+        let batch_cap = rs_batch_cap(threads);
+        let slab_count = threads.min(batch_cap).max(1);
+        let blocks_per_slab = batch_cap.div_ceil(slab_count).max(1);
         Ok(Self {
             inner,
-            block: Block::new(),
+            slabs: Vec::new(),
+            filled_blocks: 0,
             used: 0,
             wrote: false,
+            threads,
+            batch_cap,
+            blocks_per_slab,
+            pool: None,
         })
     }
-    fn emit(&mut self) -> io::Result<()> {
-        self.block.copy_in(0, &(self.used as u32).to_be_bytes());
-        self.block.words(true)?;
-        self.inner.write_all(&self.block.0)?;
-        self.block.0.fill(0);
-        self.used = 0;
+
+    fn current_block_mut(&mut self) -> &mut [u8] {
+        let slab_idx = self.filled_blocks / self.blocks_per_slab;
+        let in_slab = self.filled_blocks % self.blocks_per_slab;
+        while self.slabs.len() <= slab_idx {
+            self.slabs.push(Vec::new());
+        }
+        let needed_len = (in_slab + 1) * RS_BLOCK_WIRE_SIZE;
+        let slab = &mut self.slabs[slab_idx];
+        if slab.len() < needed_len {
+            slab.resize(needed_len, 0);
+        }
+        let start = in_slab * RS_BLOCK_WIRE_SIZE;
+        &mut slab[start..start + RS_BLOCK_WIRE_SIZE]
+    }
+
+    fn flush_filled_blocks(&mut self) -> io::Result<()> {
+        if self.filled_blocks == 0 {
+            return Ok(());
+        }
+        let active_slabs = self.filled_blocks.div_ceil(self.blocks_per_slab);
+        // Trim each active slab's logical length to the exact number of filled blocks it holds
+        // without shrinking capacity so allocations are reused on subsequent batches.
+        let mut remaining = self.filled_blocks;
+        for slab in self.slabs.iter_mut().take(active_slabs) {
+            let take = remaining.min(self.blocks_per_slab);
+            slab.truncate(take * RS_BLOCK_WIRE_SIZE);
+            remaining -= take;
+        }
+
+        if active_slabs >= 2 && self.threads >= 2 {
+            let needed_threads = active_slabs.min(self.threads);
+            let pool = self
+                .pool
+                .get_or_insert_with(|| RsWorkerPool::new(needed_threads));
+            pool.ensure_threads(needed_threads);
+            pool.run_encode_slabs(&mut self.slabs[..active_slabs])?;
+        } else {
+            for slab in self.slabs.iter_mut().take(active_slabs) {
+                for blk in slab.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                    encode_linear_block_in_place(blk);
+                }
+            }
+        }
+
+        for slab in self.slabs.iter().take(active_slabs) {
+            self.inner.write_all(slab)?;
+        }
+        for slab in self.slabs.iter_mut().take(active_slabs) {
+            slab.clear();
+        }
+        self.filled_blocks = 0;
         self.wrote = true;
         Ok(())
     }
+
     pub fn finish(mut self) -> io::Result<W> {
-        if self.used > 0 || !self.wrote {
-            self.emit()?;
+        if self.used > 0 || (self.filled_blocks == 0 && !self.wrote) {
+            let used = self.used;
+            let blk = self.current_block_mut();
+            blk[..4].copy_from_slice(&(used as u32).to_be_bytes());
+            // Zero any unused data tail in the final partial block so stale bytes never leak.
+            blk[4 + used..DATA * LANES].fill(0);
+            self.filled_blocks += 1;
+            self.used = 0;
         }
+        self.flush_filled_blocks()?;
         self.inner.flush()?;
         Ok(self.inner)
     }
 }
+
 impl<W: Write> Write for RsEncoderWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let n = data.len().min(RS_BLOCK_DATA_CAP - self.used);
-        self.block.copy_in(4 + self.used, &data[..n]);
-        self.used += n;
-        if self.used == RS_BLOCK_DATA_CAP {
-            self.emit()?;
+        if data.is_empty() {
+            return Ok(0);
         }
-        Ok(n)
+        let mut written = 0usize;
+        while written < data.len() {
+            let n = (data.len() - written).min(RS_BLOCK_DATA_CAP - self.used);
+            let used = self.used;
+            let new_used = used + n;
+            let blk = self.current_block_mut();
+            blk[4 + used..4 + new_used].copy_from_slice(&data[written..written + n]);
+            if new_used == RS_BLOCK_DATA_CAP {
+                blk[..4].copy_from_slice(&(RS_BLOCK_DATA_CAP as u32).to_be_bytes());
+            }
+            written += n;
+            if new_used == RS_BLOCK_DATA_CAP {
+                self.filled_blocks += 1;
+                self.used = 0;
+                if self.filled_blocks >= self.batch_cap {
+                    self.flush_filled_blocks()?;
+                }
+            } else {
+                self.used = new_used;
+            }
+        }
+        Ok(written)
     }
+
     fn flush(&mut self) -> io::Result<()> {
+        // Flush any already-complete blocks; partial trailing block waits for `finish()`.
+        if self.used == 0 {
+            self.flush_filled_blocks()?;
+        }
         self.inner.flush()
     }
+}
+
+enum CachedBlockOutcome {
+    Ok {
+        len: usize,
+        repaired: u64,
+        counted: bool,
+    },
+    Invalid,
 }
 
 pub struct RsSeekableReader<R> {
@@ -389,13 +1053,26 @@ pub struct RsSeekableReader<R> {
     blocks: u64,
     pos: u64,
     len: u64,
-    cache: Block,
-    cached: Option<u64>,
+    slabs: Vec<Vec<u8>>,
+    slab_block_counts: Vec<usize>,
+    outcomes: Vec<CachedBlockOutcome>,
+    pending_io_err: Option<(u64, io::Error)>,
+    window_start: u64,
+    window_len: usize,
+    last_sequential_end: Option<u64>,
     repaired: u64,
     last_block_counted: bool,
+    threads: usize,
+    batch_cap: usize,
+    pool: Option<RsWorkerPool>,
 }
+
 impl<R: Read + Seek> RsSeekableReader<R> {
-    pub fn new(mut inner: R) -> io::Result<Self> {
+    pub fn new(inner: R) -> io::Result<Self> {
+        Self::with_threads(inner, 0)
+    }
+
+    pub fn with_threads(mut inner: R, requested_threads: usize) -> io::Result<Self> {
         if !probe_rs_header(&mut inner)? {
             return Err(invalid());
         }
@@ -404,44 +1081,198 @@ impl<R: Read + Seek> RsSeekableReader<R> {
         let mut h = [0; HEADER];
         inner.read_exact(&mut h)?;
         check_profile(&h)?;
+        let threads = resolve_pipeline_threads(requested_threads);
+        let batch_cap = rs_batch_cap(threads);
         let mut reader = Self {
             inner,
             blocks,
             pos: 0,
             len: 0,
-            cache: Block::new(),
-            cached: None,
+            slabs: Vec::new(),
+            slab_block_counts: Vec::new(),
+            outcomes: Vec::new(),
+            pending_io_err: None,
+            window_start: 0,
+            window_len: 0,
+            last_sequential_end: None,
             repaired: differences(&h),
             last_block_counted: false,
+            threads,
+            batch_cap,
+            pool: None,
         };
-        let last = reader.load(blocks - 1)?;
+        // Pre-inspect only the trailing block to determine exact inner stream length.
+        reader.load_window(blocks - 1, 1)?;
+        let last = reader.access_cached_block(blocks - 1)?;
         reader.len = (blocks - 1) * RS_BLOCK_DATA_CAP as u64 + last as u64;
+        reader.last_sequential_end = None;
         Ok(reader)
     }
-    fn load(&mut self, index: u64) -> io::Result<usize> {
-        self.cached = None;
-        let is_last = index + 1 == self.blocks;
-        self.inner.seek(SeekFrom::Start(
-            HEADER as u64 + index * RS_BLOCK_WIRE_SIZE as u64,
-        ))?;
-        let (len, count) = self.cache.read(&mut self.inner, is_last)?;
-        if len == 0 && self.blocks != 1 {
-            return Err(invalid());
+
+    fn locate_in_slabs(&self, rel: usize) -> (usize, usize) {
+        let mut rem = rel;
+        for (s_idx, &count) in self.slab_block_counts.iter().enumerate() {
+            if rem < count {
+                return (s_idx, rem);
+            }
+            rem -= count;
         }
-        self.cached = Some(index);
-        if !(is_last && self.last_block_counted) {
-            self.repaired += count;
-        }
-        if is_last {
-            self.last_block_counted = true;
-        }
-        Ok(len)
+        unreachable!("rel index out of cached window")
     }
+
+    fn load_window(&mut self, start_idx: u64, requested_count: usize) -> io::Result<()> {
+        self.window_len = 0;
+        self.outcomes.clear();
+        self.slab_block_counts.clear();
+        self.pending_io_err = None;
+
+        let count = (requested_count as u64)
+            .min(self.blocks.saturating_sub(start_idx))
+            .max(1) as usize;
+        self.inner.seek(SeekFrom::Start(
+            HEADER as u64 + start_idx * RS_BLOCK_WIRE_SIZE as u64,
+        ))?;
+
+        let pool_threads = self
+            .threads
+            .min(self.blocks.min(MAX_RS_BATCH_BLOCKS as u64) as usize)
+            .max(1);
+        let worker_count = if count >= 2 && pool_threads >= 2 {
+            pool_threads.min(count)
+        } else {
+            1
+        };
+        let per_slab = count.div_ceil(worker_count).max(1);
+
+        while self.slabs.len() < worker_count {
+            self.slabs.push(Vec::new());
+        }
+
+        let mut read_blocks = 0usize;
+        let mut io_failure: Option<io::Error> = None;
+        let mut active_slabs = 0usize;
+
+        for s_idx in 0..worker_count {
+            if read_blocks >= count {
+                break;
+            }
+            let want_here = (count - read_blocks).min(per_slab);
+            let slab = &mut self.slabs[s_idx];
+            slab.resize(want_here * RS_BLOCK_WIRE_SIZE, 0);
+            let mut got_here = 0usize;
+            for b in 0..want_here {
+                let off = b * RS_BLOCK_WIRE_SIZE;
+                match self
+                    .inner
+                    .read_exact(&mut slab[off..off + RS_BLOCK_WIRE_SIZE])
+                {
+                    Ok(()) => {
+                        got_here += 1;
+                    }
+                    Err(e) => {
+                        io_failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            slab.truncate(got_here * RS_BLOCK_WIRE_SIZE);
+            if got_here > 0 {
+                self.slab_block_counts.push(got_here);
+                active_slabs += 1;
+                read_blocks += got_here;
+            }
+            if io_failure.is_some() {
+                break;
+            }
+        }
+
+        if read_blocks == 0 {
+            return Err(io_failure.unwrap_or_else(invalid));
+        }
+
+        let decoded = if active_slabs >= 2 && pool_threads >= 2 {
+            let needed_threads = active_slabs.min(pool_threads);
+            let pool = self
+                .pool
+                .get_or_insert_with(|| RsWorkerPool::new(needed_threads));
+            pool.ensure_threads(needed_threads);
+            pool.run_decode_slabs(
+                &mut self.slabs[..active_slabs],
+                start_idx,
+                self.blocks,
+                true,
+            )?
+        } else {
+            let mut single = Vec::with_capacity(read_blocks);
+            let mut cur = start_idx;
+            let reject_empty_multi = self.blocks != 1;
+            for slab in self.slabs.iter_mut().take(active_slabs) {
+                for blk in slab.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                    let is_last = cur + 1 == self.blocks;
+                    match decode_and_validate_block(blk, is_last, reject_empty_multi) {
+                        Ok((len, repaired)) => {
+                            linearize_decoded_block_in_place(blk, len);
+                            single.push(Ok((len, repaired)));
+                        }
+                        Err(_) => single.push(Err(())),
+                    }
+                    cur += 1;
+                }
+            }
+            single
+        };
+
+        for item in decoded {
+            match item {
+                Ok((len, repaired)) => self.outcomes.push(CachedBlockOutcome::Ok {
+                    len,
+                    repaired,
+                    counted: false,
+                }),
+                Err(()) => self.outcomes.push(CachedBlockOutcome::Invalid),
+            }
+        }
+
+        if let Some(err) = io_failure {
+            self.pending_io_err = Some((start_idx + read_blocks as u64, err));
+        }
+
+        self.window_start = start_idx;
+        self.window_len = self.outcomes.len();
+        self.last_sequential_end = Some(start_idx + read_blocks as u64);
+        Ok(())
+    }
+
+    fn access_cached_block(&mut self, index: u64) -> io::Result<usize> {
+        let rel = (index - self.window_start) as usize;
+        let is_last = index + 1 == self.blocks;
+        match &mut self.outcomes[rel] {
+            CachedBlockOutcome::Ok {
+                len,
+                repaired,
+                counted,
+            } => {
+                if !*counted {
+                    *counted = true;
+                    if !(is_last && self.last_block_counted) {
+                        self.repaired += *repaired;
+                    }
+                    if is_last {
+                        self.last_block_counted = true;
+                    }
+                }
+                Ok(*len)
+            }
+            CachedBlockOutcome::Invalid => Err(invalid()),
+        }
+    }
+
     /// Corrections encountered during reads (counts the pre-inspected final block once; revisited blocks recount).
     pub fn repaired_bytes(&self) -> u64 {
         self.repaired
     }
 }
+
 impl<R: Read + Seek> Read for RsSeekableReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.len || out.is_empty() {
@@ -449,15 +1280,45 @@ impl<R: Read + Seek> Read for RsSeekableReader<R> {
         }
         let index = self.pos / RS_BLOCK_DATA_CAP as u64;
         let start = (self.pos % RS_BLOCK_DATA_CAP as u64) as usize;
-        if self.cached != Some(index) {
-            self.load(index)?;
+        let in_window =
+            index >= self.window_start && index < self.window_start + self.window_len as u64;
+        if !in_window {
+            if self
+                .pending_io_err
+                .as_ref()
+                .is_some_and(|(err_idx, _)| *err_idx == index)
+            {
+                return Err(self.pending_io_err.take().unwrap().1);
+            }
+            let needed = start
+                .saturating_add(out.len())
+                .div_ceil(RS_BLOCK_DATA_CAP)
+                .max(1);
+            let is_sequential = self.last_sequential_end == Some(index);
+            let want = if self.threads <= 1 {
+                1
+            } else if is_sequential {
+                self.batch_cap
+            } else if needed > 1 {
+                needed.min(self.batch_cap)
+            } else {
+                1
+            };
+            self.load_window(index, want)?;
         }
-        let n = (out.len().min(RS_BLOCK_DATA_CAP - start) as u64).min(self.len - self.pos) as usize;
-        self.cache.copy_out(4 + start, &mut out[..n]);
+        let block_len = self.access_cached_block(index)?;
+        let n = (out.len().min(block_len.saturating_sub(start)) as u64).min(self.len - self.pos)
+            as usize;
+        let rel = (index - self.window_start) as usize;
+        let (slab_idx, in_slab) = self.locate_in_slabs(rel);
+        let blk_off = in_slab * RS_BLOCK_WIRE_SIZE;
+        let blk = &self.slabs[slab_idx][blk_off..blk_off + RS_BLOCK_WIRE_SIZE];
+        out[..n].copy_from_slice(&blk[start..start + n]);
         self.pos += n as u64;
         Ok(n)
     }
 }
+
 impl<R: Read + Seek> Seek for RsSeekableReader<R> {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         self.pos = match from {
@@ -477,31 +1338,66 @@ pub struct RepairReport {
     pub header_repaired: bool,
 }
 
-// Forward-only decoder shared by passwordless structural scanning and repair.
+enum ScanOutcome {
+    Ok(usize, u64),
+    Invalid,
+    IoError(Option<io::Error>),
+}
+
+// Forward-only batch-parallel decoder shared by passwordless structural scanning and repair.
 // Disk bytes can be hashed below this adapter, before any correction.
-pub(crate) struct Scan<R> {
+pub(crate) struct Scan<'c, R> {
     inner: R,
-    block: Block,
+    slabs: Vec<Vec<u8>>,
+    slab_block_counts: Vec<usize>,
+    outcomes: Vec<ScanOutcome>,
+    batch_cursor: usize,
+    active_rel: Option<usize>,
     count: u64,
+    fetched: u64,
     next: u64,
     offset: usize,
     len: usize,
+    threads: usize,
+    batch_cap: usize,
+    preserve_wire: bool,
+    pool: Option<RsWorkerPool>,
+    cancel: Option<&'c AtomicBool>,
     pub report: RepairReport,
 }
-impl<R: Read> Scan<R> {
-    pub fn new(mut inner: R, size: u64) -> io::Result<Self> {
+
+impl<'c, R: Read> Scan<'c, R> {
+    pub fn new_with_options(
+        mut inner: R,
+        size: u64,
+        requested_threads: usize,
+        preserve_wire: bool,
+        cancel: Option<&'c AtomicBool>,
+    ) -> io::Result<Self> {
         let count = block_count(size)?;
         let mut prefix = [0; HEADER];
         inner.read_exact(&mut prefix)?;
         check_profile(&prefix)?;
         let changed = differences(&prefix);
+        let threads = resolve_pipeline_threads(requested_threads);
+        let batch_cap = rs_batch_cap(threads);
         Ok(Self {
             inner,
-            block: Block::new(),
+            slabs: Vec::new(),
+            slab_block_counts: Vec::new(),
+            outcomes: Vec::new(),
+            batch_cursor: 0,
+            active_rel: None,
             count,
+            fetched: 0,
             next: 0,
             offset: 0,
             len: 0,
+            threads,
+            batch_cap,
+            preserve_wire,
+            pool: None,
+            cancel,
             report: RepairReport {
                 blocks_checked: 0,
                 repaired_bytes: changed,
@@ -509,39 +1405,201 @@ impl<R: Read> Scan<R> {
             },
         })
     }
+
+    fn fetch_batch(&mut self) -> io::Result<()> {
+        self.outcomes.clear();
+        self.slab_block_counts.clear();
+        self.batch_cursor = 0;
+        self.active_rel = None;
+
+        let remaining = self.count - self.fetched;
+        if remaining == 0 {
+            return Ok(());
+        }
+        let want = remaining.min(self.batch_cap as u64) as usize;
+        let start_idx = self.fetched;
+
+        let pool_threads = self
+            .threads
+            .min(self.count.min(MAX_RS_BATCH_BLOCKS as u64) as usize)
+            .max(1);
+        let worker_count = if want >= 2 && pool_threads >= 2 {
+            pool_threads.min(want)
+        } else {
+            1
+        };
+        let per_slab = want.div_ceil(worker_count).max(1);
+
+        while self.slabs.len() < worker_count {
+            self.slabs.push(Vec::new());
+        }
+
+        let mut read_blocks = 0usize;
+        let mut io_failure: Option<io::Error> = None;
+        let mut active_slabs = 0usize;
+
+        for s_idx in 0..worker_count {
+            if read_blocks >= want {
+                break;
+            }
+            if crate::vault::is_cancelled(self.cancel) {
+                return Err(io::Error::other("repair cancelled"));
+            }
+            let want_here = (want - read_blocks).min(per_slab);
+            let slab = &mut self.slabs[s_idx];
+            slab.resize(want_here * RS_BLOCK_WIRE_SIZE, 0);
+            let mut got_here = 0usize;
+            for b in 0..want_here {
+                if crate::vault::is_cancelled(self.cancel) {
+                    return Err(io::Error::other("repair cancelled"));
+                }
+                let off = b * RS_BLOCK_WIRE_SIZE;
+                match self
+                    .inner
+                    .read_exact(&mut slab[off..off + RS_BLOCK_WIRE_SIZE])
+                {
+                    Ok(()) => got_here += 1,
+                    Err(e) => {
+                        io_failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            slab.truncate(got_here * RS_BLOCK_WIRE_SIZE);
+            if got_here > 0 {
+                self.slab_block_counts.push(got_here);
+                active_slabs += 1;
+                read_blocks += got_here;
+            }
+            if io_failure.is_some() {
+                break;
+            }
+        }
+
+        if crate::vault::is_cancelled(self.cancel) {
+            return Err(io::Error::other("repair cancelled"));
+        }
+
+        self.fetched += read_blocks as u64 + u64::from(io_failure.is_some());
+
+        if read_blocks > 0 {
+            let linearize = !self.preserve_wire;
+            let decoded = if active_slabs >= 2 && pool_threads >= 2 {
+                let needed_threads = active_slabs.min(pool_threads);
+                let pool = self
+                    .pool
+                    .get_or_insert_with(|| RsWorkerPool::new(needed_threads));
+                pool.ensure_threads(needed_threads);
+                pool.run_decode_slabs(
+                    &mut self.slabs[..active_slabs],
+                    start_idx,
+                    self.count,
+                    linearize,
+                )?
+            } else {
+                let mut single = Vec::with_capacity(read_blocks);
+                let mut cur = start_idx;
+                let reject_empty_multi = self.count != 1;
+                for slab in self.slabs.iter_mut().take(active_slabs) {
+                    for blk in slab.as_chunks_mut::<RS_BLOCK_WIRE_SIZE>().0 {
+                        let is_last = cur + 1 == self.count;
+                        match decode_and_validate_block(blk, is_last, reject_empty_multi) {
+                            Ok((len, repaired)) => {
+                                if linearize {
+                                    linearize_decoded_block_in_place(blk, len);
+                                }
+                                single.push(Ok((len, repaired)));
+                            }
+                            Err(_) => single.push(Err(())),
+                        }
+                        cur += 1;
+                    }
+                }
+                single
+            };
+
+            for item in decoded {
+                match item {
+                    Ok((len, n)) => self.outcomes.push(ScanOutcome::Ok(len, n)),
+                    Err(()) => self.outcomes.push(ScanOutcome::Invalid),
+                }
+            }
+        }
+
+        if let Some(err) = io_failure {
+            self.outcomes.push(ScanOutcome::IoError(Some(err)));
+        }
+        Ok(())
+    }
+
+    fn current_block_bytes(&self) -> &[u8] {
+        let mut rem = self.active_rel.expect("active block set");
+        for (s_idx, &count) in self.slab_block_counts.iter().enumerate() {
+            if rem < count {
+                let off = rem * RS_BLOCK_WIRE_SIZE;
+                return &self.slabs[s_idx][off..off + RS_BLOCK_WIRE_SIZE];
+            }
+            rem -= count;
+        }
+        unreachable!("active_rel out of bounds")
+    }
+
     pub fn next_block(&mut self) -> io::Result<bool> {
         if self.next == self.count {
             return Ok(false);
         }
+        if self.batch_cursor >= self.outcomes.len() {
+            self.fetch_batch()?;
+            if self.outcomes.is_empty() {
+                return Ok(false);
+            }
+        }
+
+        let rel = self.batch_cursor;
+        self.batch_cursor += 1;
         self.next += 1;
         self.len = 0;
         self.offset = 0;
-        let (len, n) = self.block.read(&mut self.inner, self.next == self.count)?;
-        if len == 0 && self.count != 1 {
-            return Err(invalid());
+        self.active_rel = None;
+
+        match &mut self.outcomes[rel] {
+            ScanOutcome::Ok(len, repaired) => {
+                self.len = *len;
+                self.active_rel = Some(rel);
+                self.report.blocks_checked += 1;
+                self.report.repaired_bytes += *repaired;
+                Ok(true)
+            }
+            ScanOutcome::Invalid => Err(invalid()),
+            ScanOutcome::IoError(err) => Err(err
+                .take()
+                .unwrap_or_else(|| io::Error::other("I/O error reading Reed-Solomon block"))),
         }
-        self.len = len;
-        self.report.blocks_checked += 1;
-        self.report.repaired_bytes += n;
-        Ok(true)
     }
 }
-impl<R: Read> Read for Scan<R> {
+
+impl<R: Read> Read for Scan<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() || self.offset == self.len && !self.next_block()? {
             return Ok(0);
         }
         let n = out.len().min(self.len - self.offset);
-        self.block.copy_out(4 + self.offset, &mut out[..n]);
+        let blk = self.current_block_bytes();
+        if self.preserve_wire {
+            copy_out_slice(blk, 4 + self.offset, &mut out[..n]);
+        } else {
+            out[..n].copy_from_slice(&blk[self.offset..self.offset + n]);
+        }
         self.offset += n;
         Ok(n)
     }
 }
+
 // Feed corrected inner bytes to the existing structural validator while writing
 // each corrected wire block exactly once. In particular, dropping a whole RS
 // block can leave valid syndromes while truncating the inner v5 container.
 struct RepairScan<'a, R, W> {
-    scan: Scan<R>,
+    scan: Scan<'a, R>,
     writer: &'a mut W,
     cancel: Option<&'a AtomicBool>,
     read_error: Option<io::Error>,
@@ -563,7 +1621,7 @@ impl<R: Read, W: Write> Read for RepairScan<'_, R, W> {
             Err(e) => return Err(e),
         };
         if self.scan.report.blocks_checked != before {
-            if let Err(e) = self.writer.write_all(&self.scan.block.0) {
+            if let Err(e) = self.writer.write_all(self.scan.current_block_bytes()) {
                 self.write_error = Some(e);
                 return Err(io::Error::other("cannot write repaired block"));
             }
@@ -571,10 +1629,20 @@ impl<R: Read, W: Write> Read for RepairScan<'_, R, W> {
         Ok(n)
     }
 }
+
 pub fn repair_vault_stream<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
     cancel: Option<&AtomicBool>,
+) -> Result<RepairReport, CryptoError> {
+    repair_vault_stream_with_threads(reader, writer, cancel, 0)
+}
+
+pub fn repair_vault_stream_with_threads<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: Option<&AtomicBool>,
+    threads: usize,
 ) -> Result<RepairReport, CryptoError> {
     if crate::vault::is_cancelled(cancel) {
         return Err(CryptoError::Cancelled);
@@ -586,7 +1654,7 @@ pub fn repair_vault_stream<R: Read + Seek, W: Write>(
     }
     let size = reader.seek(SeekFrom::End(0))?;
     reader.rewind()?;
-    let scan = Scan::new(reader, size)?;
+    let scan = Scan::new_with_options(reader, size, threads, true, cancel)?;
     if crate::vault::is_cancelled(cancel) {
         return Err(CryptoError::Cancelled);
     }
@@ -602,11 +1670,11 @@ pub fn repair_vault_stream<R: Read + Seek, W: Write>(
     if let Some(e) = repair.write_error {
         return Err(e.into());
     }
-    if let Some(e) = repair.read_error {
-        return Err(e.into());
-    }
     if crate::vault::is_cancelled(cancel) {
         return Err(CryptoError::Cancelled);
+    }
+    if let Some(e) = repair.read_error {
+        return Err(e.into());
     }
     if !ok {
         return Err(CryptoError::InvalidFormat(message));
@@ -622,4 +1690,217 @@ pub(crate) fn validate_mode(stealth: bool) -> Result<(), CryptoError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn worker_pool_recovers_from_panicked_helper_without_deadlock_or_lost_slabs() {
+        let mut pool = RsWorkerPool::new(4);
+        assert_eq!(pool.helpers.len(), 3);
+
+        // Simulate helper 1 having panicked prior to a batch while helper 0 is healthy.
+        {
+            let (lock, _) = &*pool.helpers[1].state;
+            let mut slot = lock.lock().unwrap();
+            slot.panicked = true;
+        }
+
+        let mut enc_slabs = vec![vec![0u8; RS_BLOCK_WIRE_SIZE]; 4];
+        let err = pool.run_encode_slabs(&mut enc_slabs).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        // Every slab (including slab 1 dispatched to healthy helper 0) must be restored.
+        assert!(enc_slabs.iter().all(|s| s.len() == RS_BLOCK_WIRE_SIZE));
+        // Healthy helper 0 must not have a lingering unconsumed result.
+        {
+            let (lock, _) = &*pool.helpers[0].state;
+            assert!(lock.lock().unwrap().result.is_none());
+        }
+
+        // Same invariant for decode slabs.
+        let mut dec_slabs = vec![vec![0u8; RS_BLOCK_WIRE_SIZE]; 4];
+        let derr = pool
+            .run_decode_slabs(&mut dec_slabs, 0, 4, true)
+            .unwrap_err();
+        assert_eq!(derr.kind(), io::ErrorKind::Other);
+        assert!(dec_slabs.iter().all(|s| s.len() == RS_BLOCK_WIRE_SIZE));
+        {
+            let (lock, _) = &*pool.helpers[0].state;
+            assert!(lock.lock().unwrap().result.is_none());
+        }
+
+        // Exercise HelperExitGuard directly on a real panicking thread so wait loop wakes cleanly.
+        let state = Arc::new((
+            Mutex::new(HelperSlot {
+                task: None,
+                result: None,
+                shutdown: false,
+                panicked: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            let _guard = HelperExitGuard {
+                state: worker_state,
+            };
+            panic!("injected helper panic");
+        });
+        let _ = handle.join();
+        let (lock, _) = &*state;
+        let slot = lock.lock().unwrap();
+        assert!(slot.panicked);
+        assert!(slot.shutdown);
+    }
+
+    #[test]
+    fn encoder_skips_worker_pool_spawn_when_only_one_slab_is_active() {
+        let payload = vec![0x3Cu8; RS_BLOCK_DATA_CAP * 3 + 100];
+        let mut enc = RsEncoderWriter::with_threads(Vec::new(), 16).unwrap();
+        enc.write_all(&payload).unwrap();
+        // With threads=16, batch_cap=64, blocks_per_slab=4 -> 3 filled blocks stay in slab 0.
+        assert!(enc.pool.is_none());
+        enc.flush().unwrap();
+        assert!(enc.pool.is_none());
+        let wire = enc.finish().unwrap();
+
+        let mut dec = Vec::new();
+        RsSeekableReader::with_threads(Cursor::new(&wire), 16)
+            .unwrap()
+            .read_to_end(&mut dec)
+            .unwrap();
+        assert_eq!(dec, payload);
+    }
+
+    #[test]
+    fn seekable_reader_preserves_os_io_error_and_recovers_on_retry() {
+        let payload: Vec<u8> = (0..(RS_BLOCK_DATA_CAP * 12 + 321))
+            .map(|i| ((i * 19 + 5) % 251) as u8)
+            .collect();
+        let mut enc = RsEncoderWriter::with_threads(Vec::new(), 4).unwrap();
+        enc.write_all(&payload).unwrap();
+        let wire = enc.finish().unwrap();
+
+        struct FaultyReader {
+            inner: Cursor<Vec<u8>>,
+            fail_offset: u64,
+            armed: bool,
+        }
+        impl Read for FaultyReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let pos = self.inner.position();
+                if self.armed
+                    && pos >= self.fail_offset
+                    && pos < self.fail_offset + RS_BLOCK_WIRE_SIZE as u64
+                {
+                    self.armed = false;
+                    return Err(io::Error::from_raw_os_error(23));
+                }
+                self.inner.read(buf)
+            }
+        }
+        impl Seek for FaultyReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+
+        // Trigger a one-shot OS error (raw code 23) on block 4 inside a multi-block prefetch window.
+        let fail_offset = HEADER as u64 + 4 * RS_BLOCK_WIRE_SIZE as u64;
+        let faulty = FaultyReader {
+            inner: Cursor::new(wire),
+            fail_offset,
+            armed: true,
+        };
+        let mut r = RsSeekableReader::with_threads(faulty, 8).unwrap();
+
+        // Blocks 0..4 must read cleanly despite block 4 failing during prefetch.
+        let mut first4 = vec![0u8; 4 * RS_BLOCK_DATA_CAP];
+        r.read_exact(&mut first4).unwrap();
+        assert_eq!(first4, payload[..first4.len()]);
+
+        // Block 4 surfaces the exact OS error (preserving raw_os_error() == Some(23)).
+        let mut blk4 = vec![0u8; RS_BLOCK_DATA_CAP];
+        let err = r.read(&mut blk4).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(23));
+
+        // Retrying block 4 after the transient fault clears must re-read from underlying reader and succeed!
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, payload[first4.len()..]);
+    }
+
+    #[test]
+    fn worker_pool_scales_helpers_on_demand_and_executes_tasks_on_helper_threads() {
+        use std::sync::atomic::Ordering;
+
+        let payload: Vec<u8> = (0..(RS_BLOCK_DATA_CAP * 20 + 123))
+            .map(|i| ((i * 7 + 11) % 251) as u8)
+            .collect();
+
+        // 1. Encoder with threads=64 flushing 3 blocks spawns only 2 helpers (not 63),
+        // then grows on demand when a larger batch arrives.
+        let mut enc = RsEncoderWriter::with_threads(Vec::new(), 64).unwrap();
+        enc.write_all(&payload[..RS_BLOCK_DATA_CAP * 3]).unwrap();
+        enc.flush().unwrap();
+        let pool = enc.pool.as_ref().expect("3 slabs should spawn 2 helpers");
+        assert_eq!(pool.helpers.len(), 2);
+        assert_eq!(pool.helper_tasks_executed.load(Ordering::Relaxed), 2);
+
+        enc.write_all(&payload[RS_BLOCK_DATA_CAP * 3..]).unwrap();
+        // Flush remaining 17 full blocks + partial tail -> 18 slabs -> grows to 17 helpers.
+        let wire = {
+            let used = enc.used;
+            let blk = enc.current_block_mut();
+            blk[..4].copy_from_slice(&(used as u32).to_be_bytes());
+            blk[4 + used..DATA * LANES].fill(0);
+            enc.filled_blocks += 1;
+            enc.used = 0;
+            enc.flush_filled_blocks().unwrap();
+            let pool = enc.pool.as_ref().unwrap();
+            assert_eq!(pool.helpers.len(), 17);
+            assert_eq!(pool.helper_tasks_executed.load(Ordering::Relaxed), 2 + 17);
+            enc.inner
+        };
+
+        // 2. Single-threaded reader never spawns a worker pool.
+        let mut r1 = RsSeekableReader::with_threads(Cursor::new(&wire), 1).unwrap();
+        let mut out1 = Vec::new();
+        r1.read_to_end(&mut out1).unwrap();
+        assert_eq!(out1, payload);
+        assert!(r1.pool.is_none());
+
+        // 3. Multi-threaded reader with threads=64 doing a 3-block non-sequential read
+        // (such as hidden-compartment manifest inspection) spawns only 2 helpers (not 63),
+        // executes 2 helper tasks, then grows on demand when streaming sequentially.
+        let mut r64 = RsSeekableReader::with_threads(Cursor::new(&wire), 64).unwrap();
+        assert!(r64.pool.is_none());
+        let seek_off = (5 * RS_BLOCK_DATA_CAP) as u64;
+        r64.seek(SeekFrom::Start(seek_off)).unwrap();
+        let mut three_blocks = vec![0u8; 3 * RS_BLOCK_DATA_CAP];
+        r64.read_exact(&mut three_blocks).unwrap();
+        assert_eq!(
+            three_blocks,
+            payload[seek_off as usize..seek_off as usize + three_blocks.len()]
+        );
+        {
+            let pool = r64
+                .pool
+                .as_ref()
+                .expect("3-block seek read should spawn 2 helpers");
+            assert_eq!(pool.helpers.len(), 2);
+            assert_eq!(pool.helper_tasks_executed.load(Ordering::Relaxed), 2);
+        }
+
+        // Continuing sequentially from block 8 loads remaining 13 blocks (8..21) -> grows to 12 helpers.
+        let mut tail = Vec::new();
+        r64.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, payload[8 * RS_BLOCK_DATA_CAP..]);
+        let pool = r64.pool.as_ref().unwrap();
+        assert_eq!(pool.helpers.len(), 12);
+        assert_eq!(pool.helper_tasks_executed.load(Ordering::Relaxed), 2 + 12);
+    }
 }
