@@ -1,12 +1,12 @@
-# v4.6.0 Release Checklist
+# v4.7.0 Release Checklist
 
 > **English** (default) · [Türkçe](RELEASE_CHECKLIST.tr.md)
 
 ## Before tagging
 
 - [ ] **CI.** On the candidate commit, Windows and Ubuntu CI jobs plus the `dependency-audit` job (`cargo-deny` RustSec, license, and source checks) are green. [CI workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
-- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.6.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.6.0` in Properties → Details.
-- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.6.0` heading with non-empty English release notes underneath.
+- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.7.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.7.0` in Properties → Details.
+- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.7.0` heading with non-empty English release notes underneath.
 - [ ] **Turkish glyphs & i18n.** Open `rpm-encrypter.exe` from the ZIP; verify it starts in Turkish and `TR / EN` switching updates tabs and buttons cleanly (`Şifrele`, `Çöz`, `İncele`). Confirm `Iğdır-ölçü.txt` renders without missing-glyph boxes.
 - [ ] **Drag-and-drop round-trip.** Drop a folder with two test files onto the window to encrypt, then drop the resulting `.vault` onto the window, verify **Decrypt** opens, and confirm extracted file bytes match originals.
 - [ ] **Selective extraction & RAM-only preview.** Unlock the same vault on **Inspect**, click **Preview** on a UTF-8 text file and an image (verify no temp files are written and closing/`Esc` dismisses cleanly), then check one of the two files and click **Extract Selected** into an empty folder; confirm only that file is written with exact contents.
@@ -19,8 +19,9 @@
 - [ ] **v4.5.0 Profiles, Pre-Flight Estimator, Idle/Panic Clear & Queue.** Apply built-in and saved custom **Encryption Profiles** (confirming `config.json` never stores secrets); drop a test folder larger than `10 MiB` with `10 MiB` container selected and verify **Pre-Flight Size & Fit Estimate** warns before launch; queue two operations (**Add to Queue**), reorder/pause/resume, verify **Show in Folder** and **Verify Now** appear afterward; copy unrelated text to the OS clipboard, trigger **Clear Session (Ctrl+L)** and idle timeout (`1 min`), and verify all in-app secrets/manifests/logs clear while the OS clipboard remains intact.
 
 - [ ] **v4.6.0 Vault Explorer, Enhanced RAM Preview & Split/Join Volumes.** Unlock a multi-folder vault in **Inspect**, verify **Folder Tree / Flat List**, tri-state folder checkboxes, category/size filters, text `Ctrl+F` search + line numbers, image zoom + `90°` rotation, and binary Hex preview. Encrypt a test payload with `--split-mb 1` (CLI) or GUI **Split Volume**, drop `.vault.001` + `.vault.002` onto the window to confirm deduplication and virtual **Decrypt / Inspect / Repair / Re-Key** with zero temp merged files, and verify standalone `split` / `join` byte identity.
+- [ ] **v4.7.0 Printable Recovery Sheet & Parallel AEAD/RS Pipeline.** From the GUI 24-word confirmation modal, click **Save Printable Sheet (.html)...**, open the saved `.html` offline to confirm clean A4/Letter `Ctrl+P` print layout with zero external requests and all 24 words, then delete the `.html` file; verify CLI `encrypt --recovery-sheet` + `recovery-sheet` round-trip. In **Settings**, adjust **AEAD / Reed-Solomon Threads** (`Auto`, `1`, `4`), save and restart to verify persistence, and run CLI `encrypt` / `decrypt` / `inspect` / `repair` / `diff` with `--threads 1` and `--threads 4` on an RS vault.
 
 ## After publishing
 
-- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.6.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
-- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.6.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)
+- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.7.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
+- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.7.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)

@@ -16,7 +16,7 @@ Uygulama varsayılan olarak Türkçe arayüzle açılır; sol menünün altında
 
 1. Dosyaları veya klasörleri uygulama penceresine sürükleyin. **Şifrele** sekmesinde listeyi ve kasanın kaydedileceği yeri kontrol edin. İsterseniz **Şifreleme Profili** alanından hazır bir şablon (*Günlük Yedek*, *Uzun Ömürlü Arşiv (RS)*, *Maksimum Gizlilik (Stealth)*) seçebilir veya kendi parolasız profilinizi kaydedebilirsiniz; kaynak eklediğinizde **Ön Kontrol (Boyut ve Kapasite Tahmini)** kartından toplam boyutu, RS ek yükünü ve sabit konteyner sığma durumunu başlatmadan önce görün.
 2. Uzun, benzersiz bir parola girip tekrarlayın. Ek koruma için boş olmayan bir **anahtar dosyası (keyfile)** seçebilirsiniz. Bu durumda kasayı parolayla her açtığınızda aynı içeriğe sahip dosya da gerekir. Anahtar dosyasının yedeğini kasa dışında, güvenli bir yerde saklayın.
-3. **Şimdi Şifrele** düğmesine (veya arka planda başka iş sürerken **Kuyruğa Ekle** düğmesine) basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın. Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
+3. **Şimdi Şifrele** düğmesine (veya arka planda başka iş sürerken **Kuyruğa Ekle** düğmesine) basın. Ekrandaki **24 kelimelik BIP-39 kurtarma cümlesini** sırasıyla kâğıda yazın — ya da **Yazdırılabilir Kart Kaydet (.html)...** düğmesiyle çevrimdışı A4/Letter yazdırılabilir HTML kurtarma kartı kaydedin (`Ctrl+P` ile çevrimdışı yazdırıp ardından `.html` dosyasını diskten silin). Kaydettiğinizi onaylayıp devam edin. Bu kelimeleri bilen biri kasayı tek başına açabilir. Kâğıdı kasadan ayrı ve güvenli bir yerde tutun.
 4. İşlem tamamlandığında alt hızlı erişim şeridindeki **Şimdi Doğrula** veya **Klasörde Göster** düğmesini kullanın ve yeni kasayı ayrı bir klasöre çözerek dosyalarınızı açabildiğinizi kontrol edin. Bu kontrolü yapana kadar asılları saklayın.
 
 ## Konteyner Boyutu (Padding) ve Gizli Kasa (Makul İnkâr Edilebilirlik)
@@ -71,7 +71,7 @@ Terminalde aynı karşılaştırmayı yapmak için aşağıdaki komutu kullanın
 
 **Toplu İş Kuyruğu ve Hızlı Aksiyonlar:** **Şifrele** / **Çöz** sekmelerindeki **Kuyruğa Ekle** veya **İncele** sekmesindeki **+ Kuyruk** düğmeleriyle işleri sıralayıp duraklatabilir veya sırasını değiştirebilirsiniz. İşlem tamamlanınca alt şeritte **Klasörde Göster** ve uygun işlemlerde **Şimdi Doğrula** düğmeleri görünür; pencere odak dışındaysa görev çubuğu uyarısı tetiklenir (ayarlardan kapatılabilir).
 
-**Ayarlar** sekmesinde Argon2id yineleme sayısı (1–10), paroladan anahtar türetirken yapılan iş miktarını belirler. Paralellik (1–16), bu işin kaç şeride bölüneceğini ayarlar. Arayüzü büyütmek veya küçültmek için %80–150 arasındaki hazır ölçeklerden birini seçin. Tercihlerin sonraki açılışta da kullanılması için **Tercihleri Kaydet** düğmesine basın.
+**Ayarlar** sekmesinde Argon2id yineleme sayısı (1–10), paroladan anahtar türetirken yapılan iş miktarını; paralellik (1–16) ise bu işin kaç şeride bölüneceğini ayarlar. **AEAD / Reed-Solomon İş Parçacığı** seçicisiyle sınırlı bellekli çok çekirdekli boru hattı için `Otomatik`, `1` (tek iş parçacığı) veya `2–64` çalışan seçebilirsiniz. Arayüzü büyütmek veya küçültmek için %80–150 arasındaki hazır ölçeklerden birini seçin. Tercihlerin sonraki açılışta da kullanılması için **Tercihleri Kaydet** düğmesine basın.
 
 **Parola Üretici** sekmesinde büyük harf, küçük harf, rakam ve sembol sınıflarından en az birini seçin. Parolayı elle yazacaksanız karıştırılabilir karakterleri hariç tutarak `0`, `O`, `1`, `l` ve `I` karakterlerini elemeniz mümkün.
 
@@ -86,8 +86,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 Örnekte paket klasöründe bir terminal açıldığı, `Belgeler` klasörünün ve `anahtar.key` dosyasının burada bulunduğu varsayılır. Windows PowerShell’de komutların başındaki `./rpm-encrypter-cli` yerine `.\rpm-encrypter-cli.exe` yazın. Parolayı program sorduğunda girin. İlk komutun sonunda gösterilen kurtarma cümlesini güvenli bir yere kaydedin.
 
 ```sh
-# Klasörü parola ve anahtar dosyasıyla şifrele
-./rpm-encrypter-cli encrypt ./Belgeler --keyfile ./anahtar.key
+# Klasörü parola + anahtar dosyasıyla şifrele ve çevrimdışı yazdırılabilir HTML kurtarma kartı üret
+./rpm-encrypter-cli encrypt ./Belgeler --keyfile ./anahtar.key --recovery-sheet ./Belgeler-kurtarma.html --recovery-sheet-lang tr
+
+# Mevcut 24 kelimelik kurtarma cümlesinden çevrimdışı yazdırılabilir HTML kart üret
+./rpm-encrypter-cli recovery-sheet -o ./Belgeler-kurtarma.html --vault-name Belgeler.vault --has-keyfile --lang tr
 
 # Sabit 25 MiB konteyner olarak şifrele
 ./rpm-encrypter-cli encrypt ./Belgeler --container-mb 25
@@ -95,8 +98,8 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 # Şifreli başlıkla (Stealth Modu) sabit 25 MiB konteyner oluştur
 ./rpm-encrypter-cli encrypt ./Belgeler --stealth --container-mb 25
 
-# Reed-Solomon bit-rot koruması (~%7 parite) ile şifrele
-./rpm-encrypter-cli encrypt ./Belgeler --reed-solomon
+# Reed-Solomon bit-rot koruması (~%7 parite) ile 4 iş parçacığı kullanarak şifrele
+./rpm-encrypter-cli encrypt ./Belgeler --reed-solomon --threads 4
 
 # FAT32 uyumlu 4000 MiB parçalar hâlinde şifrele (.vault.001, .002, ...)
 ./rpm-encrypter-cli encrypt ./Belgeler --split-mb 4000
@@ -106,14 +109,14 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 ./rpm-encrypter-cli join ./Belgeler.vault.001 -o ./Belgeler.birlesik.vault
 
 # Hasarlı Reed-Solomon kasasını parolasız atomik olarak onar (yerinde veya kopyaya)
-./rpm-encrypter-cli repair ./Belgeler.vault
+./rpm-encrypter-cli repair ./Belgeler.vault --threads 4
 ./rpm-encrypter-cli repair ./Belgeler.vault -o ./Belgeler.onarildi.vault
 
 # Dış + gizli bölme oluştur (sıkıştırmasız gizli bölme + gizli keyfile)
 ./rpm-encrypter-cli encrypt ./Sahte --container-mb 50 --hidden ./Gizli --hidden-keyfile ./gizli.key --hidden-no-compress
 
-# Oluşan kasayı aç (çıktıda farklı bir kasa adı gördüyseniz onu kullanın)
-./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key
+# Oluşan kasayı aç (--threads 0..=64 desteklenir; 0 = otomatik, 1 = tek iş parçacığı)
+./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key --threads 4
 
 # Kurtarma cümlesiyle aç (yalnızca dış bölme için geçerlidir)
 ./rpm-encrypter-cli decrypt ./Belgeler.vault --recovery
@@ -121,14 +124,14 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 # Yalnızca tek dosya veya alt klasör seçerek aç (--only tekrarlanabilir)
 ./rpm-encrypter-cli decrypt ./Belgeler.vault --only Belgeler/notlar.txt
 
-# Parola istemeden yapısal bütünlük + SHA-256 kontrolü
-./rpm-encrypter-cli inspect ./Belgeler.vault --integrity-only
+# Parola istemeden yapısal bütünlük + SHA-256 kontrolü (RS kasalarda --threads desteklenir)
+./rpm-encrypter-cli inspect ./Belgeler.vault --integrity-only --threads 4
 
 # Aynı anahtar dosyasını kullanarak parolayı değiştir (dolgusuz kasalarda)
 ./rpm-encrypter-cli rekey ./Belgeler.vault --keyfile ./anahtar.key
 ```
 
-`encrypt` ve `decrypt` komutlarında `--progress` seçeneği, hız ve tahmini kalan süre bilgilerinin standart hata akışına (`stderr`) ne zaman yazılacağını belirler. `auto` varsayılandır ve yalnızca etkileşimli terminalde gösterir. `always` çıktı yönlendirilse de gösterir. `never` ilerleme bilgisini kapatır.
+`encrypt`, `decrypt`, `inspect`, `repair` ve `diff` komutlarında `--threads <0..=64>` seçeneği sınırlı bellekli paralel AEAD ve Reed-Solomon boru hattı iş parçacığı sayısını belirler (`0` = otomatik çekirdek tespiti, `1` = tek iş parçacığı). `encrypt` ve `decrypt` komutlarında `--progress` seçeneği, hız ve tahmini kalan süre bilgilerinin standart hata akışına (`stderr`) ne zaman yazılacağını belirler. `auto` varsayılandır ve yalnızca etkileşimli terminalde gösterir. `always` çıktı yönlendirilse de gösterir. `never` ilerleme bilgisini kapatır.
 
 ```sh
 ./rpm-encrypter-cli decrypt ./Belgeler.vault --keyfile ./anahtar.key --progress always
@@ -136,11 +139,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.6.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.7.0/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.6.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.6.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.7.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.0
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.tr.md)

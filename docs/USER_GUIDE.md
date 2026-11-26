@@ -16,7 +16,7 @@ During encryption and decryption, live throughput (e.g., `MiB/s`) and an estimat
 
 1. Drag and drop files or folders onto the window (or use **Add Files...** / **Add Folder...**). Verify the source list and destination directory on the **Encrypt** tab. Optionally choose a built-in **Encryption Profile** (*Daily Backup*, *Long-Term Archive (RS)*, *Maximum Privacy (Stealth)*) or save your own non-secret preset; once sources are added, review the **Pre-Flight Size & Fit Estimate** card for total size, RS parity overhead, and fixed-container fit before starting.
 2. Enter and confirm a strong, unique password. Optionally bind a non-empty **keyfile** as a second factor; if bound, that exact file is required alongside the password on every unlock, so back it up safely outside the vault.
-3. Click **Encrypt Now** (or **Add to Queue** to enqueue after another running job). Write down the **24-word BIP-39 recovery phrase** in order and store it separately from the vault, then confirm to start. Anyone holding this phrase can unlock the vault without the password or keyfile.
+3. Click **Encrypt Now** (or **Add to Queue** to enqueue after another running job). Write down the **24-word BIP-39 recovery phrase** in order — or click **Save Printable Sheet (.html)...** to save a self-contained offline printable A4/Letter HTML recovery card (print offline via `Ctrl+P`, then delete the `.html` file from disk) — store the paper copy separately from the vault, and confirm to start. Anyone holding this phrase can unlock the vault without the password or keyfile.
 4. Once finished, use **Verify Now** or **Show in Folder** in the bottom quick-action strip (and test decrypting the new `.vault` into a separate folder) before deleting or wiping the originals.
 
 ## Container Size (Padding) & Hidden Vault (Plausible Deniability)
@@ -69,7 +69,7 @@ Terminal equivalent (supports `--json`, `--keyfile-a`, `--keyfile-b`, `--recover
 
 - **Idle Auto-Lock & Clear Session (`Ctrl+L`):** Click **Clear Session (Ctrl+L)** at the bottom of the left sidebar (or press `Ctrl+L`) anytime to scrub all in-app passwords, recovery phrases, RAM previews, loaded manifests, diff results, logs, and pending queued credentials. **Settings → Auto-Clear Idle Session** triggers the same cleanup automatically after `1–30` minutes of inactivity (default `5 min`; active background transfers defer the timer). This cleanup **never touches or overwrites your OS clipboard**.
 - **Batch Job Queue & Quick Actions:** Click **Add to Queue** on **Encrypt** / **Decrypt** (or **+ Queue** beside Repair / Integrity Check on **Inspect**) to run multiple operations sequentially with reorder/pause/cancel-pause support. After Encrypt, Decrypt, Repair, or Re-Key finishes, use **Show in Folder** or **Verify Now** in the bottom quick-action strip; if unfocused, the window can request taskbar attention (configurable in **Settings**).
-- **Settings:** Configure Argon2id memory (`16–256 MiB`), iterations (`1–10`), parallelism (`1–16`), default gzip compression, secure wipe passes, idle auto-clear duration, unfocused completion alerts, and persistent UI scale (`80–150%`). Click **Save Preferences** to persist settings across restarts.
+- **Settings:** Configure Argon2id memory (`16–256 MiB`), iterations (`1–10`), parallelism (`1–16`), **AEAD / Reed-Solomon Threads** (`Auto` / `1` / `2..=64` for the bounded-memory multi-core pipeline), default gzip compression, secure wipe passes, idle auto-clear duration, unfocused completion alerts, and persistent UI scale (`80–150%`). Click **Save Preferences** to persist settings across restarts.
 - **Password Gen:** Independently toggle uppercase letters, lowercase letters, digits, and symbols, and optionally exclude visually ambiguous characters (`0`, `O`, `1`, `l`, `I`).
 
 ## Changing a password (Re-Key)
@@ -83,8 +83,11 @@ Re-keying only re-wraps the DEK under the new credentials (`O(1)` cryptographic 
 Examples below assume a terminal opened in the extracted release folder with `./Docs` and `./my.key` nearby. On Windows PowerShell, replace `./rpm-encrypter-cli` with `.\rpm-encrypter-cli.exe`. Save the 24-word recovery phrase printed at the end of `encrypt`.
 
 ```sh
-# Encrypt a folder with password + keyfile
-./rpm-encrypter-cli encrypt ./Docs --keyfile ./my.key
+# Encrypt a folder with password + keyfile and write an offline printable HTML recovery sheet
+./rpm-encrypter-cli encrypt ./Docs --keyfile ./my.key --recovery-sheet ./Docs-recovery.html --recovery-sheet-lang en
+
+# Generate an offline printable HTML recovery sheet from an existing 24-word phrase
+./rpm-encrypter-cli recovery-sheet -o ./Docs-recovery.html --vault-name Docs.vault --has-keyfile --lang en
 
 # Pad to a fixed 25 MiB container
 ./rpm-encrypter-cli encrypt ./Docs --container-mb 25
@@ -92,8 +95,8 @@ Examples below assume a terminal opened in the extracted release folder with `./
 # Encrypt a folder with encrypted header (Stealth Mode) + 25 MiB padding
 ./rpm-encrypter-cli encrypt ./Docs --stealth --container-mb 25
 
-# Encrypt a folder with Reed-Solomon bit-rot protection (~7% parity)
-./rpm-encrypter-cli encrypt ./Docs --reed-solomon
+# Encrypt a folder with Reed-Solomon bit-rot protection (~7% parity) using 4 pipeline threads
+./rpm-encrypter-cli encrypt ./Docs --reed-solomon --threads 4
 
 # Encrypt and split into FAT32-safe 4000 MiB volumes (.vault.001, .002, ...)
 ./rpm-encrypter-cli encrypt ./Docs --split-mb 4000
@@ -103,14 +106,14 @@ Examples below assume a terminal opened in the extracted release folder with `./
 ./rpm-encrypter-cli join ./Docs.vault.001 -o ./Docs.joined.vault
 
 # Repair a damaged Reed-Solomon vault without a password (in place or to a copy)
-./rpm-encrypter-cli repair ./Docs.vault
+./rpm-encrypter-cli repair ./Docs.vault --threads 4
 ./rpm-encrypter-cli repair ./Docs.vault -o ./Docs.repaired.vault
 
 # Create an outer + hidden vault (uncompressed hidden compartment + hidden keyfile)
 ./rpm-encrypter-cli encrypt ./Decoy --container-mb 50 --hidden ./Secret --hidden-keyfile ./hidden.key --hidden-no-compress
 
-# Decrypt the vault
-./rpm-encrypter-cli decrypt ./Docs.vault --keyfile ./my.key
+# Decrypt the vault (supports --threads 0..=64; 0 = auto, 1 = single-threaded)
+./rpm-encrypter-cli decrypt ./Docs.vault --keyfile ./my.key --threads 4
 
 # Decrypt with the 24-word recovery phrase (outer compartment only)
 ./rpm-encrypter-cli decrypt ./Docs.vault --recovery
@@ -118,14 +121,14 @@ Examples below assume a terminal opened in the extracted release folder with `./
 # Extract only specific file(s) or folder(s) (--only is repeatable)
 ./rpm-encrypter-cli decrypt ./Docs.vault --only Docs/notes.txt
 
-# Passwordless structural integrity + SHA-256 verification
-./rpm-encrypter-cli inspect ./Docs.vault --integrity-only
+# Passwordless structural integrity + SHA-256 verification (supports --threads for RS vaults)
+./rpm-encrypter-cli inspect ./Docs.vault --integrity-only --threads 4
 
 # Rotate password keeping the same keyfile (non-padded vaults only)
 ./rpm-encrypter-cli rekey ./Docs.vault --keyfile ./my.key
 ```
 
-For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `stderr`: `auto` (default, TTY only), `always`, or `never`.
+For `encrypt`, `decrypt`, `inspect`, `repair`, and `diff`, `--threads <0..=64>` controls worker threads for the bounded-memory AEAD and Reed-Solomon pipeline (`0` = auto-detect logical CPUs, `1` = single-threaded). For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `stderr`: `auto` (default, TTY only), `always`, or `never`.
 
 ```sh
 ./rpm-encrypter-cli decrypt ./Docs.vault --keyfile ./my.key --progress always
@@ -133,11 +136,11 @@ For `encrypt` and `decrypt`, `--progress` controls live throughput and ETA on `s
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.6.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.7.0/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.6.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.6.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.7.0
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.0
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.

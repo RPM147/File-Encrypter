@@ -7,16 +7,16 @@
 ```text
 Cargo.toml                  # Saf-Rust workspace manifesti (unsafe RS/kripto sarmalayıcı yok)
 crates/
-  rpm-core/                 # Vault Format v5 (Parçalı AEAD, Argon2id, HKDF, BIP-39, Gizli RPMH, Stealth, RS RPMR, Diff, Zeroize/VirtualLock/mlock)
-  rpm-storage/              # Sınırlı sıfır-geçici-dosya borusu, tar+gzip paketleyici, atomik I/O, RAM-içi önizleme, güvenli silici, ayarlar, HKCU kabuk entegrasyonu
+  rpm-core/                 # Vault Format v5 (Paralel Parçalı AEAD, Argon2id, HKDF, BIP-39, Gizli RPMH, Stealth, Paralel RS RPMR, Diff, Zeroize/VirtualLock/mlock)
+  rpm-storage/              # Sınırlı sıfır-geçici-dosya borusu, tar+gzip paketleyici, parçalı split/join sanal akışı (split.rs), çevrimdışı HTML kurtarma kartı (recovery_sheet.rs), atomik I/O, RAM-içi önizleme, güvenli silici, ayarlar, HKCU kabuk entegrasyonu
   rpm-cli/                  # Başsız CLI ikilisi (rpm-encrypter-cli)
   rpm-gui/                  # OS sürükle-bırak ve RAM önizlemeli yerel eframe/egui masaüstü GUI ikilisi (rpm-encrypter)
 ```
 
 ## Bağımlılık Kuralları (Çevrimsiz)
 
-1. **`rpm-core`** yalnızca saf-Rust kripto/serileştirme paketlerine (`aes-gcm`, `argon2`, `hkdf`, `sha2`, `bip39`, `base64`, `zeroize`, `serde`, `serde_json`, `thiserror`, `rand` ve Win32/Unix bellek kilitleme bağlayıcıları) dayanır. `rs.rs` gibi saf-Rust protokol/FEC modülleri `#![forbid(unsafe_code)]` uygular. Hiçbir zaman arayüz, arşiv veya kayıt defteri işlemi yapmaz.
-2. **`rpm-storage`** `rpm-core`’a bağımlıdır ve akış tabanlı tar/deflate paketleme, sınırlı açma, bellekte sınırlı boru aktarımı, çökme güvenli atomik yazma, parçalı kasa (split/join) sanal akışı, RAM-içi girdi önizlemesi, en iyi çabayla silme, ayar kalıcılığı ve Windows HKCU kabuk entegrasyonunu uygular.
+1. **`rpm-core`** yalnızca saf-Rust kripto/serileştirme paketlerine (`aes-gcm`, `argon2`, `hkdf`, `sha2`, `bip39`, `base64`, `zeroize`, `serde`, `serde_json`, `thiserror`, `rand` ve Win32/Unix bellek kilitleme bağlayıcıları) dayanır. `pipeline.rs` ve `rs.rs` gibi saf-Rust protokol/FEC/boru hattı modülleri `#![forbid(unsafe_code)]` uygular. Hiçbir zaman arayüz, arşiv veya kayıt defteri işlemi yapmaz.
+2. **`rpm-storage`** `rpm-core`’a bağımlıdır ve akış tabanlı tar/deflate paketleme, sınırlı açma, bellekte sınırlı boru aktarımı, çökme güvenli atomik yazma, parçalı kasa (`split.rs`) sanal akışı, çevrimdışı yazdırılabilir HTML kurtarma kartı (`recovery_sheet.rs`), RAM-içi girdi önizlemesi, en iyi çabayla silme, ayar kalıcılığı ve Windows HKCU kabuk entegrasyonunu uygular.
 3. **`rpm-cli`** yalnızca `rpm-core` ve `rpm-storage`’a bağımlıdır (sıfır GUI paketi).
 4. **`rpm-gui`**, `eframe`/`egui` + `rfd` + `zxcvbn` bileşenlerini `rpm-core` ve `rpm-storage`’ı süren arka plan iş parçacıklarına bağlar.
 
@@ -88,6 +88,15 @@ Vault Format **v5**, `VAULT_VERSION = 5` olarak dondurulmuştur:
 
 - `rpm-storage::preview`, çözülen baytları doğrulanmış parça akışından doğrudan tar/gzip üzerinden sıfırlanan RAM’e (`DEFAULT_PREVIEW_MAX_BYTES = 16 MiB` varsayılan sınırı) geçici dosya olmadan akıtır.
 - `rpm-gui`, çözülmüş önizleme durumunu **tüm bölme akışı** son parça AEAD doğrulamasını tamamlayana kadar kapalı tutar ve `Esc`, kapatma, sekme değişimi veya kasa değişiminde tamponları/dokuları sıfırlar.
+
+### 6. Sınırlı Bellekli Çok Çekirdekli Paralel AEAD ve RS Boru Hattı
+
+- **`rpm-core::pipeline`**, çok parçalı `AES-256-GCM` şifreleme ve çözme işlemlerini `AEAD_PIPELINE_MEMORY_BUDGET = 8 MiB` sabit tampon bütçesi içinde `#![forbid(unsafe_code)]` kapsamlı kayan pencereli işçi havuzuyla (`MAX_PIPELINE_THREADS = 64`, `0` = otomatik çekirdek tespiti, `1` = tek iş parçacığı) hızlandırır. İkili çıktı tek iş parçacıklı çalıştırmayla bayt-bayt özdeştir; tek parça ve `threads == 1` akışlarında sıfır iş parçacığı açılır, çözülen parçalar AEAD doğrulaması sonrası kesin `0, 1, 2, ...` sırasıyla yazılır (hata/iptalde sonraki tamponlar sıfırlanır) ve `ShutdownGuard` / `WorkerExitGuard` kısmi çıkış veya panik kilitlenmelerini önler.
+- **`rpm-core::rs`**, `RsEncoderWriter`, `RsSeekableReader` ve ileri yönlü `Scan`/onarım için ayrık `16.320` baytlık blok dilimleri üzerinde talep üzerine ölçeklenen (`RsWorkerPool`) paralel kodlama/çözme çalıştırır; yalnızca `active_slabs >= 2` olduğunda yardımcı iş parçacığı açar ve gerçek OS `io::Error` kodlarını korur.
+
+### 7. Çevrimdışı Yazdırılabilir HTML Kurtarma Kartı
+
+- **`rpm-storage::recovery_sheet`**, oluşturma öncesinde 24 kelimelik BIP-39 cümlesini (`rpm_core::mnemonic_to_entropy`) doğrular; sıfır JavaScript’li, CSP kilitli (`default-src 'none'; style-src 'unsafe-inline';`) A4/Letter baskı uyumlu HTML belgesini `Zeroizing<String>` içinde üretip `atomic_write` (Unix’te `0o600`) ile yazar. Tasarım gereği (`INV-06`) `RecoverySheetInfo` gizli bölme, decoy veya dolgu alanı taşımaz ve `keyfile_hash` bilgisini asla içermez.
 
 ## Temiz Sayfa / v4 Geriye Dönük Uyumsuzluk Olmaması Politikası
 

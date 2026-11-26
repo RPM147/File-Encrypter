@@ -7,16 +7,16 @@
 ```text
 Cargo.toml                  # Pure-Rust workspace manifest (no unsafe RS/crypto wrappers)
 crates/
-  rpm-core/                 # Vault Format v5 (Chunked AEAD, Argon2id, HKDF, BIP-39, Hidden RPMH, Stealth, RS RPMR, Diff, Zeroize/VirtualLock/mlock)
-  rpm-storage/              # Bounded zero-temp-plaintext pipe, tar+gzip packager, atomic I/O, RAM-only preview, wiper, config, HKCU shell integration
+  rpm-core/                 # Vault Format v5 (Parallel Chunked AEAD, Argon2id, HKDF, BIP-39, Hidden RPMH, Stealth, Parallel RS RPMR, Diff, Zeroize/VirtualLock/mlock)
+  rpm-storage/              # Bounded zero-temp-plaintext pipe, tar+gzip packager, split/join virtual streaming (split.rs), offline HTML recovery sheet (recovery_sheet.rs), atomic I/O, RAM-only preview, wiper, config, HKCU shell integration
   rpm-cli/                  # Headless CLI binary (rpm-encrypter-cli)
   rpm-gui/                  # Native eframe/egui desktop GUI binary (rpm-encrypter) with OS drag-and-drop & RAM preview
 ```
 
 ## Dependency Rules (Acyclic)
 
-1. **`rpm-core`** depends only on pure-Rust crypto/serialization crates (`aes-gcm`, `argon2`, `hkdf`, `sha2`, `bip39`, `base64`, `zeroize`, `serde`, `serde_json`, `thiserror`, `rand`, and Win32/Unix memory-locking bindings). Pure-Rust protocol/FEC modules such as `rs.rs` enforce `#![forbid(unsafe_code)]`. It never performs UI, archive, or registry work.
-2. **`rpm-storage`** depends on `rpm-core` and implements streaming tar/deflate packing and bounded unpacking, bounded in-memory piping, crash-safe atomic writes, RAM-only entry preview, best-effort wiping, config persistence, and Windows HKCU shell integration.
+1. **`rpm-core`** depends only on pure-Rust crypto/serialization crates (`aes-gcm`, `argon2`, `hkdf`, `sha2`, `bip39`, `base64`, `zeroize`, `serde`, `serde_json`, `thiserror`, `rand`, and Win32/Unix memory-locking bindings). Pure-Rust protocol/FEC/pipeline modules (`pipeline.rs`, `rs.rs`) enforce `#![forbid(unsafe_code)]`. It never performs UI, archive, or registry work.
+2. **`rpm-storage`** depends on `rpm-core` and implements streaming tar/deflate packing and bounded unpacking, bounded in-memory piping, multi-part split/join virtual streaming (`split.rs`), offline printable HTML recovery sheets (`recovery_sheet.rs`), crash-safe atomic writes, RAM-only entry preview, best-effort wiping, config persistence, and Windows HKCU shell integration.
 3. **`rpm-cli`** depends on `rpm-core` and `rpm-storage` only (zero GUI crates).
 4. **`rpm-gui`** wires `eframe`/`egui` + `rfd` + `zxcvbn` to background worker threads driving `rpm-core` and `rpm-storage`.
 
@@ -88,6 +88,15 @@ Vault Format **v5** is frozen at `VAULT_VERSION = 5`:
 
 - `rpm-storage::preview` streams decrypted bytes directly from the verified chunk stream through tar/gzip into zeroized RAM (`DEFAULT_PREVIEW_MAX_BYTES = 16 MiB` default cap) without temporary files.
 - `rpm-gui` keeps decoded preview state closed until the **entire compartment stream** completes final-chunk AEAD authentication, and scrubs buffers/textures on `Esc`, close, tab switch, or vault switch.
+
+### 6. Bounded-Memory Multi-Core Parallel AEAD & RS Pipeline
+
+- **`rpm-core::pipeline`** accelerates multi-chunk `AES-256-GCM` encryption and decryption via a `#![forbid(unsafe_code)]` scoped sliding-window worker pool capped at `AEAD_PIPELINE_MEMORY_BUDGET = 8 MiB` (`MAX_PIPELINE_THREADS = 64`, `0` = auto-detect logical CPUs, `1` = single-threaded). Wire output is byte-for-byte identical to single-threaded execution; single-chunk and `threads == 1` streams spawn zero threads, decrypted chunks are emitted strictly in order `0, 1, 2, ...` after AEAD verification (zeroizing any speculative later chunks on failure/cancel), and `ShutdownGuard` / `WorkerExitGuard` prevent unwind or partial-exit deadlocks.
+- **`rpm-core::rs`** runs an owned, on-demand scaling `RsWorkerPool` across disjoint `16,320`-byte block slabs for `RsEncoderWriter`, `RsSeekableReader`, and forward `Scan`/repair, spawning helpers only when `active_slabs >= 2` and preserving real OS `io::Error` codes and clean retry behavior.
+
+### 7. Offline Printable HTML Recovery Sheet
+
+- **`rpm-storage::recovery_sheet`** validates the 24-word BIP-39 mnemonic (`rpm_core::mnemonic_to_entropy`) before rendering a zero-JavaScript, CSP-locked (`default-src 'none'; style-src 'unsafe-inline';`) A4/Letter printable HTML sheet held in `Zeroizing<String>` and written via `atomic_write` (`0o600` on Unix). By construction (`INV-06`), `RecoverySheetInfo` carries no hidden-compartment, decoy, or padding fields and never embeds `keyfile_hash`.
 
 ## Clean-Slate / No v4 Backward Compatibility Policy
 

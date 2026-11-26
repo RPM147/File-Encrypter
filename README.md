@@ -12,11 +12,11 @@ Everything runs locally with zero telemetry, cloud accounts, or network dependen
 
 ## Key Features
 
-- **Chunked Authenticated Encryption (Vault Format v5):** Plaintext streams are encrypted and authenticated in independent `1 MiB` AEAD chunks bound to per-vault context, chunk index, final-chunk flag, and plain length. Corrupted, reordered, truncated, or trailing-appended chunks fail **in RAM before any byte is written to disk**.
+- **Chunked Authenticated Encryption & Multi-Core Pipeline (Vault Format v5):** Plaintext streams are encrypted and authenticated in independent `1 MiB` AEAD chunks bound to per-vault context, chunk index, final-chunk flag, and plain length, accelerated by a bounded-memory (`8 MiB` buffer cap) multi-core AEAD & Reed-Solomon pipeline (`--threads <0..=64>` in CLI or **Settings** in GUI). Corrupted, reordered, truncated, or trailing-appended chunks fail **in RAM before any byte is written to disk**.
 - **Zero Plaintext Temp Files:** Packing and unpacking stream over a bounded in-memory pipe directly into/out of the Chunked AEAD stream — no intermediate plaintext `.zip`/`.tar` file is created on disk.
 - **Deterministic Memory Scrubbing:** Passwords, keyfile hashes, DEKs, and chunk buffers are zeroized on drop (`zeroize`) and pinned best-effort against swapping (`VirtualLock` on Windows, `mlock` on Unix).
 - **Optional Keyfile Two-Factor Unlock:** Bind a vault to any non-empty keyfile (streamed through SHA-256 and mixed via HKDF with the Argon2id key).
-- **24-Word BIP-39 Recovery Phrases:** Emergency recovery key slot stored separately from the password slot.
+- **24-Word BIP-39 Recovery Phrases & Offline Printable Recovery Sheet:** Emergency recovery key slot stored separately from the password slot, with an optional self-contained, zero-JavaScript, CSP-locked printable HTML recovery sheet (`--recovery-sheet` / `recovery-sheet` in CLI or **Save Printable Sheet (.html)...** in GUI) that never leaks hidden-vault metadata.
 - **O(1) Re-Key:** Rotate passwords and/or keyfiles by re-wrapping only the 32-byte DEK envelope without decrypting gigabytes of payload chunks.
 - **Native Desktop GUI + OS Drag-and-Drop (`rpm-encrypter`):** Built with `eframe`/`egui` and `rfd`, featuring a bilingual Turkish/English UI (`TR`/`EN`), external file/folder drag-and-drop, and an opt-in 30-second auto-clearing clipboard timer for copied secrets.
 - **Operational Safety, Presets & Batch Workflow (GUI):** Includes clipboard-safe idle auto-lock & manual session clear (`Ctrl+L`, leaving the OS clipboard untouched), built-in and custom non-secret **Encryption Profiles**, a pre-flight source size / RS parity / container fit estimator, post-op **Show in Folder** / **Verify Now** quick actions, and a zeroizing sequential **Batch Job Queue**.
@@ -58,17 +58,18 @@ From the repository root, run the packaging script in PowerShell. It uses the wo
 Passwords are never accepted as CLI flags; interactive secure prompts or `--password-stdin` / `--recovery-stdin` are used instead:
 
 ```bash
-cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-out recovery.txt
-cargo run -p rpm-cli -- encrypt ./folder --reed-solomon
+cargo run -p rpm-cli -- encrypt ./folder --keyfile ./my.key --recovery-sheet recovery-sheet.html --recovery-sheet-lang en
+cargo run -p rpm-cli -- encrypt ./folder --reed-solomon --threads 4
 cargo run -p rpm-cli -- encrypt ./folder --split-mb 4000
 cargo run -p rpm-cli -- encrypt ./folder --stealth --container-mb 50
 cargo run -p rpm-cli -- encrypt ./decoy --container-mb 50 --hidden ./secret --hidden-keyfile ./hidden.key
+cargo run -p rpm-cli -- recovery-sheet -o recovery-sheet.html --vault-name folder.vault --lang en
 cargo run -p rpm-cli -- split ./folder.vault --part-mb 100
 cargo run -p rpm-cli -- join ./folder.vault.001 -o ./folder.joined.vault
-cargo run -p rpm-cli -- repair ./folder.vault
-cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored
-cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json
-cargo run -p rpm-cli -- diff ./vault-a.vault ./vault-b.vault
+cargo run -p rpm-cli -- repair ./folder.vault --threads 4
+cargo run -p rpm-cli -- decrypt ./folder.vault --keyfile ./my.key -o ./restored --threads 4
+cargo run -p rpm-cli -- inspect ./folder.vault --integrity-only --json --threads 4
+cargo run -p rpm-cli -- diff ./vault-a.vault ./vault-b.vault --threads 4
 cargo run -p rpm-cli -- rekey ./folder.vault --keyfile ./my.key
 cargo run -p rpm-cli -- password --length 24
 cargo run -p rpm-cli -- shell-integration install   # Windows HKCU only

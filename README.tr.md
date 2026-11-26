@@ -12,11 +12,11 @@ Her şey tamamen yerel çalışır; sıfır telemetri, bulut hesabı veya ağ ba
 
 ## Temel Özellikler
 
-- **Parçalı Kimlik Doğrulamalı Şifreleme (Vault Format v5):** Düz metin akışları kasa bağlamına, parça dizinine, son parça bayrağına ve düz metin uzunluğuna bağlı bağımsız `1 MiB` AEAD parçaları hâlinde şifrelenip doğrulanır. Bozuk, sırası değiştirilmiş, kırpılmış veya sonradan eklenmiş veriler **diske tek bayt yazılmadan RAM’de reddedilir**.
+- **Parçalı Kimlik Doğrulamalı Şifreleme ve Çok Çekirdekli Boru Hattı (Vault Format v5):** Düz metin akışları kasa bağlamına, parça dizinine, son parça bayrağına ve düz metin uzunluğuna bağlı bağımsız `1 MiB` AEAD parçaları hâlinde şifrelenip doğrulanır; sabit sınırlı bellekli (`8 MiB` tampon bütçeli) çok çekirdekli AEAD ve Reed-Solomon boru hattıyla hızlandırılır (CLI `--threads <0..=64>` veya GUI **Ayarlar**). Bozuk, sırası değiştirilmiş, kırpılmış veya sonradan eklenmiş veriler **diske tek bayt yazılmadan RAM’de reddedilir**.
 - **Sıfır Geçici Düz Metin Dosyası:** Paketleme ve açma işlemleri diske ara `.zip`/`.tar` dosyası yazmadan bellekteki sınırlı boru (pipe) üzerinden doğrudan Parçalı AEAD akışına bağlanır.
 - **Kesin Bellek Sıfırlama:** Parolalar, keyfile özetleri, DEK’ler ve parça tamponları bellekten düşerken sıfırlanır (`zeroize`) ve mümkün olan en iyi çabayla takas dosyasına karşı kilitlenir (Windows’ta `VirtualLock`, Unix’te `mlock`).
 - **İsteğe Bağlı Anahtar Dosyası (Keyfile) İki Faktörlü Açılış:** Kasanızı boş olmayan herhangi bir anahtar dosyasına (SHA-256 özeti alınıp Argon2id anahtarıyla HKDF üzerinden karıştırılarak) bağlayın.
-- **24 Kelimelik BIP-39 Kurtarma Cümleleri:** Parola slotundan ayrı saklanan acil durum kurtarma anahtarı slotu.
+- **24 Kelimelik BIP-39 Kurtarma Cümleleri ve Yazdırılabilir Kurtarma Kartı:** Parola slotundan ayrı saklanan acil durum kurtarma anahtarı slotu; gizli kasa bilgisi sızdırmayan, sıfır JavaScript’li, CSP kilitli çevrimdışı yazdırılabilir HTML kurtarma kartı (`--recovery-sheet` / `recovery-sheet` veya GUI **Yazdırılabilir Kart Kaydet (.html)...**) ile desteklenir.
 - **O(1) Anahtar Değiştirme (Re-Key):** Gigabaytlarca veri parçasını yeniden şifrelemek yerine yalnızca 32 baytlık DEK zarfını yeniden sararak parolaları ve/veya keyfile bağını güncelleyin.
 - **Yerel Masaüstü Arayüzü + Sürükle-Bırak (`rpm-encrypter`):** `eframe`/`egui` ve `rfd` ile geliştirilmiştir; Türkçe/İngilizce arayüz (`TR`/`EN`), harici dosya/klasör sürükle-bırak desteği ve kopyalanan sırlar için isteğe bağlı 30 saniyelik otomatik pano temizleme zamanlayıcısı sunar.
 - **Operasyonel Güvenlik, Profiller ve Toplu Kuyruk (GUI):** Sistem panosuna dokunmayan hareketsizlikte otomatik kilit ve manuel oturum temizleme (`Ctrl+L`), hazır ve özel şifresiz **Şifreleme Profilleri**, ön kontrolde kaynak boyutu / RS parite / konteyner sığma tahmincisi, işlem sonrası **Klasörde Göster** / **Şimdi Doğrula** hızlı aksiyonları ve sıfırlamalı sıralı **Toplu İş Kuyruğu** içerir.
@@ -58,17 +58,18 @@ Proje kökünden PowerShell’de paketleme betiğini çalıştırın. Workspace 
 Parolalar hiçbir zaman CLI bayrağı olarak kabul edilmez; bunun yerine güvenli etkileşimli istemler veya `--password-stdin` / `--recovery-stdin` kullanılır:
 
 ```bash
-cargo run -p rpm-cli -- encrypt ./klasor --keyfile ./anahtar.key --recovery-out kurtarma.txt
-cargo run -p rpm-cli -- encrypt ./klasor --reed-solomon
+cargo run -p rpm-cli -- encrypt ./klasor --keyfile ./anahtar.key --recovery-sheet kurtarma-karti.html --recovery-sheet-lang tr
+cargo run -p rpm-cli -- encrypt ./klasor --reed-solomon --threads 4
 cargo run -p rpm-cli -- encrypt ./klasor --split-mb 4000
 cargo run -p rpm-cli -- encrypt ./klasor --stealth --container-mb 50
 cargo run -p rpm-cli -- encrypt ./sahte --container-mb 50 --hidden ./gizli --hidden-keyfile ./gizli.key
+cargo run -p rpm-cli -- recovery-sheet -o kurtarma-karti.html --vault-name klasor.vault --lang tr
 cargo run -p rpm-cli -- split ./klasor.vault --part-mb 100
 cargo run -p rpm-cli -- join ./klasor.vault.001 -o ./klasor.birlesik.vault
-cargo run -p rpm-cli -- repair ./klasor.vault
-cargo run -p rpm-cli -- decrypt ./klasor.vault --keyfile ./anahtar.key -o ./cozulen
-cargo run -p rpm-cli -- inspect ./klasor.vault --integrity-only --json
-cargo run -p rpm-cli -- diff ./kasa-a.vault ./kasa-b.vault
+cargo run -p rpm-cli -- repair ./klasor.vault --threads 4
+cargo run -p rpm-cli -- decrypt ./klasor.vault --keyfile ./anahtar.key -o ./cozulen --threads 4
+cargo run -p rpm-cli -- inspect ./klasor.vault --integrity-only --json --threads 4
+cargo run -p rpm-cli -- diff ./kasa-a.vault ./kasa-b.vault --threads 4
 cargo run -p rpm-cli -- rekey ./klasor.vault --keyfile ./anahtar.key
 cargo run -p rpm-cli -- password --length 24
 cargo run -p rpm-cli -- shell-integration install   # Yalnızca Windows HKCU
