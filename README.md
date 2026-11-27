@@ -1,6 +1,6 @@
 # RPM Encrypter
 
-[![CI](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
+[![CI](https://github.com/RPM147/RPM-Encrypter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RPM147/RPM-Encrypter/actions/workflows/ci.yml)
 
 **Language / Dil:** **English** (default) · [Türkçe](README.tr.md)
 

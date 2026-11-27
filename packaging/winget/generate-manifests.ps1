@@ -57,8 +57,8 @@ try {
     $manifestDir = Join-Path $baseOut (Join-Path 'RPM147.RPMEncrypter' $Version)
     [void][IO.Directory]::CreateDirectory($manifestDir)
 
-    $installerUrl = "https://github.com/RPM147/File-Encrypter/releases/download/v$Version/$archiveName"
-    $releaseNotesUrl = "https://github.com/RPM147/File-Encrypter/releases/tag/v$Version"
+    $installerUrl = "https://github.com/RPM147/RPM-Encrypter/releases/download/v$Version/$archiveName"
+    $releaseNotesUrl = "https://github.com/RPM147/RPM-Encrypter/releases/tag/v$Version"
 
     $versionYaml = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
@@ -99,11 +99,11 @@ PackageVersion: $Version
 PackageLocale: en-US
 Publisher: RPM147
 PublisherUrl: https://github.com/RPM147
-PublisherSupportUrl: https://github.com/RPM147/File-Encrypter/issues
+PublisherSupportUrl: https://github.com/RPM147/RPM-Encrypter/issues
 PackageName: RPM Encrypter
-PackageUrl: https://github.com/RPM147/File-Encrypter
+PackageUrl: https://github.com/RPM147/RPM-Encrypter
 License: AGPL-3.0-or-later
-LicenseUrl: https://github.com/RPM147/File-Encrypter/blob/main/LICENSE
+LicenseUrl: https://github.com/RPM147/RPM-Encrypter/blob/main/LICENSE
 ShortDescription: Pure-Rust local file and folder encryption tool using Chunked AES-256-GCM and Argon2id.
 Tags:
   - encryption
