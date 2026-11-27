@@ -1,5 +1,6 @@
 use rpm_core::{
-    decrypt_unlocked_stream_with_threads, unlock_seekable_with_kdf_and_threads, Auth, CryptoError,
+    decrypt_unlocked_stream_with_threads, unlock_seekable_with_kdf_threads_and_cancel, Auth,
+    CryptoError,
 };
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -48,8 +49,29 @@ fn read_member(
                     "preview byte limit exceeded".into(),
                 ));
             }
-            let mut bytes = Zeroizing::new(vec![0; entry.size() as usize]);
-            entry.read_exact(&mut bytes)?;
+            let total_len = entry.size() as usize;
+            let mut bytes = Zeroizing::new(vec![0; total_len]);
+            let mut filled = 0usize;
+            while filled < total_len {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(StorageError::Cancelled);
+                }
+                let end = (filled + 64 * 1024).min(total_len);
+                match entry.read(&mut bytes[filled..end]) {
+                    Ok(0) => {
+                        return Err(StorageError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF reading preview entry",
+                        )));
+                    }
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(StorageError::Io(e)),
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
             found = Some(bytes);
         }
         Ok(())
@@ -110,8 +132,20 @@ pub fn extract_entry_to_memory_v5_with_stealth_kdf_and_threads(
     cancel: Arc<AtomicBool>,
 ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
     let target = relative_path(target_path, UnpackLimits::default().max_path_depth)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     let mut vault = open_vault_reader(vault_path)?;
-    let unlocked = unlock_seekable_with_kdf_and_threads(&mut vault, auth, stealth_kdf, threads)?;
+    let unlocked = unlock_seekable_with_kdf_threads_and_cancel(
+        &mut vault,
+        auth,
+        stealth_kdf,
+        threads,
+        Some(&cancel),
+    )?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     let compressed = unlocked.is_compressed();
     let total = unlocked.metadata().original_size;
     let (mut writer, mut reader) = bounded_pipe(2);
@@ -126,7 +160,14 @@ pub fn extract_entry_to_memory_v5_with_stealth_kdf_and_threads(
         )?;
         // A tar end marker can precede the final authenticated frame.
         let mut scratch = Zeroizing::new([0u8; 8192]);
-        while reader.read(&mut *scratch)? != 0 {}
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
+            if reader.read(&mut *scratch)? == 0 {
+                break;
+            }
+        }
         Ok(bytes)
     });
     let verified = decrypt_unlocked_stream_with_threads(

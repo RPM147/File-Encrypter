@@ -2914,3 +2914,59 @@ fn pipeline_threads_settings_persistence_and_bilingual_render() {
         out.textures_delta.clear();
     }
 }
+
+#[test]
+fn recovery_modal_blocks_direct_launch_while_busy_and_cancelled_i18n_parity() {
+    use rpm_gui::tabs::encrypt::can_launch_recovery_prompt;
+
+    // 1. Bilingual parity for status_cancelled
+    assert!(!i18n::TR.status_cancelled.trim().is_empty());
+    assert!(!i18n::EN.status_cancelled.trim().is_empty());
+    assert_ne!(i18n::TR.status_cancelled, i18n::EN.status_cancelled);
+
+    // 2. Recovery modal launch predicate across confirmed x queue_after_confirm x busy
+    let make_prompt = |confirmed: bool, queue_after_confirm: bool| RecoveryPrompt {
+        phrase: "abandon ".repeat(24),
+        entropy: SecretKey::new([0x42; 32]),
+        confirmed,
+        queue_after_confirm,
+    };
+    assert!(!can_launch_recovery_prompt(
+        &make_prompt(false, false),
+        false
+    ));
+    assert!(!can_launch_recovery_prompt(
+        &make_prompt(false, false),
+        true
+    ));
+    assert!(can_launch_recovery_prompt(&make_prompt(true, false), false));
+    assert!(
+        !can_launch_recovery_prompt(&make_prompt(true, false), true),
+        "direct encrypt launch must stay disabled while busy"
+    );
+    assert!(!can_launch_recovery_prompt(
+        &make_prompt(false, true),
+        false
+    ));
+    assert!(!can_launch_recovery_prompt(&make_prompt(false, true), true));
+    assert!(can_launch_recovery_prompt(&make_prompt(true, true), false));
+    assert!(
+        can_launch_recovery_prompt(&make_prompt(true, true), true),
+        "queue-after-confirm launch remains enabled while busy"
+    );
+
+    // 3. Headless render of recovery modal while busy keeps modal intact and never flips cancel
+    let mut st = fresh_state();
+    st.busy = true;
+    st.encrypt.recovery_prompt = Some(make_prompt(true, false));
+    let ctx = egui::Context::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(true));
+    let mut out = ctx.run_ui(Default::default(), |ui| {
+        rpm_gui::tabs::encrypt::ui(ui, &ctx, &mut st, &tx, &cancel);
+    });
+    out.textures_delta.clear();
+    assert!(st.encrypt.recovery_prompt.is_some());
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(rx.try_recv().is_err());
+}

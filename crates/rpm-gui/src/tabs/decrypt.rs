@@ -183,12 +183,13 @@ pub fn ui(
                 .clicked()
             {
                 if let Some(req) = take_validated_decrypt_request(state, s) {
-                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                    state.begin_transfer(s.status_dec_running);
-                    worker::spawn_decrypt_with_threads(
+                    let (scope, job_cancel) =
+                        state.begin_transfer_job(s.status_dec_running, cancel);
+                    worker::spawn_decrypt_scoped(
                         ctx.clone(),
                         tx.clone(),
-                        Arc::clone(cancel),
+                        job_cancel,
+                        Some(scope),
                         req.vaults,
                         req.use_recovery,
                         req.secret,

@@ -1,22 +1,23 @@
 //! Background worker thread launchers bridging `rpm-core`/`rpm-storage` to `egui`.
 
 use std::fs::File;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rpm_core::{
-    diff_metadata, hash_keyfile_reader, inspect_header_seekable_with_kdf_and_threads,
+    diff_metadata, hash_keyfile_reader, inspect_header_seekable_with_kdf_threads_and_cancel,
     mnemonic_to_entropy, Auth, CryptoError, EncryptOptions, HiddenEncryptOptions, IntegrityReport,
     KdfParams, SecretKey, VaultDiff, VaultInfo, STEALTH_KDF_PARAMS,
 };
 use rpm_storage::config::AppLanguage;
 use rpm_storage::{
-    check_compartment_sources, check_vault_integrity_with_parts_and_threads, check_wipe_targets,
-    decrypt_vault_v5_with_stealth_kdf_and_threads, discover_split_parts,
+    check_compartment_sources, check_vault_integrity_with_parts_threads_and_cancel,
+    check_wipe_targets, decrypt_vault_v5_with_stealth_kdf_and_threads, discover_split_parts,
     encrypt_hidden_sources_v5_split_with_threads, encrypt_hidden_sources_v5_with_threads,
     encrypt_sources_v5_split_with_threads, encrypt_sources_v5_with_threads,
     extract_entry_to_memory_v5_with_stealth_kdf_and_threads, join_vault_parts, open_vault_reader,
@@ -33,14 +34,82 @@ use crate::state::WorkerUpdate;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
 const MAX_REPORT_ENTRIES: usize = 150;
 
-fn send(tx: &mpsc::Sender<WorkerUpdate>, ctx: &egui::Context, msg: WorkerUpdate) {
-    let _ = tx.send(msg);
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerScope {
+    pub epoch: u64,
+    pub job_id: u64,
+}
+
+fn send_scoped(
+    tx: &mpsc::Sender<WorkerUpdate>,
+    ctx: &egui::Context,
+    scope: Option<WorkerScope>,
+    msg: WorkerUpdate,
+) {
+    let wrapped = match scope {
+        Some(s) => WorkerUpdate::Scoped {
+            epoch: s.epoch,
+            job_id: s.job_id,
+            update: Box::new(msg),
+        },
+        None => msg,
+    };
+    let _ = tx.send(wrapped);
     ctx.request_repaint();
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "worker thread panicked".into()
+    }
+}
+
+fn worker_panic_error_msg(detail: &str, lang: AppLanguage) -> String {
+    match lang {
+        AppLanguage::Tr => format!("Beklenmeyen arka plan hatası: {detail}"),
+        AppLanguage::En => format!("Unexpected worker error: {detail}"),
+    }
+}
+
+pub(crate) fn spawn_guarded_worker<F>(
+    tx: mpsc::Sender<WorkerUpdate>,
+    ctx: egui::Context,
+    scope: Option<WorkerScope>,
+    lang: AppLanguage,
+    body: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let tx_err = tx.clone();
+    let ctx_err = ctx.clone();
+    if let Err(err) = thread::Builder::new().spawn(move || {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
+            let detail = panic_payload_message(&*payload);
+            send_scoped(
+                &tx_err,
+                &ctx_err,
+                scope,
+                WorkerUpdate::Error(worker_panic_error_msg(&detail, lang)),
+            );
+        }
+    }) {
+        send_scoped(
+            &tx,
+            &ctx,
+            scope,
+            WorkerUpdate::Error(worker_panic_error_msg(&err.to_string(), lang)),
+        );
+    }
 }
 
 fn make_progress_cb(
     tx: mpsc::Sender<WorkerUpdate>,
     ctx: egui::Context,
+    scope: Option<WorkerScope>,
     item_index: Option<(usize, usize)>,
 ) -> Arc<dyn Fn(u64, u64) + Send + Sync> {
     let meter = match item_index {
@@ -63,9 +132,20 @@ fn make_progress_cb(
         if should_send {
             guard.1 = Some(now);
             drop(guard);
-            send(&tx, &ctx, WorkerUpdate::Progress(snap));
+            send_scoped(&tx, &ctx, scope, WorkerUpdate::Progress(snap));
         }
     })
+}
+
+fn cancelled_status_msg(lang: AppLanguage) -> String {
+    crate::i18n::strings(lang).status_cancelled.to_string()
+}
+
+fn is_storage_cancelled(err: &StorageError) -> bool {
+    matches!(
+        err,
+        StorageError::Cancelled | StorageError::Crypto(CryptoError::Cancelled)
+    )
 }
 
 fn load_optional_keyfile(path: Option<&Path>) -> Result<Option<SecretKey>, StorageError> {
@@ -522,23 +602,33 @@ fn wipe_sources(
     wipe_passes: u8,
     tx: &mpsc::Sender<WorkerUpdate>,
     ctx: &egui::Context,
+    scope: Option<WorkerScope>,
+    cancel: &AtomicBool,
     lang: AppLanguage,
-) {
+) -> bool {
     let wiper = SecureWiper::new(wipe_passes);
     for s in sources {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
         let wres = if s.is_dir() {
-            wiper.wipe_folder(s)
+            wiper.wipe_folder_cancellable(s, Some(cancel))
         } else {
-            wiper.wipe_file(s)
+            wiper.wipe_file_cancellable(s, Some(cancel))
         };
-        if let Err(err) = wres {
-            let warn = match lang {
-                AppLanguage::Tr => format!("Güvenli silme uyarısı: {err}"),
-                AppLanguage::En => format!("Wipe warning: {err}"),
-            };
-            send(tx, ctx, WorkerUpdate::Log(warn));
+        match wres {
+            Ok(()) => {}
+            Err(err) if is_storage_cancelled(&err) => return true,
+            Err(err) => {
+                let warn = match lang {
+                    AppLanguage::Tr => format!("Güvenli silme uyarısı: {err}"),
+                    AppLanguage::En => format!("Wipe warning: {err}"),
+                };
+                send_scoped(tx, ctx, scope, WorkerUpdate::Log(warn));
+            }
         }
     }
+    cancel.load(Ordering::Relaxed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,26 +734,104 @@ pub fn spawn_encrypt_with_split_and_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_encrypt_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        sources,
+        password,
+        recovery_entropy,
+        keyfile,
+        output_dir,
+        compress,
+        container_size_bytes,
+        split_part_bytes,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_encrypt_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    sources: Vec<PathBuf>,
+    password: Zeroizing<String>,
+    recovery_entropy: SecretKey,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    compress: bool,
+    container_size_bytes: Option<u64>,
+    split_part_bytes: Option<u64>,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
         let base_dir = resolve_output_dir(&sources, output_dir.clone());
         if secure_wipe {
             if let Err(e) = check_wipe_targets(sources.iter(), &base_dir, keyfile.iter()) {
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::Error(format_safety_error(e, false, lang)),
                 );
                 return;
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let opts = EncryptOptions {
             stealth,
@@ -691,9 +859,9 @@ pub fn spawn_encrypt_with_split_and_threads(
             }
             (AppLanguage::En, false) => format!("Encrypting -> {}", out_vault.display()),
         };
-        send(&tx, &ctx, WorkerUpdate::Log(start_log));
+        send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(start_log));
 
-        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, None);
 
         let tx_skip = tx.clone();
         let ctx_skip = ctx.clone();
@@ -702,7 +870,7 @@ pub fn spawn_encrypt_with_split_and_threads(
                 AppLanguage::Tr => format!("Atlandı: {msg}"),
                 AppLanguage::En => format!("Skipped: {msg}"),
             };
-            send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
+            send_scoped(&tx_skip, &ctx_skip, scope, WorkerUpdate::Log(line));
         };
 
         let res = if let Some(part_bytes) = split_part_bytes {
@@ -714,7 +882,7 @@ pub fn spawn_encrypt_with_split_and_threads(
                 &opts,
                 threads,
                 progress,
-                cancel,
+                Arc::clone(&cancel),
                 on_skip,
             )
             .map(|(_summary, meta, parts)| (meta, parts))
@@ -726,7 +894,7 @@ pub fn spawn_encrypt_with_split_and_threads(
                 &opts,
                 threads,
                 progress,
-                cancel,
+                Arc::clone(&cancel),
                 on_skip,
             )
             .map(|(_summary, meta)| (meta, vec![out_vault.clone()]))
@@ -734,8 +902,34 @@ pub fn spawn_encrypt_with_split_and_threads(
 
         match res {
             Ok((meta, outputs)) => {
-                if secure_wipe {
-                    wipe_sources(&sources, wipe_passes, &tx, &ctx, lang);
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
+                if secure_wipe
+                    && wipe_sources(&sources, wipe_passes, &tx, &ctx, scope, &cancel, lang)
+                {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
                 }
                 let primary_out = outputs.first().cloned().unwrap_or(out_vault);
                 let vault_name = primary_out
@@ -765,16 +959,23 @@ pub fn spawn_encrypt_with_split_and_threads(
                         }
                     }
                 };
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::EncryptDone {
                         status,
                         output_path: primary_out,
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -902,11 +1103,74 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
-        if let Err(e) = check_compartment_sources(&decoy_sources, &hidden_sources) {
-            send(
+    spawn_encrypt_hidden_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        decoy_sources,
+        hidden_sources,
+        decoy_password,
+        hidden_password,
+        decoy_recovery_entropy,
+        decoy_keyfile,
+        hidden_keyfile,
+        output_dir,
+        decoy_compressed,
+        hidden_compressed,
+        container_size_bytes,
+        split_part_bytes,
+        stealth,
+        reed_solomon,
+        secure_wipe,
+        wipe_passes,
+        kdf,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_encrypt_hidden_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    decoy_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+    decoy_password: Zeroizing<String>,
+    hidden_password: Zeroizing<String>,
+    decoy_recovery_entropy: SecretKey,
+    decoy_keyfile: Option<PathBuf>,
+    hidden_keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    decoy_compressed: bool,
+    hidden_compressed: bool,
+    container_size_bytes: u64,
+    split_part_bytes: Option<u64>,
+    stealth: bool,
+    reed_solomon: bool,
+    secure_wipe: bool,
+    wipe_passes: u8,
+    kdf: KdfParams,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
                 &tx,
                 &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
+        if let Err(e) = check_compartment_sources(&decoy_sources, &hidden_sources) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
                 WorkerUpdate::Error(format_safety_error(e, true, lang)),
             );
             return;
@@ -918,19 +1182,34 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                 &base_dir,
                 decoy_keyfile.iter().chain(&hidden_keyfile),
             ) {
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::Error(format_safety_error(e, false, lang)),
                 );
                 return;
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let decoy_keyfile_hash = match load_optional_keyfile(decoy_keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
@@ -941,10 +1220,19 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                     AppLanguage::Tr => format!("Gizli anahtar dosyası hatası: {e}"),
                     AppLanguage::En => format!("Hidden keyfile error: {e}"),
                 };
-                send(&tx, &ctx, WorkerUpdate::Error(msg));
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(msg));
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let opts = HiddenEncryptOptions {
             stealth,
@@ -981,9 +1269,9 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                 format!("Writing hidden vault container -> {}", out_vault.display())
             }
         };
-        send(&tx, &ctx, WorkerUpdate::Log(start_log));
+        send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(start_log));
 
-        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, None);
         let tx_skip = tx.clone();
         let ctx_skip = ctx.clone();
         let on_skip = move |msg: &str| {
@@ -991,7 +1279,7 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                 AppLanguage::Tr => format!("Atlandı: {msg}"),
                 AppLanguage::En => format!("Skipped: {msg}"),
             };
-            send(&tx_skip, &ctx_skip, WorkerUpdate::Log(line));
+            send_scoped(&tx_skip, &ctx_skip, scope, WorkerUpdate::Log(line));
         };
 
         let res = if let Some(part_bytes) = split_part_bytes {
@@ -1005,7 +1293,7 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                 &opts,
                 threads,
                 progress,
-                cancel,
+                Arc::clone(&cancel),
                 on_skip,
             )
         } else {
@@ -1018,7 +1306,7 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                 &opts,
                 threads,
                 progress,
-                cancel,
+                Arc::clone(&cancel),
                 on_skip,
             )
             .map(|(summary, d, h)| (summary, d, h, vec![out_vault.clone()]))
@@ -1026,9 +1314,43 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
 
         match res {
             Ok((summary, decoy_meta, hidden_meta, outputs)) => {
-                if secure_wipe {
-                    wipe_sources(&decoy_sources, wipe_passes, &tx, &ctx, lang);
-                    wipe_sources(&hidden_sources, wipe_passes, &tx, &ctx, lang);
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
+                if secure_wipe
+                    && (wipe_sources(&decoy_sources, wipe_passes, &tx, &ctx, scope, &cancel, lang)
+                        || wipe_sources(
+                            &hidden_sources,
+                            wipe_passes,
+                            &tx,
+                            &ctx,
+                            scope,
+                            &cancel,
+                            lang,
+                        ))
+                {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
                 }
                 let primary_out = outputs.first().cloned().unwrap_or(out_vault);
                 let vault_name = primary_out
@@ -1063,16 +1385,23 @@ pub fn spawn_encrypt_hidden_with_split_and_threads(
                         ),
                     }
                 };
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::EncryptDone {
                         status,
                         output_path: primary_out,
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1116,11 +1445,54 @@ pub fn spawn_decrypt_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_decrypt_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        vaults,
+        use_recovery,
+        secret,
+        keyfile,
+        output_dir,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_decrypt_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vaults: Vec<PathBuf>,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
@@ -1129,7 +1501,7 @@ pub fn spawn_decrypt_with_threads(
             match mnemonic_to_entropy(&secret) {
                 Ok(k) => Some(k),
                 Err(e) => {
-                    send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                    send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string()));
                     return;
                 }
             }
@@ -1140,6 +1512,15 @@ pub fn spawn_decrypt_with_threads(
         let mut ok_count = 0usize;
         let mut first_output: Option<PathBuf> = None;
         for (idx, vault) in vaults.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(cancelled_status_msg(lang)),
+                );
+                return;
+            }
             let root_out = output_dir.clone().unwrap_or_else(|| {
                 vault
                     .parent()
@@ -1158,7 +1539,7 @@ pub fn spawn_decrypt_with_threads(
             };
 
             let item = (vaults.len() > 1).then_some((idx + 1, vaults.len()));
-            let progress = make_progress_cb(tx.clone(), ctx.clone(), item);
+            let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, item);
 
             match decrypt_vault_v5_with_stealth_kdf_and_threads(
                 vault,
@@ -1189,13 +1570,31 @@ pub fn spawn_decrypt_with_threads(
                             summary.output_path.display()
                         ),
                     };
-                    send(&tx, &ctx, WorkerUpdate::Log(line));
+                    send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(line));
+                }
+                Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
                 }
                 Err(e) => {
-                    send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                    send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string()));
                     return;
                 }
             }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
         }
 
         let reveal_target = if vaults.len() > 1 {
@@ -1216,9 +1615,10 @@ pub fn spawn_decrypt_with_threads(
             AppLanguage::Tr => format!("{ok_count}/{} kasa çözüldü", vaults.len()),
             AppLanguage::En => format!("Decrypted {ok_count}/{} vault(s)", vaults.len()),
         };
-        send(
+        send_scoped(
             &tx,
             &ctx,
+            scope,
             WorkerUpdate::DecryptDone {
                 status,
                 output_path: reveal_target,
@@ -1243,13 +1643,56 @@ pub fn spawn_integrity_check_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(
-        move || match check_vault_integrity_with_parts_and_threads(&vault, threads) {
+    spawn_integrity_check_scoped(
+        ctx,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        vault,
+        threads,
+        lang,
+    );
+}
+
+pub(crate) fn spawn_integrity_check_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault: PathBuf,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
+        match check_vault_integrity_with_parts_threads_and_cancel(
+            &vault,
+            threads,
+            Some(cancel.as_ref()),
+        ) {
             Ok((rep, split_parts)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
                 let text = format_integrity_report_with_split(&rep, split_parts, lang);
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::IntegrityDone {
                         text,
                         ok: rep.ok,
@@ -1257,9 +1700,15 @@ pub fn spawn_integrity_check_with_threads(
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
-        },
-    );
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
+        }
+    });
 }
 
 pub fn spawn_inspect(
@@ -1285,11 +1734,52 @@ pub fn spawn_inspect_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_inspect_scoped(
+        ctx,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        vault,
+        use_recovery,
+        secret,
+        keyfile,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_inspect_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault: PathBuf,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
@@ -1297,18 +1787,27 @@ pub fn spawn_inspect_with_threads(
             match mnemonic_to_entropy(&secret) {
                 Ok(k) => Some(k),
                 Err(e) => {
-                    send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                    send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string()));
                     return;
                 }
             }
         } else {
             None
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let mut reader = match open_vault_reader(&vault) {
             Ok(r) => r,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string()));
                 return;
             }
         };
@@ -1322,13 +1821,23 @@ pub fn spawn_inspect_with_threads(
             }
         };
 
-        match inspect_header_seekable_with_kdf_and_threads(
+        match inspect_header_seekable_with_kdf_threads_and_cancel(
             &mut reader,
             auth,
             &STEALTH_KDF_PARAMS,
             threads,
+            Some(cancel.as_ref()),
         ) {
             Ok(info) => {
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
                 let text = format_inspect_report_with_split(&info, split_parts, lang);
                 let status = match (lang, info.is_hidden_compartment) {
                     (AppLanguage::Tr, true) => "Gizli kasa meta verisi açıldı",
@@ -1337,9 +1846,10 @@ pub fn spawn_inspect_with_threads(
                     (AppLanguage::En, false) => "Vault metadata unlocked",
                 };
                 let manifest = info.metadata.files.clone();
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::InspectDone {
                         text,
                         status: status.into(),
@@ -1348,7 +1858,15 @@ pub fn spawn_inspect_with_threads(
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if matches!(e, CryptoError::Cancelled) || cancel.load(Ordering::Relaxed) => {
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(cancelled_status_msg(lang)),
+                )
+            }
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1360,35 +1878,52 @@ pub struct VaultDiffTarget {
     pub keyfile: Option<PathBuf>,
 }
 
+enum DiffUnlockError {
+    Cancelled,
+    Message(String),
+}
+
 fn unlock_vault_header_for_diff(
     label: &str,
     target: &VaultDiffTarget,
     threads: usize,
+    cancel: &AtomicBool,
     lang: AppLanguage,
-) -> Result<VaultInfo, String> {
+) -> Result<VaultInfo, DiffUnlockError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DiffUnlockError::Cancelled);
+    }
     let prefix = match lang {
         AppLanguage::Tr => format!("Kasa {label}"),
         AppLanguage::En => format!("Vault {label}"),
     };
     if !target.path.is_file() {
-        return Err(match lang {
+        return Err(DiffUnlockError::Message(match lang {
             AppLanguage::Tr => format!("{prefix}: dosya bulunamadı: {}", target.path.display()),
             AppLanguage::En => format!("{prefix}: vault not found: {}", target.path.display()),
-        });
+        }));
     }
     let keyfile_hash = if target.use_recovery {
         None
     } else {
-        load_optional_keyfile(target.keyfile.as_deref())
-            .map_err(|e| format!("{prefix}: {}", keyfile_error_msg(&e, lang)))?
+        load_optional_keyfile(target.keyfile.as_deref()).map_err(|e| {
+            DiffUnlockError::Message(format!("{prefix}: {}", keyfile_error_msg(&e, lang)))
+        })?
     };
     let recovery_key = if target.use_recovery {
-        Some(mnemonic_to_entropy(&target.secret).map_err(|e| format!("{prefix}: {e}"))?)
+        Some(
+            mnemonic_to_entropy(&target.secret)
+                .map_err(|e| DiffUnlockError::Message(format!("{prefix}: {e}")))?,
+        )
     } else {
         None
     };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DiffUnlockError::Cancelled);
+    }
 
-    let mut reader = open_vault_reader(&target.path).map_err(|e| format!("{prefix}: {e}"))?;
+    let mut reader = open_vault_reader(&target.path)
+        .map_err(|e| DiffUnlockError::Message(format!("{prefix}: {e}")))?;
     let auth = if let Some(ref rk) = recovery_key {
         Auth::RecoveryKey(rk)
     } else {
@@ -1397,8 +1932,20 @@ fn unlock_vault_header_for_diff(
             keyfile_hash: keyfile_hash.as_ref(),
         }
     };
-    inspect_header_seekable_with_kdf_and_threads(&mut reader, auth, &STEALTH_KDF_PARAMS, threads)
-        .map_err(|e| format!("{prefix}: {e}"))
+    inspect_header_seekable_with_kdf_threads_and_cancel(
+        &mut reader,
+        auth,
+        &STEALTH_KDF_PARAMS,
+        threads,
+        Some(cancel),
+    )
+    .map_err(|e| {
+        if matches!(e, CryptoError::Cancelled) || cancel.load(Ordering::Relaxed) {
+            DiffUnlockError::Cancelled
+        } else {
+            DiffUnlockError::Message(format!("{prefix}: {e}"))
+        }
+    })
 }
 
 pub fn spawn_vault_diff(
@@ -1419,24 +1966,83 @@ pub fn spawn_vault_diff_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
-        let info_a = match unlock_vault_header_for_diff("A", &vault_a, threads, lang) {
+    spawn_vault_diff_scoped(
+        ctx,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        vault_a,
+        vault_b,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_vault_diff_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault_a: VaultDiffTarget,
+    vault_b: VaultDiffTarget,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        let info_a = match unlock_vault_header_for_diff("A", &vault_a, threads, &cancel, lang) {
             Ok(info) => info,
-            Err(err) => {
-                send(&tx, &ctx, WorkerUpdate::Error(err));
+            Err(DiffUnlockError::Cancelled) => {
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(cancelled_status_msg(lang)),
+                );
+                return;
+            }
+            Err(DiffUnlockError::Message(err)) => {
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(err));
                 return;
             }
         };
-        let info_b = match unlock_vault_header_for_diff("B", &vault_b, threads, lang) {
+        let info_b = match unlock_vault_header_for_diff("B", &vault_b, threads, &cancel, lang) {
             Ok(info) => info,
-            Err(err) => {
-                send(&tx, &ctx, WorkerUpdate::Error(err));
+            Err(DiffUnlockError::Cancelled) => {
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(cancelled_status_msg(lang)),
+                );
+                return;
+            }
+            Err(DiffUnlockError::Message(err)) => {
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(err));
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         match diff_metadata(&info_a.metadata, &info_b.metadata) {
             Ok(diff) => {
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
                 let text = format_diff_report(&diff, lang);
                 let status = match lang {
                     AppLanguage::Tr => format!(
@@ -1454,9 +2060,9 @@ pub fn spawn_vault_diff_with_threads(
                         diff.unchanged.len()
                     ),
                 };
-                send(&tx, &ctx, WorkerUpdate::DiffDone { text, status });
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::DiffDone { text, status });
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1503,11 +2109,56 @@ pub fn spawn_selective_extract_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_selective_extract_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        vault,
+        use_recovery,
+        secret,
+        keyfile,
+        selected_paths,
+        output_dir,
+        threads,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_selective_extract_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault: PathBuf,
+    use_recovery: bool,
+    secret: Zeroizing<String>,
+    keyfile: Option<PathBuf>,
+    selected_paths: Vec<String>,
+    output_dir: Option<PathBuf>,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
         let keyfile_hash = match load_optional_keyfile(keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
@@ -1515,13 +2166,22 @@ pub fn spawn_selective_extract_with_threads(
             match mnemonic_to_entropy(&secret) {
                 Ok(k) => Some(k),
                 Err(e) => {
-                    send(&tx, &ctx, WorkerUpdate::Error(e.to_string()));
+                    send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string()));
                     return;
                 }
             }
         } else {
             None
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let root_out = output_dir.unwrap_or_else(|| {
             vault
@@ -1540,7 +2200,7 @@ pub fn spawn_selective_extract_with_threads(
             }
         };
 
-        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, None);
 
         match decrypt_vault_v5_with_stealth_kdf_and_threads(
             &vault,
@@ -1553,6 +2213,15 @@ pub fn spawn_selective_extract_with_threads(
             Arc::clone(&cancel),
         ) {
             Ok(summary) => {
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
                 let msg = match lang {
                     AppLanguage::Tr => format!(
                         "{} seçili dosya çıkarıldı -> {}",
@@ -1565,17 +2234,24 @@ pub fn spawn_selective_extract_with_threads(
                         summary.output_path.display()
                     ),
                 };
-                send(&tx, &ctx, WorkerUpdate::Log(msg.clone()));
-                send(
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(msg.clone()));
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::DecryptDone {
                         status: msg,
                         output_path: Some(summary.output_path),
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1593,11 +2269,54 @@ pub fn spawn_rekey(
     new_kdf: KdfParams,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_rekey_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        vault,
+        old_password,
+        new_password,
+        old_keyfile,
+        new_keyfile,
+        new_kdf,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_rekey_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault: PathBuf,
+    old_password: Zeroizing<String>,
+    new_password: Zeroizing<String>,
+    old_keyfile: Option<PathBuf>,
+    new_keyfile: Option<PathBuf>,
+    new_kdf: KdfParams,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
         let old_kf = match load_optional_keyfile(old_keyfile.as_deref()) {
             Ok(k) => k,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(keyfile_error_msg(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(keyfile_error_msg(&e, lang)),
+                );
                 return;
             }
         };
@@ -1608,16 +2327,30 @@ pub fn spawn_rekey(
                     AppLanguage::Tr => format!("Yeni anahtar dosyası hatası: {e}"),
                     AppLanguage::En => format!("New keyfile error: {e}"),
                 };
-                send(&tx, &ctx, WorkerUpdate::Error(msg));
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(msg));
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
 
         let primary_vault = match discover_split_parts(&vault) {
             Ok(Some(set)) => set.first_part().to_path_buf(),
             Ok(None) => vault,
             Err(e) => {
-                send(&tx, &ctx, WorkerUpdate::Error(format_rekey_error(&e, lang)));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::Error(format_rekey_error(&e, lang)),
+                );
                 return;
             }
         };
@@ -1632,22 +2365,43 @@ pub fn spawn_rekey(
             Some(&cancel),
         ) {
             Ok(()) => {
+                if cancel.load(Ordering::Relaxed) {
+                    send_scoped(
+                        &tx,
+                        &ctx,
+                        scope,
+                        WorkerUpdate::Error(cancelled_status_msg(lang)),
+                    );
+                    return;
+                }
                 let status = match lang {
                     AppLanguage::Tr => {
                         format!("Anahtar güncelleme tamamlandı: {}", primary_vault.display())
                     }
                     AppLanguage::En => format!("Re-key complete: {}", primary_vault.display()),
                 };
-                send(
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::RekeyDone {
                         status,
                         vault_path: primary_vault,
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(format_rekey_error(&e, lang))),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(format_rekey_error(&e, lang)),
+            ),
         }
     });
 }
@@ -1676,9 +2430,69 @@ pub fn spawn_preview_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_preview_scoped(ctx, tx, cancel, None, gen, target, path, threads, lang);
+}
+
+pub(crate) fn spawn_guarded_preview_worker<F>(
+    tx: mpsc::Sender<WorkerUpdate>,
+    ctx: egui::Context,
+    scope: Option<WorkerScope>,
+    gen: u64,
+    lang: AppLanguage,
+    body: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let tx_spawn_err = tx.clone();
+    let ctx_spawn_err = ctx.clone();
+    let tx_panic = tx.clone();
+    let ctx_panic = ctx.clone();
+    if let Err(err) = thread::Builder::new().spawn(move || {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
+            let detail = panic_payload_message(&*payload);
+            send_scoped(
+                &tx_panic,
+                &ctx_panic,
+                scope,
+                WorkerUpdate::PreviewError {
+                    gen,
+                    message: worker_panic_error_msg(&detail, lang),
+                    cancelled: false,
+                },
+            );
+        }
+    }) {
+        send_scoped(
+            &tx_spawn_err,
+            &ctx_spawn_err,
+            scope,
+            WorkerUpdate::PreviewError {
+                gen,
+                message: worker_panic_error_msg(&err.to_string(), lang),
+                cancelled: false,
+            },
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_preview_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    gen: u64,
+    target: VaultDiffTarget,
+    path: String,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_preview_worker(tx.clone(), ctx.clone(), scope, gen, lang, move || {
         let s = crate::i18n::strings(lang);
         let result = (|| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
             let recovery = target
                 .use_recovery
                 .then(|| mnemonic_to_entropy(&target.secret))
@@ -1689,6 +2503,9 @@ pub fn spawn_preview_with_threads(
             } else {
                 None
             };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StorageError::Cancelled);
+            }
             let auth = match recovery.as_ref() {
                 Some(key) => Auth::RecoveryKey(key),
                 None => Auth::Password {
@@ -1703,18 +2520,23 @@ pub fn spawn_preview_with_threads(
                 rpm_storage::DEFAULT_PREVIEW_MAX_BYTES,
                 &rpm_core::STEALTH_KDF_PARAMS,
                 threads,
-                make_progress_cb(tx.clone(), ctx.clone(), None),
-                cancel,
+                make_progress_cb(tx.clone(), ctx.clone(), scope, None),
+                Arc::clone(&cancel),
             )
         })();
         let msg = match result {
+            Ok(_bytes) if cancel.load(Ordering::Relaxed) => WorkerUpdate::PreviewError {
+                gen,
+                message: s.preview_cancelled.into(),
+                cancelled: true,
+            },
             Ok(bytes) => WorkerUpdate::PreviewDone {
                 gen,
                 path,
                 bytes,
                 status: s.preview_ready.into(),
             },
-            Err(StorageError::Cancelled | StorageError::Crypto(CryptoError::Cancelled)) => {
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => {
                 WorkerUpdate::PreviewError {
                     gen,
                     message: s.preview_cancelled.into(),
@@ -1732,7 +2554,7 @@ pub fn spawn_preview_with_threads(
                 cancelled: false,
             },
         };
-        send(&tx, &ctx, msg);
+        send_scoped(&tx, &ctx, scope, msg);
     });
 }
 
@@ -1754,16 +2576,38 @@ pub fn spawn_repair_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
+    spawn_repair_scoped(ctx, tx, path, cancel, None, threads, lang);
+}
+
+pub(crate) fn spawn_repair_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    threads: usize,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
         let s = crate::i18n::strings(lang);
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(s.repair_cancelled.into()),
+            );
+            return;
+        }
         let primary_path = if path.is_file() {
             match discover_split_parts(&path) {
                 Ok(Some(set)) => set.first_part().to_path_buf(),
                 Ok(None) => path,
                 Err(e) => {
-                    send(
+                    send_scoped(
                         &tx,
                         &ctx,
+                        scope,
                         WorkerUpdate::Error(format!("{}: {e}", s.repair_error)),
                     );
                     return;
@@ -1772,37 +2616,41 @@ pub fn spawn_repair_with_threads(
         } else {
             path
         };
-        let msg = match repair_vault_v5_with_threads(&primary_path, None, threads, cancel) {
-            Ok(r) => WorkerUpdate::RepairDone {
-                text: match lang {
-                    AppLanguage::Tr => format!(
-                        "{}: {} ({} blok kontrol edildi)",
-                        s.repair_done, r.repaired_bytes, r.blocks_checked
-                    ),
-                    AppLanguage::En => format!(
-                        "{}: {} ({} blocks checked)",
-                        s.repair_done, r.repaired_bytes, r.blocks_checked
-                    ),
+        let msg =
+            match repair_vault_v5_with_threads(&primary_path, None, threads, Arc::clone(&cancel)) {
+                Ok(_r) if cancel.load(Ordering::Relaxed) => {
+                    WorkerUpdate::Error(s.repair_cancelled.into())
+                }
+                Ok(r) => WorkerUpdate::RepairDone {
+                    text: match lang {
+                        AppLanguage::Tr => format!(
+                            "{}: {} ({} blok kontrol edildi)",
+                            s.repair_done, r.repaired_bytes, r.blocks_checked
+                        ),
+                        AppLanguage::En => format!(
+                            "{}: {} ({} blocks checked)",
+                            s.repair_done, r.repaired_bytes, r.blocks_checked
+                        ),
+                    },
+                    vault_path: primary_path,
                 },
-                vault_path: primary_path,
-            },
-            Err(StorageError::Crypto(CryptoError::UnsupportedOperation(_))) => {
-                WorkerUpdate::Error(s.repair_requires_rs.into())
-            }
-            Err(StorageError::Crypto(CryptoError::Cancelled)) => {
-                WorkerUpdate::Error(s.repair_cancelled.into())
-            }
-            Err(StorageError::Crypto(CryptoError::InvalidFormat(_))) => {
-                WorkerUpdate::Error(s.repair_invalid.into())
-            }
-            Err(StorageError::Crypto(CryptoError::Io(e)))
-                if e.kind() == std::io::ErrorKind::InvalidData =>
-            {
-                WorkerUpdate::Error(s.repair_invalid.into())
-            }
-            Err(e) => WorkerUpdate::Error(format!("{}: {e}", s.repair_error)),
-        };
-        send(&tx, &ctx, msg);
+                Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => {
+                    WorkerUpdate::Error(s.repair_cancelled.into())
+                }
+                Err(StorageError::Crypto(CryptoError::UnsupportedOperation(_))) => {
+                    WorkerUpdate::Error(s.repair_requires_rs.into())
+                }
+                Err(StorageError::Crypto(CryptoError::InvalidFormat(_))) => {
+                    WorkerUpdate::Error(s.repair_invalid.into())
+                }
+                Err(StorageError::Crypto(CryptoError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    WorkerUpdate::Error(s.repair_invalid.into())
+                }
+                Err(e) => WorkerUpdate::Error(format!("{}: {e}", s.repair_error)),
+            };
+        send_scoped(&tx, &ctx, scope, msg);
     });
 }
 
@@ -1814,22 +2662,84 @@ pub fn spawn_source_scan(
     outer_sources: Vec<PathBuf>,
     hidden_sources: Vec<PathBuf>,
 ) {
-    thread::spawn(move || {
-        let Some(outer) = scan_sources_sync(&outer_sources, &cancel) else {
+    spawn_source_scan_scoped(ctx, tx, cancel, gen, outer_sources, hidden_sources, None);
+}
+
+pub(crate) fn spawn_guarded_source_scan_worker<F>(
+    tx: mpsc::Sender<WorkerUpdate>,
+    ctx: egui::Context,
+    cancel: Arc<AtomicBool>,
+    gen: u64,
+    scope: Option<WorkerScope>,
+    body: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let tx_spawn_err = tx.clone();
+    let ctx_spawn_err = ctx.clone();
+    let cancel_spawn_err = Arc::clone(&cancel);
+    let tx_panic = tx.clone();
+    let ctx_panic = ctx.clone();
+    let cancel_panic = Arc::clone(&cancel);
+    if thread::Builder::new()
+        .spawn(move || {
+            let res = catch_unwind(AssertUnwindSafe(body));
+            if res.is_err() && !cancel_panic.load(Ordering::Relaxed) {
+                send_scoped(
+                    &tx_panic,
+                    &ctx_panic,
+                    scope,
+                    WorkerUpdate::SourceScanDone {
+                        gen,
+                        outer: SourceSizeSummary::default(),
+                        hidden: SourceSizeSummary::default(),
+                    },
+                );
+            }
+        })
+        .is_err()
+        && !cancel_spawn_err.load(Ordering::Relaxed)
+    {
+        send_scoped(
+            &tx_spawn_err,
+            &ctx_spawn_err,
+            scope,
+            WorkerUpdate::SourceScanDone {
+                gen,
+                outer: SourceSizeSummary::default(),
+                hidden: SourceSizeSummary::default(),
+            },
+        );
+    }
+}
+
+pub(crate) fn spawn_source_scan_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    gen: u64,
+    outer_sources: Vec<PathBuf>,
+    hidden_sources: Vec<PathBuf>,
+    scope: Option<WorkerScope>,
+) {
+    let cancel_run = Arc::clone(&cancel);
+    spawn_guarded_source_scan_worker(tx.clone(), ctx.clone(), cancel, gen, scope, move || {
+        let Some(outer) = scan_sources_sync(&outer_sources, &cancel_run) else {
             return;
         };
         let hidden = if hidden_sources.is_empty() {
             SourceSizeSummary::default()
         } else {
-            let Some(h) = scan_sources_sync(&hidden_sources, &cancel) else {
+            let Some(h) = scan_sources_sync(&hidden_sources, &cancel_run) else {
                 return;
             };
             h
         };
-        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            send(
+        if !cancel_run.load(Ordering::Relaxed) {
+            send_scoped(
                 &tx,
                 &ctx,
+                scope,
                 WorkerUpdate::SourceScanDone { gen, outer, hidden },
             );
         }
@@ -1845,15 +2755,53 @@ pub fn spawn_split_vault(
     part_size_bytes: u64,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
-        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
+    spawn_split_vault_scoped(
+        ctx,
+        tx,
+        cancel,
+        None,
+        vault,
+        output_dir,
+        part_size_bytes,
+        lang,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_split_vault_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    vault: PathBuf,
+    output_dir: Option<PathBuf>,
+    part_size_bytes: u64,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, None);
         match split_vault_file(
             &vault,
             output_dir.as_deref(),
             part_size_bytes,
             progress,
-            cancel,
+            Arc::clone(&cancel),
         ) {
+            Ok(_parts) if cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
             Ok(parts) => {
                 let first_part = parts[0].clone();
                 let first_name = first_part
@@ -1868,10 +2816,21 @@ pub fn spawn_split_vault(
                         format!("Split vault into {} part(s) -> {first_name}", parts.len())
                     }
                 };
-                send(&tx, &ctx, WorkerUpdate::Log(status.clone()));
-                send(&tx, &ctx, WorkerUpdate::SplitDone { status, first_part });
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(status.clone()));
+                send_scoped(
+                    &tx,
+                    &ctx,
+                    scope,
+                    WorkerUpdate::SplitDone { status, first_part },
+                );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1884,9 +2843,36 @@ pub fn spawn_join_vault(
     output_path: Option<PathBuf>,
     lang: AppLanguage,
 ) {
-    thread::spawn(move || {
-        let progress = make_progress_cb(tx.clone(), ctx.clone(), None);
-        match join_vault_parts(&part, output_path.as_deref(), progress, cancel) {
+    spawn_join_vault_scoped(ctx, tx, cancel, None, part, output_path, lang);
+}
+
+pub(crate) fn spawn_join_vault_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    part: PathBuf,
+    output_path: Option<PathBuf>,
+    lang: AppLanguage,
+) {
+    spawn_guarded_worker(tx.clone(), ctx.clone(), scope, lang, move || {
+        if cancel.load(Ordering::Relaxed) {
+            send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            );
+            return;
+        }
+        let progress = make_progress_cb(tx.clone(), ctx.clone(), scope, None);
+        match join_vault_parts(&part, output_path.as_deref(), progress, Arc::clone(&cancel)) {
+            Ok(_) if cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
             Ok((out_path, total_bytes)) => {
                 let out_name = out_path
                     .file_name()
@@ -1902,17 +2888,24 @@ pub fn spawn_join_vault(
                         crate::progress::format_bytes(total_bytes)
                     ),
                 };
-                send(&tx, &ctx, WorkerUpdate::Log(status.clone()));
-                send(
+                send_scoped(&tx, &ctx, scope, WorkerUpdate::Log(status.clone()));
+                send_scoped(
                     &tx,
                     &ctx,
+                    scope,
                     WorkerUpdate::JoinDone {
                         status,
                         output_path: out_path,
                     },
                 );
             }
-            Err(e) => send(&tx, &ctx, WorkerUpdate::Error(e.to_string())),
+            Err(e) if is_storage_cancelled(&e) || cancel.load(Ordering::Relaxed) => send_scoped(
+                &tx,
+                &ctx,
+                scope,
+                WorkerUpdate::Error(cancelled_status_msg(lang)),
+            ),
+            Err(e) => send_scoped(&tx, &ctx, scope, WorkerUpdate::Error(e.to_string())),
         }
     });
 }
@@ -1935,6 +2928,18 @@ pub fn spawn_queued_job_with_threads(
     threads: usize,
     lang: AppLanguage,
 ) -> &'static str {
+    spawn_queued_job_scoped(ctx, tx, cancel, None, job, threads, lang)
+}
+
+pub(crate) fn spawn_queued_job_scoped(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerUpdate>,
+    cancel: Arc<AtomicBool>,
+    scope: Option<WorkerScope>,
+    job: QueuedJob,
+    threads: usize,
+    lang: AppLanguage,
+) -> &'static str {
     let s = crate::i18n::strings(lang);
     match job.kind {
         QueuedJobKind::Encrypt {
@@ -1952,10 +2957,11 @@ pub fn spawn_queued_job_with_threads(
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt_with_split_and_threads(
+            spawn_encrypt_scoped(
                 ctx,
                 tx,
                 cancel,
+                scope,
                 sources,
                 password,
                 recovery_entropy,
@@ -1993,10 +2999,11 @@ pub fn spawn_queued_job_with_threads(
             wipe_passes,
             kdf,
         } => {
-            spawn_encrypt_hidden_with_split_and_threads(
+            spawn_encrypt_hidden_scoped(
                 ctx,
                 tx,
                 cancel,
+                scope,
                 decoy_sources,
                 hidden_sources,
                 decoy_password,
@@ -2026,10 +3033,11 @@ pub fn spawn_queued_job_with_threads(
             keyfile,
             output_dir,
         } => {
-            spawn_decrypt_with_threads(
+            spawn_decrypt_scoped(
                 ctx,
                 tx,
                 cancel,
+                scope,
                 vaults,
                 use_recovery,
                 secret,
@@ -2041,12 +3049,93 @@ pub fn spawn_queued_job_with_threads(
             s.status_dec_running
         }
         QueuedJobKind::Repair { path } => {
-            spawn_repair_with_threads(ctx, tx, path, cancel, threads, lang);
+            spawn_repair_scoped(ctx, tx, path, cancel, scope, threads, lang);
             s.repair_running
         }
         QueuedJobKind::IntegrityCheck { path } => {
-            spawn_integrity_check_with_threads(ctx, tx, path, threads, lang);
+            spawn_integrity_check_scoped(ctx, tx, cancel, scope, path, threads, lang);
             s.status_checking_integrity
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_sources_honors_cancel_without_deleting_files_or_logging_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("first.txt");
+        let sub = dir.path().join("folder");
+        std::fs::create_dir(&sub).unwrap();
+        let f2 = sub.join("nested.txt");
+        std::fs::write(&f1, b"first").unwrap();
+        std::fs::write(&f2, b"nested").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = AtomicBool::new(true);
+
+        let cancelled = wipe_sources(
+            &[f1.clone(), sub.clone()],
+            3,
+            &tx,
+            &ctx,
+            None,
+            &cancel,
+            AppLanguage::En,
+        );
+        assert!(cancelled);
+        assert_eq!(std::fs::read(&f1).unwrap(), b"first");
+        assert_eq!(std::fs::read(&f2).unwrap(), b"nested");
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled wipe_sources must not emit misleading wipe warnings"
+        );
+    }
+
+    #[test]
+    fn wipe_sources_stops_mid_batch_when_cancelled_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let data = vec![0x5Au8; 2 * 1024 * 1024];
+        for i in 0..8usize {
+            let p = dir.path().join(format!("wipe_{i}.bin"));
+            std::fs::write(&p, &data).unwrap();
+            files.push(p);
+        }
+        let sub = dir.path().join("tail_folder");
+        std::fs::create_dir(&sub).unwrap();
+        let tail_file = sub.join("untouched.txt");
+        std::fs::write(&tail_file, b"untouched tail").unwrap();
+        files.push(sub.clone());
+
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        let first_file = files[0].clone();
+        let stopper = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while first_file.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            cancel_bg.store(true, Ordering::Relaxed);
+        });
+
+        let cancelled = wipe_sources(&files, 3, &tx, &ctx, None, &cancel, AppLanguage::En);
+        stopper.join().unwrap();
+
+        assert!(cancelled, "expected concurrent cancel to halt wipe_sources");
+        assert_eq!(
+            std::fs::read(&tail_file).unwrap(),
+            b"untouched tail",
+            "tail folder should remain untouched after mid-batch cancel"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "concurrently cancelled wipe_sources must not emit wipe warnings"
+        );
     }
 }

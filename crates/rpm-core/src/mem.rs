@@ -51,8 +51,10 @@ fn unlock_key_page(page: usize) {
             *count -= 1;
             return;
         }
+        // Hold the page-lock mutex across `unlock_memory` (matching `lock_key_page`)
+        // so a concurrent allocation on the same OS page cannot be locked and then
+        // silently unlocked by this thread.
         map.remove(&page);
-        drop(map);
         unlock_memory(page as *const u8, page_size);
     }
 }
@@ -186,5 +188,73 @@ pub fn unlock_memory(ptr: *const u8, len: usize) {
     #[cfg(unix)]
     unsafe {
         let _ = libc::munlock(ptr as *const libc::c_void, len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn concurrent_secret_key_lock_and_unlock_keeps_page_refcounts_consistent() {
+        let threads: Vec<_> = (0..8)
+            .map(|tid| {
+                thread::spawn(move || {
+                    for iter in 0..256usize {
+                        let byte = ((tid * 31 + iter) % 251) as u8;
+                        let key = SecretKey::new([byte; 32]);
+                        assert_eq!(key.as_bytes(), &[byte; 32]);
+                        let cloned = key.clone();
+                        assert_eq!(cloned.as_bytes(), &[byte; 32]);
+                        drop(key);
+                        drop(cloned);
+                    }
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().unwrap();
+        }
+        // Any remaining entry in `page_locks()` must have a positive refcount (from other
+        // tests running concurrently in the same binary), never zero.
+        let map = page_locks().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(map.values().all(|&count| count > 0));
+        drop(map);
+
+        // Verify multiple keys sharing the same 4 KiB OS page bump the refcount above 1
+        // and keep the page pinned while at least one sibling key remains alive.
+        let mut keys: Vec<SecretKey> = (0..128usize)
+            .map(|i| SecretKey::new([(i as u8).wrapping_mul(7); 32]))
+            .collect();
+        let locked_pages: Vec<usize> = keys.iter().filter_map(|k| k.locked_page).collect();
+        if locked_pages.len() >= 2 {
+            let mut freq: HashMap<usize, usize> = HashMap::new();
+            for p in &locked_pages {
+                *freq.entry(*p).or_insert(0) += 1;
+            }
+            if let Some((&shared_page, &local_count)) = freq.iter().find(|(_, &c)| c >= 2) {
+                {
+                    let map = page_locks().lock().unwrap_or_else(|e| e.into_inner());
+                    assert!(
+                        map.get(&shared_page).copied().unwrap_or(0) >= local_count,
+                        "shared page refcount under-counted"
+                    );
+                }
+                // Drop exactly one key on `shared_page`; the page must remain in `page_locks()`
+                // with refcount >= local_count - 1.
+                let drop_pos = keys
+                    .iter()
+                    .position(|k| k.locked_page == Some(shared_page))
+                    .unwrap();
+                keys.remove(drop_pos);
+                let map = page_locks().lock().unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    map.get(&shared_page).copied().unwrap_or(0) >= local_count - 1,
+                    "dropping one sibling key prematurely unlocked shared page"
+                );
+            }
+        }
+        drop(keys);
     }
 }

@@ -5,6 +5,11 @@ use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use zeroize::Zeroizing;
 
+/// Upper bound on each individual message enqueued into a [`bounded_pipe`].
+/// Bounding message size keeps total in-flight heap strictly `O(capacity * 64 KiB)`
+/// regardless of Vault v5 `chunk_size` (1 MiB..16 MiB), eliminating 10x amplification.
+pub const PIPE_MAX_CHUNK_BYTES: usize = 64 * 1024;
+
 pub struct PipeWriter {
     tx: Option<SyncSender<Zeroizing<Vec<u8>>>>,
 }
@@ -36,9 +41,10 @@ impl Write for PipeWriter {
             .tx
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"))?;
-        tx.send(Zeroizing::new(buf.to_vec()))
+        let take = buf.len().min(PIPE_MAX_CHUNK_BYTES);
+        tx.send(Zeroizing::new(buf[..take].to_vec()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "reader dropped"))?;
-        Ok(buf.len())
+        Ok(take)
     }
 
     fn flush(&mut self) -> io::Result<()> {

@@ -132,6 +132,15 @@ impl UnlockedVault {
         }
     }
 
+    pub fn chunk_size(&self) -> u32 {
+        match self {
+            Self::ReedSolomon { inner, .. } => inner.chunk_size(),
+            Self::Outer { header, .. } => header.chunk_size,
+            Self::Stealth { info, .. } => info.chunk_size,
+            Self::Hidden { chunk_size, .. } => *chunk_size,
+        }
+    }
+
     pub fn vault_info(&self) -> VaultInfo {
         match self {
             Self::ReedSolomon { inner, repaired } => {
@@ -355,9 +364,14 @@ pub fn encrypt_hidden_stream_with_threads<R1: Read, R2: Read, W: Write>(
     hidden_progress: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<HiddenEncryptSummary, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     if opts.reed_solomon {
         crate::rs::validate_mode(opts.stealth)?;
-        let mut rs = crate::RsEncoderWriter::with_threads(writer, threads)?;
+        let (aead_threads, rs_threads) =
+            crate::pipeline::split_nested_threads(threads, opts.chunk_size);
+        let mut rs = crate::RsEncoderWriter::with_threads(writer, rs_threads)?;
         let summary = encrypt_hidden_inner(
             decoy_reader,
             hidden_reader,
@@ -367,12 +381,21 @@ pub fn encrypt_hidden_stream_with_threads<R1: Read, R2: Read, W: Write>(
             decoy_password,
             hidden_password,
             opts,
-            threads,
+            aead_threads,
             decoy_progress,
             hidden_progress,
             cancel,
         )?;
-        rs.finish()?;
+        if crate::vault::is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
+        rs.finish().map_err(|e| {
+            if crate::vault::is_cancelled(cancel) {
+                CryptoError::Cancelled
+            } else {
+                e.into()
+            }
+        })?;
         Ok(summary)
     } else {
         encrypt_hidden_inner(
@@ -555,12 +578,18 @@ fn encrypt_hidden_inner<R1: Read, R2: Read, W: Write>(
         &hidden_dek,
         &hidden_meta_nonce,
     );
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mini_kek = derive_hidden_kek(
         hidden_password,
         &container_salt,
         &opts.kdf,
         opts.hidden_keyfile_hash.as_ref(),
     )?;
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mini_aad = mini_header_aad(
         opts.container_size_bytes,
         &container_salt,
@@ -606,7 +635,11 @@ pub(crate) fn try_unlock_hidden<R: Read + Seek>(
     container: HiddenContainer<'_>,
     password: &[u8],
     keyfile_hash: Option<&SecretKey>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<UnlockedVault, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let container_size = container.size;
     let hdr_len = container.min_offset;
     if password.is_empty() || container_size < hdr_len + HIDDEN_MINI_HEADER_WIRE_SIZE as u64 {
@@ -618,14 +651,22 @@ pub(crate) fn try_unlock_hidden<R: Read + Seek>(
     reader.seek(SeekFrom::Start(mini_offset))?;
     let mut wire = [0u8; HIDDEN_MINI_HEADER_WIRE_SIZE];
     reader.read_exact(&mut wire).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else if e.kind() == io::ErrorKind::UnexpectedEof {
             CryptoError::AuthenticationFailed
         } else {
             CryptoError::Io(e)
         }
     })?;
 
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mini_kek = derive_hidden_kek(password, &container_salt, &container.kdf, keyfile_hash)?;
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mini_aad = mini_header_aad(container_size, &container_salt, keyfile_hash.is_some());
     let mini_cipher =
         Aes256Gcm::new_from_slice(mini_kek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
@@ -669,7 +710,9 @@ pub(crate) fn try_unlock_hidden<R: Read + Seek>(
     reader.seek(SeekFrom::Start(decoded.hidden_data_offset))?;
     let mut enc_meta = vec![0u8; decoded.encrypted_meta_len as usize];
     reader.read_exact(&mut enc_meta).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else if e.kind() == io::ErrorKind::UnexpectedEof {
             CryptoError::AuthenticationFailed
         } else {
             CryptoError::Io(e)
@@ -747,15 +790,42 @@ pub fn unlock_seekable_with_kdf_and_threads<R: Read + Seek>(
     stealth_kdf: &KdfParams,
     threads: usize,
 ) -> Result<UnlockedVault, CryptoError> {
-    if crate::rs::probe_rs_header(reader)? {
-        let mut rs = crate::RsSeekableReader::with_threads(reader, threads)?;
-        let inner = unlock_inner(&mut rs, auth, stealth_kdf, true)?;
+    unlock_seekable_with_kdf_threads_and_cancel(reader, auth, stealth_kdf, threads, None)
+}
+
+pub fn unlock_seekable_with_kdf_threads_and_cancel<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<UnlockedVault, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
+    let has_rs = match crate::rs::probe_rs_header(reader) {
+        Ok(v) => v,
+        Err(_) if crate::vault::is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+        Err(e) => return Err(e.into()),
+    };
+    if has_rs {
+        if crate::vault::is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
+        let mut rs = match crate::rs::BorrowedCancelRsReader::with_threads_and_cancel(
+            reader, threads, cancel,
+        ) {
+            Ok(r) => r,
+            Err(_) if crate::vault::is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e.into()),
+        };
+        let inner = unlock_inner(&mut rs, auth, stealth_kdf, true, cancel)?;
         Ok(UnlockedVault::ReedSolomon {
             inner: Box::new(inner),
             repaired: rs.repaired_bytes(),
         })
     } else {
-        unlock_inner(reader, auth, stealth_kdf, false)
+        unlock_inner(reader, auth, stealth_kdf, false, cancel)
     }
 }
 
@@ -764,12 +834,20 @@ fn unlock_inner<R: Read + Seek>(
     auth: Auth<'_>,
     stealth_kdf: &KdfParams,
     rs: bool,
+    cancel: Option<&AtomicBool>,
 ) -> Result<UnlockedVault, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     reader.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 4];
-    reader
-        .read_exact(&mut magic)
-        .map_err(crate::stealth::map_eof)?;
+    reader.read_exact(&mut magic).map_err(|e| {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            crate::stealth::map_eof(e)
+        }
+    })?;
     reader.seek(SeekFrom::Start(0))?;
     if magic != crate::VAULT_MAGIC {
         if rs {
@@ -777,9 +855,13 @@ fn unlock_inner<R: Read + Seek>(
                 "expected RPMV inside Reed-Solomon envelope".into(),
             ));
         }
-        return crate::stealth::unlock(reader, auth, stealth_kdf);
+        return crate::stealth::unlock(reader, auth, stealth_kdf, cancel);
     }
-    let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
+    let (header, enc_meta, hdr_len) = match read_header_and_meta(reader) {
+        Ok(v) => v,
+        Err(_) if crate::vault::is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+        Err(e) => return Err(e),
+    };
     let stream_len = reader.seek(SeekFrom::End(0))?;
     if let Some(target_size) = header.container_size {
         if stream_len != target_size {
@@ -788,8 +870,14 @@ fn unlock_inner<R: Read + Seek>(
     }
     reader.seek(SeekFrom::Start(hdr_len))?;
 
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let outer_err = match unlock_dek(&header, auth) {
         Ok(dek) => {
+            if crate::vault::is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
             let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
             return Ok(UnlockedVault::Outer {
                 header,
@@ -801,6 +889,9 @@ fn unlock_inner<R: Read + Seek>(
         Err(err) => err,
     };
 
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     if let (
         Some(target_size),
         Auth::Password {
@@ -809,7 +900,7 @@ fn unlock_inner<R: Read + Seek>(
         },
     ) = (header.container_size, auth)
     {
-        if let Ok(hidden) = try_unlock_hidden(
+        match try_unlock_hidden(
             reader,
             HiddenContainer {
                 salt: header
@@ -822,8 +913,11 @@ fn unlock_inner<R: Read + Seek>(
             },
             password,
             keyfile_hash,
+            cancel,
         ) {
-            return Ok(hidden);
+            Ok(hidden) => return Ok(hidden),
+            Err(CryptoError::Cancelled) => return Err(CryptoError::Cancelled),
+            Err(_) => {}
         }
     }
 
@@ -852,7 +946,20 @@ pub fn inspect_header_seekable_with_kdf_and_threads<R: Read + Seek>(
     stealth_kdf: &KdfParams,
     threads: usize,
 ) -> Result<VaultInfo, CryptoError> {
-    Ok(unlock_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, threads)?.vault_info())
+    inspect_header_seekable_with_kdf_threads_and_cancel(reader, auth, stealth_kdf, threads, None)
+}
+
+pub fn inspect_header_seekable_with_kdf_threads_and_cancel<R: Read + Seek>(
+    reader: &mut R,
+    auth: Auth<'_>,
+    stealth_kdf: &KdfParams,
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<VaultInfo, CryptoError> {
+    Ok(
+        unlock_seekable_with_kdf_threads_and_cancel(reader, auth, stealth_kdf, threads, cancel)?
+            .vault_info(),
+    )
 }
 
 /// Decrypt the chunked payload of an already-unlocked outer or hidden compartment.
@@ -875,9 +982,20 @@ pub fn decrypt_unlocked_stream_with_threads<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<u64, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     if let UnlockedVault::ReedSolomon { inner, .. } = unlocked {
-        let mut rs = crate::RsSeekableReader::with_threads(reader, threads)?;
-        decrypt_inner(&mut rs, writer, inner, threads, progress_cb, cancel)
+        let (aead_threads, rs_threads) =
+            crate::pipeline::split_nested_threads(threads, inner.chunk_size());
+        let mut rs = match crate::rs::BorrowedCancelRsReader::with_threads_and_cancel(
+            reader, rs_threads, cancel,
+        ) {
+            Ok(r) => r,
+            Err(_) if crate::vault::is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e.into()),
+        };
+        decrypt_inner(&mut rs, writer, inner, aead_threads, progress_cb, cancel)
     } else {
         decrypt_inner(reader, writer, unlocked, threads, progress_cb, cancel)
     }
@@ -967,7 +1085,16 @@ fn decrypt_inner<R: Read + Seek, W: Write>(
                 cancel,
             )?;
 
-            writer.flush()?;
+            if crate::vault::is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
+            writer.flush().map_err(|e| {
+                if crate::vault::is_cancelled(cancel) {
+                    CryptoError::Cancelled
+                } else {
+                    e.into()
+                }
+            })?;
             Ok(total_bytes)
         }
     }
@@ -1040,7 +1167,11 @@ pub fn decrypt_stream_seekable_with_kdf_and_threads<R: Read + Seek, W: Write>(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
-    let unlocked = unlock_seekable_with_kdf_and_threads(reader, auth, stealth_kdf, threads)?;
+    let unlocked =
+        unlock_seekable_with_kdf_threads_and_cancel(reader, auth, stealth_kdf, threads, cancel)?;
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     decrypt_unlocked_stream_with_threads(reader, writer, &unlocked, threads, progress_cb, cancel)?;
     Ok(unlocked.metadata().clone())
 }

@@ -29,16 +29,18 @@ pub use hidden::{
     decrypt_stream_seekable_with_kdf_and_threads, decrypt_stream_seekable_with_threads,
     decrypt_unlocked_stream, decrypt_unlocked_stream_with_threads, encrypt_hidden_stream,
     encrypt_hidden_stream_with_threads, inspect_header_seekable, inspect_header_seekable_with_kdf,
-    inspect_header_seekable_with_kdf_and_threads, unlock_seekable, unlock_seekable_with_kdf,
-    unlock_seekable_with_kdf_and_threads, HiddenEncryptOptions, HiddenEncryptSummary,
-    UnlockedVault,
+    inspect_header_seekable_with_kdf_and_threads,
+    inspect_header_seekable_with_kdf_threads_and_cancel, unlock_seekable, unlock_seekable_with_kdf,
+    unlock_seekable_with_kdf_and_threads, unlock_seekable_with_kdf_threads_and_cancel,
+    HiddenEncryptOptions, HiddenEncryptSummary, UnlockedVault,
 };
 pub use kdf::{hash_keyfile_reader, KdfParams};
 pub use mem::{SecretBuf, SecretKey};
 pub use recovery::{entropy_to_mnemonic, generate_recovery_entropy, mnemonic_to_entropy};
 pub use vault::{
     check_integrity, check_integrity_reader, check_integrity_reader_with_threads,
-    check_integrity_with_threads, decrypt_chunks_with_key, decrypt_chunks_with_key_at,
+    check_integrity_reader_with_threads_and_cancel, check_integrity_with_threads,
+    check_integrity_with_threads_and_cancel, decrypt_chunks_with_key, decrypt_chunks_with_key_at,
     decrypt_stream, decrypt_stream_with_threads, encrypt_stream, encrypt_stream_with_threads,
     inspect_header, rekey_stream, EncryptOptions, EncryptSummary, IntegrityReport, RekeyOptions,
     VaultInfo,

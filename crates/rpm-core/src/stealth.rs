@@ -1,6 +1,7 @@
 //! Fixed-layout encrypted outer header. No unauthenticated length or KDF
 //! setting from the file controls an allocation or a password derivation.
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::AtomicBool;
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -155,14 +156,24 @@ pub(crate) fn unlock<R: Read + Seek>(
     reader: &mut R,
     auth: Auth<'_>,
     kdf: &KdfParams,
+    cancel: Option<&AtomicBool>,
 ) -> Result<UnlockedVault, CryptoError> {
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let size = reader.seek(SeekFrom::End(0))?;
     if size < META_OFFSET {
         return Err(CryptoError::AuthenticationFailed);
     }
     reader.seek(SeekFrom::Start(0))?;
     let mut salt = [0; SALT_SIZE];
-    reader.read_exact(&mut salt).map_err(map_eof)?;
+    reader.read_exact(&mut salt).map_err(|e| {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            map_eof(e)
+        }
+    })?;
 
     let (key, domain) = match auth {
         Auth::Password {
@@ -185,8 +196,17 @@ pub(crate) fn unlock<R: Read + Seek>(
             )
         }
     };
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mut wire = [0; SLOT_SIZE];
-    reader.read_exact(&mut wire).map_err(map_eof)?;
+    reader.read_exact(&mut wire).map_err(|e| {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            map_eof(e)
+        }
+    })?;
     let cipher = Aes256Gcm::new(key.as_bytes().into());
     let plain = match cipher.decrypt(
         Nonce::from_slice(&wire[..AES_NONCE_SIZE]),
@@ -197,6 +217,9 @@ pub(crate) fn unlock<R: Read + Seek>(
     ) {
         Ok(slot) => Zeroizing::new(slot),
         Err(_) => {
+            if crate::vault::is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
             if let Auth::Password {
                 password,
                 keyfile_hash,
@@ -214,6 +237,7 @@ pub(crate) fn unlock<R: Read + Seek>(
                         },
                         password,
                         keyfile_hash,
+                        cancel,
                     );
                 }
             }
@@ -252,7 +276,16 @@ pub(crate) fn unlock<R: Read + Seek>(
     let ctx = context(&salt, id, chunk_size, flags, container);
     reader.seek(SeekFrom::Start(META_OFFSET))?;
     let mut meta = vec![0; meta_len];
-    reader.read_exact(&mut meta).map_err(map_eof)?;
+    reader.read_exact(&mut meta).map_err(|e| {
+        if crate::vault::is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            map_eof(e)
+        }
+    })?;
+    if crate::vault::is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let decrypted = Zeroizing::new(
         Aes256Gcm::new(dek.as_bytes().into())
             .decrypt(

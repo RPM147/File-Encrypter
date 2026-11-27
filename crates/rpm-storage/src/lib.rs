@@ -28,11 +28,12 @@ pub use recovery_sheet::{
 };
 pub use split::{
     check_vault_integrity, check_vault_integrity_with_parts,
-    check_vault_integrity_with_parts_and_threads, discover_split_parts, is_vault_or_split_filename,
-    join_vault_parts, open_vault_reader, parse_split_part_path, path_dedup_key, split_part_path,
-    split_vault_file, unique_split_base, validate_split_bounds, vault_display_stem, PathDedupKey,
-    SplitDiscoveryCache, SplitVolumePart, SplitVolumeReader, SplitVolumeSet, VaultReader,
-    MAX_SPLIT_PARTS, MIN_SPLIT_PART_SIZE,
+    check_vault_integrity_with_parts_and_threads,
+    check_vault_integrity_with_parts_threads_and_cancel, discover_split_parts,
+    is_vault_or_split_filename, join_vault_parts, open_vault_reader, parse_split_part_path,
+    path_dedup_key, split_part_path, split_vault_file, unique_split_base, validate_split_bounds,
+    vault_display_stem, PathDedupKey, SplitDiscoveryCache, SplitVolumePart, SplitVolumeReader,
+    SplitVolumeSet, VaultReader, MAX_SPLIT_PARTS, MIN_SPLIT_PART_SIZE,
 };
 pub use wiper::SecureWiper;
 pub use workflow::{

@@ -394,6 +394,14 @@ pub enum WorkerUpdate {
         hidden: SourceSizeSummary,
     },
     Error(String),
+    /// Epoch- and job-fenced wrapper emitted by GUI-owned background workers so
+    /// stale updates from cancelled/abandoned workers or cleared sessions are
+    /// discarded deterministically in `RpmApp::drain_updates`.
+    Scoped {
+        epoch: u64,
+        job_id: u64,
+        update: Box<WorkerUpdate>,
+    },
 }
 
 pub struct RecoveryPrompt {
@@ -868,6 +876,10 @@ pub struct AppState {
     pub queue_completed: usize,
     pub queue_failed: usize,
     next_queue_id: u64,
+    session_epoch: u64,
+    active_job_id: u64,
+    next_job_id: u64,
+    active_job_cancel: Option<Arc<AtomicBool>>,
     pub encrypt: EncryptFields,
     pub decrypt: DecryptFields,
     pub inspect: InspectFields,
@@ -932,6 +944,10 @@ impl AppState {
             queue_completed: 0,
             queue_failed: 0,
             next_queue_id: 1,
+            session_epoch: 0,
+            active_job_id: 0,
+            next_job_id: 1,
+            active_job_cancel: None,
             encrypt: EncryptFields {
                 reed_solomon: false,
                 stealth: false,
@@ -1040,6 +1056,107 @@ impl AppState {
         self.progress = 0.0;
         self.transfer = None;
         self.set_status(status, false);
+    }
+
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    pub fn active_job_id(&self) -> u64 {
+        self.active_job_id
+    }
+
+    fn alloc_job_id(&mut self) -> u64 {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        id
+    }
+
+    pub(crate) fn begin_job(
+        &mut self,
+        legacy_cancel: &Arc<AtomicBool>,
+    ) -> (crate::worker::WorkerScope, Arc<AtomicBool>) {
+        if let Some(prev) = self.active_job_cancel.take() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        legacy_cancel.store(false, Ordering::Relaxed);
+        let job_id = self.alloc_job_id();
+        let job_cancel = Arc::new(AtomicBool::new(false));
+        self.active_job_id = job_id;
+        self.active_job_cancel = Some(Arc::clone(&job_cancel));
+        (
+            crate::worker::WorkerScope {
+                epoch: self.session_epoch,
+                job_id,
+            },
+            job_cancel,
+        )
+    }
+
+    pub(crate) fn begin_transfer_job(
+        &mut self,
+        status: impl Into<String>,
+        legacy_cancel: &Arc<AtomicBool>,
+    ) -> (crate::worker::WorkerScope, Arc<AtomicBool>) {
+        self.begin_transfer(status);
+        self.begin_job(legacy_cancel)
+    }
+
+    pub(crate) fn begin_busy_job(
+        &mut self,
+        status: impl Into<String>,
+        legacy_cancel: &Arc<AtomicBool>,
+    ) -> (crate::worker::WorkerScope, Arc<AtomicBool>) {
+        self.busy = true;
+        self.transfer = None;
+        self.set_status(status, false);
+        self.begin_job(legacy_cancel)
+    }
+
+    pub(crate) fn begin_preview_job(
+        &mut self,
+        status: impl Into<String>,
+        legacy_cancel: &Arc<AtomicBool>,
+    ) -> (u64, crate::worker::WorkerScope, Arc<AtomicBool>) {
+        if let Some(prev) = self.active_job_cancel.take() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        legacy_cancel.store(false, Ordering::Relaxed);
+        let (gen, preview_cancel) = self.inspect.begin_preview();
+        let job_id = self.alloc_job_id();
+        self.active_job_id = job_id;
+        self.active_job_cancel = Some(Arc::clone(&preview_cancel));
+        self.begin_transfer(status);
+        (
+            gen,
+            crate::worker::WorkerScope {
+                epoch: self.session_epoch,
+                job_id,
+            },
+            preview_cancel,
+        )
+    }
+
+    pub fn cancel_active_job(&mut self) {
+        if let Some(ref cancel) = self.active_job_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some((_, ref preview_cancel)) = self.inspect.preview_pending {
+            preview_cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_active_job_cancelled(&self) -> bool {
+        self.active_job_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    pub fn finish_active_job(&mut self) {
+        self.busy = false;
+        self.transfer = None;
+        self.active_job_id = 0;
+        self.active_job_cancel = None;
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
@@ -1182,12 +1299,25 @@ impl AppState {
             || !self.pwgen.generated.is_empty()
             || !self.logs.is_empty()
             || !self.job_queue.is_empty()
+            || self.active_queue_job.is_some()
+            || self.busy
             || self.last_action.is_some()
     }
 
     /// Clear all in-app secrets, previews, loaded manifests, logs, pending queue, and quick action
-    /// banners. Never alters `clipboard_deadline` or overwrites the OS clipboard.
+    /// banners, and fence any in-flight workers behind a new `session_epoch`. Never alters
+    /// `clipboard_deadline` or overwrites the OS clipboard.
     pub fn clear_sensitive_session(&mut self, reason: SessionClearReason) {
+        if let Some(active_cancel) = self.active_job_cancel.take() {
+            active_cancel.store(true, Ordering::Relaxed);
+        }
+        self.session_epoch = self.session_epoch.wrapping_add(1);
+        self.active_job_id = 0;
+        self.active_queue_job = None;
+        self.busy = false;
+        self.progress = 0.0;
+        self.transfer = None;
+        self.encrypt.cancel_preflight_scan();
         self.clear_encrypt_secrets();
         self.clear_decrypt_secrets();
         self.clear_inspect_secrets();
@@ -1443,13 +1573,17 @@ impl AppState {
         let cancel = Arc::new(AtomicBool::new(false));
         self.encrypt.preflight_scan_cancel = Some(Arc::clone(&cancel));
         self.encrypt.preflight_scanning = true;
-        crate::worker::spawn_source_scan(
+        crate::worker::spawn_source_scan_scoped(
             ctx.clone(),
             tx.clone(),
             cancel,
             gen,
             current_key.0,
             current_key.1,
+            Some(crate::worker::WorkerScope {
+                epoch: self.session_epoch,
+                job_id: 0,
+            }),
         );
     }
 
@@ -1461,6 +1595,8 @@ impl AppState {
             self.busy = false;
             self.transfer = None;
             self.progress = 0.0;
+            self.active_job_id = 0;
+            self.active_job_cancel = None;
         }
         had_any
     }

@@ -289,7 +289,11 @@ pub fn ui(
         if vault_changed {
             let current = PathBuf::from(state.inspect.vault_path.trim());
             if state.inspect.manifest_vault.as_ref() != Some(&current) {
+                let had_pending = state.inspect.preview_pending.is_some();
                 state.clear_preview_and_busy();
+                if had_pending {
+                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 state.inspect.reset_manifest();
             }
         }
@@ -339,15 +343,13 @@ pub fn ui(
                 if ui.button(s.btn_repair).clicked() {
                     let path = PathBuf::from(state.inspect.vault_path.trim());
                     if path.is_file() {
-                        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                        state.busy = true;
-                        state.transfer = None;
-                        state.set_status(s.repair_running, false);
-                        worker::spawn_repair_with_threads(
+                        let (scope, job_cancel) = state.begin_busy_job(s.repair_running, cancel);
+                        worker::spawn_repair_scoped(
                             ctx.clone(),
                             tx.clone(),
                             path,
-                            cancel.clone(),
+                            job_cancel,
+                            Some(scope),
                             usize::from(state.config.pipeline_threads),
                             state.config.language,
                         );
@@ -370,12 +372,13 @@ pub fn ui(
                     if !p.is_file() {
                         state.set_status(s.err_select_vault, true);
                     } else {
-                        state.busy = true;
-                        state.transfer = None;
-                        state.set_status(s.status_checking_integrity, false);
-                        worker::spawn_integrity_check_with_threads(
+                        let (scope, job_cancel) =
+                            state.begin_busy_job(s.status_checking_integrity, cancel);
+                        worker::spawn_integrity_check_scoped(
                             ctx.clone(),
                             tx.clone(),
+                            job_cancel,
+                            Some(scope),
                             p,
                             usize::from(state.config.pipeline_threads),
                             state.config.language,
@@ -412,12 +415,12 @@ pub fn ui(
                         state.set_status(s.err_enter_pw_or_rec, true);
                         return;
                     }
-                    state.busy = true;
-                    state.transfer = None;
-                    state.set_status(s.status_inspecting, false);
-                    worker::spawn_inspect_with_threads(
+                    let (scope, job_cancel) = state.begin_busy_job(s.status_inspecting, cancel);
+                    worker::spawn_inspect_scoped(
                         ctx.clone(),
                         tx.clone(),
+                        job_cancel,
+                        Some(scope),
                         p,
                         state.inspect.use_recovery,
                         Zeroizing::new(sec),
@@ -619,12 +622,13 @@ pub fn ui(
                         secret,
                         keyfile: state.inspect.keyfile.clone(),
                     };
-                    let (gen, preview_cancel) = state.inspect.begin_preview();
-                    state.begin_transfer(s.preview_loading);
-                    worker::spawn_preview_with_threads(
+                    let (gen, scope, preview_cancel) =
+                        state.begin_preview_job(s.preview_loading, cancel);
+                    worker::spawn_preview_scoped(
                         ctx.clone(),
                         tx.clone(),
                         preview_cancel,
+                        Some(scope),
                         gen,
                         target,
                         path,
@@ -692,12 +696,13 @@ pub fn ui(
                     let mut chosen: Vec<String> =
                         state.inspect.selected_paths.iter().cloned().collect();
                     chosen.sort();
-                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                    state.begin_transfer(s.status_extracting_selected);
-                    worker::spawn_selective_extract_with_threads(
+                    let (scope, job_cancel) =
+                        state.begin_transfer_job(s.status_extracting_selected, cancel);
+                    worker::spawn_selective_extract_scoped(
                         ctx.clone(),
                         tx.clone(),
-                        Arc::clone(cancel),
+                        job_cancel,
+                        Some(scope),
                         vault,
                         state.inspect.use_recovery,
                         Zeroizing::new(sec),
@@ -797,12 +802,12 @@ pub fn ui(
                         .flatten(),
                 };
 
-                state.busy = true;
-                state.transfer = None;
-                state.set_status(s.status_comparing_vaults, false);
-                worker::spawn_vault_diff_with_threads(
+                let (scope, job_cancel) = state.begin_busy_job(s.status_comparing_vaults, cancel);
+                worker::spawn_vault_diff_scoped(
                     ctx.clone(),
                     tx.clone(),
+                    job_cancel,
+                    Some(scope),
                     target_a,
                     target_b,
                     usize::from(state.config.pipeline_threads),
@@ -903,12 +908,13 @@ pub fn ui(
                             };
                             match (part_res, out_dir_res) {
                                 (Ok(Some(part_bytes)), Ok(out_dir)) => {
-                                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                                    state.begin_transfer(s.status_splitting);
-                                    worker::spawn_split_vault(
+                                    let (scope, job_cancel) =
+                                        state.begin_transfer_job(s.status_splitting, cancel);
+                                    worker::spawn_split_vault_scoped(
                                         ctx.clone(),
                                         tx.clone(),
-                                        Arc::clone(cancel),
+                                        job_cancel,
+                                        Some(scope),
                                         src,
                                         out_dir,
                                         part_bytes,
@@ -972,12 +978,13 @@ pub fn ui(
                                 let trimmed = state.split_join.join_output_path.trim();
                                 (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
                             };
-                            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                            state.begin_transfer(s.status_joining);
-                            worker::spawn_join_vault(
+                            let (scope, job_cancel) =
+                                state.begin_transfer_job(s.status_joining, cancel);
+                            worker::spawn_join_vault_scoped(
                                 ctx.clone(),
                                 tx.clone(),
-                                Arc::clone(cancel),
+                                job_cancel,
+                                Some(scope),
                                 part,
                                 out_opt,
                                 state.config.language,

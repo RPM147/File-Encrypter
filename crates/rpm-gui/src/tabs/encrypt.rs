@@ -55,6 +55,13 @@ fn suggested_vault_label_for_sheet(sources: &[PathBuf], is_split: bool) -> Strin
     }
 }
 
+/// Whether the recovery confirmation modal's primary launch button may execute right now.
+/// Direct launches are blocked while another worker is active (`busy == true`), whereas
+/// queuing after confirmation stays allowed.
+pub fn can_launch_recovery_prompt(prompt: &RecoveryPrompt, busy: bool) -> bool {
+    prompt.confirmed && (prompt.queue_after_confirm || !busy)
+}
+
 pub fn validate_encrypt_inputs(
     state: &AppState,
     s: &'static Strings,
@@ -827,6 +834,7 @@ pub fn ui(
     let mut copy_phrase_now: Option<String> = None;
     let mut save_sheet_phrase: Option<Zeroizing<String>> = None;
     let enable_hidden_now = state.encrypt.enable_hidden;
+    let busy_now = state.busy;
     if let Some(prompt) = state.encrypt.recovery_prompt.as_mut() {
         egui::Window::new(s.modal_rec_title)
             .collapsible(false)
@@ -861,7 +869,7 @@ pub fn ui(
                     if ui.button(s.btn_save_recovery_sheet).clicked() {
                         save_sheet_phrase = Some(Zeroizing::new(prompt.phrase.clone()));
                     }
-                    ui.add_enabled_ui(prompt.confirmed, |ui| {
+                    ui.add_enabled_ui(can_launch_recovery_prompt(prompt, busy_now), |ui| {
                         if ui
                             .add(theme::primary_button(s.btn_continue_encrypt, ui.visuals()))
                             .clicked()
@@ -907,6 +915,14 @@ pub fn ui(
         state.encrypt.recovery_prompt = None;
         state.set_status(s.status_enc_cancelled, false);
     } else if launch {
+        let wants_direct_launch = state
+            .encrypt
+            .recovery_prompt
+            .as_ref()
+            .is_some_and(|p| !p.queue_after_confirm);
+        if wants_direct_launch && state.busy {
+            return;
+        }
         let (container_size, split_part_bytes) = match validate_encrypt_inputs(state, s) {
             Ok(pair) => pair,
             Err(err_msg) => {
@@ -973,21 +989,25 @@ pub fn ui(
                     });
                 }
             } else {
-                cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                if state.busy {
+                    return;
+                }
                 if state.encrypt.enable_hidden {
                     let Some(container_size_bytes) = container_size else {
                         state.set_status(s.err_hidden_requires_container, true);
                         return;
                     };
-                    state.begin_transfer(s.status_enc_hidden_running);
+                    let (scope, job_cancel) =
+                        state.begin_transfer_job(s.status_enc_hidden_running, cancel);
                     let decoy_pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
                     let hidden_pw =
                         Zeroizing::new(std::mem::take(&mut state.encrypt.hidden_password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt_hidden_with_split_and_threads(
+                    worker::spawn_encrypt_hidden_scoped(
                         ctx.clone(),
                         tx.clone(),
-                        Arc::clone(cancel),
+                        job_cancel,
+                        Some(scope),
                         state.encrypt.sources.clone(),
                         state.encrypt.hidden_sources.clone(),
                         decoy_pw,
@@ -1009,13 +1029,15 @@ pub fn ui(
                         state.config.language,
                     );
                 } else {
-                    state.begin_transfer(s.status_enc_running);
+                    let (scope, job_cancel) =
+                        state.begin_transfer_job(s.status_enc_running, cancel);
                     let pw = Zeroizing::new(std::mem::take(&mut state.encrypt.password));
                     state.clear_encrypt_secrets();
-                    worker::spawn_encrypt_with_split_and_threads(
+                    worker::spawn_encrypt_scoped(
                         ctx.clone(),
                         tx.clone(),
-                        Arc::clone(cancel),
+                        job_cancel,
+                        Some(scope),
                         state.encrypt.sources.clone(),
                         pw,
                         prompt.entropy.clone(),

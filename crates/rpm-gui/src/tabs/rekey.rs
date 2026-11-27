@@ -144,14 +144,12 @@ pub fn ui(
                 state.rekey.new_keyfile.clone()
             };
             state.clear_rekey_secrets();
-            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-            state.busy = true;
-            state.transfer = None;
-            state.set_status(s.status_rekeying, false);
-            worker::spawn_rekey(
+            let (scope, job_cancel) = state.begin_busy_job(s.status_rekeying, cancel);
+            worker::spawn_rekey_scoped(
                 ctx.clone(),
                 tx.clone(),
-                Arc::clone(cancel),
+                job_cancel,
+                Some(scope),
                 p,
                 old_pw,
                 new_pw,

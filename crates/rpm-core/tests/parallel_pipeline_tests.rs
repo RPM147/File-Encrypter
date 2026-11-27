@@ -6,10 +6,11 @@ use rpm_core::constants::{AES_TAG_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use rpm_core::header::read_header_and_meta;
 use rpm_core::rs::{RS_BLOCK_DATA_CAP, RS_BLOCK_WIRE_SIZE};
 use rpm_core::{
-    check_integrity_reader_with_threads, decrypt_stream_seekable_with_kdf_and_threads,
-    decrypt_stream_seekable_with_threads, decrypt_stream_with_threads, default_pipeline_threads,
-    encrypt_hidden_stream_with_threads, encrypt_stream_with_threads,
-    inspect_header_seekable_with_kdf_and_threads, repair_vault_stream_with_threads,
+    check_integrity_reader_with_threads, check_integrity_reader_with_threads_and_cancel,
+    decrypt_stream_seekable_with_kdf_and_threads, decrypt_stream_seekable_with_threads,
+    decrypt_stream_with_threads, default_pipeline_threads, encrypt_hidden_stream_with_threads,
+    encrypt_stream_with_threads, inspect_header_seekable_with_kdf_and_threads,
+    inspect_header_seekable_with_kdf_threads_and_cancel, repair_vault_stream_with_threads,
     resolve_pipeline_threads, Auth, CryptoError, EncryptOptions, FileManifestEntry,
     HiddenEncryptOptions, KdfParams, RsEncoderWriter, RsSeekableReader, VaultMetadata,
     MAX_PIPELINE_THREADS,
@@ -826,4 +827,258 @@ fn extreme_threads_chunk_sizes_and_large_manifest_unlock() {
         .unwrap();
         assert_eq!(dec, small_data);
     }
+}
+
+#[test]
+fn check_integrity_preserves_os_eio_after_transient_partial_read_and_honors_cancel() {
+    let mut rng = StdRng::seed_from_u64(0xE10C_A9CE);
+    let mut plain = vec![0u8; 512 * 1024 + 123];
+    rng.fill_bytes(&mut plain);
+
+    // Build RS, Standard, and Stealth vaults for integrity & inspect cancellation + EIO checks.
+    let mut rs_vault = Vec::new();
+    encrypt_stream_with_threads(
+        &mut Cursor::new(&plain),
+        &mut rs_vault,
+        &meta("rs.bin", plain.len()),
+        b"EioPw!1",
+        &EncryptOptions {
+            reed_solomon: true,
+            kdf: KdfParams::fast_test(),
+            chunk_size: MIN_CHUNK_SIZE,
+            compressed: false,
+            ..Default::default()
+        },
+        4,
+        |_| {},
+        None,
+    )
+    .unwrap();
+
+    let mut std_vault = Vec::new();
+    encrypt_stream_with_threads(
+        &mut Cursor::new(&plain),
+        &mut std_vault,
+        &meta("std.bin", plain.len()),
+        b"EioPw!1",
+        &EncryptOptions {
+            kdf: KdfParams::fast_test(),
+            chunk_size: MIN_CHUNK_SIZE,
+            compressed: false,
+            ..Default::default()
+        },
+        4,
+        |_| {},
+        None,
+    )
+    .unwrap();
+
+    let mut stealth_vault = Vec::new();
+    encrypt_stream_with_threads(
+        &mut Cursor::new(&plain),
+        &mut stealth_vault,
+        &meta("stealth.bin", plain.len()),
+        b"EioPw!1",
+        &EncryptOptions {
+            stealth: true,
+            kdf: KdfParams::fast_test(),
+            chunk_size: MIN_CHUNK_SIZE,
+            compressed: false,
+            ..Default::default()
+        },
+        4,
+        |_| {},
+        None,
+    )
+    .unwrap();
+
+    // 1. Single-shot transient EIO after partial read during RS integrity check must NOT be
+    //    overwritten with "invalid or uncorrectable Reed-Solomon block" (`InvalidData`).
+    struct SingleShotEioVault {
+        inner: Cursor<Vec<u8>>,
+        fail_at: u64,
+        armed: bool,
+        saw_rewind: bool,
+    }
+    impl Read for SingleShotEioVault {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let pos = self.inner.position();
+            if self.saw_rewind && self.armed && pos >= self.fail_at {
+                self.armed = false;
+                // Advance misaligned bytes before raising single-shot EIO.
+                let take = buf.len().min(333);
+                let _ = self.inner.read(&mut buf[..take]);
+                return Err(std::io::Error::other("simulated_transient_eio_fault"));
+            }
+            self.inner.read(buf)
+        }
+    }
+    impl Seek for SingleShotEioVault {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            if matches!(pos, SeekFrom::Start(0)) && self.inner.position() > 0 {
+                self.saw_rewind = true;
+            }
+            self.inner.seek(pos)
+        }
+    }
+
+    for threads in [1usize, 4] {
+        let mut faulty = SingleShotEioVault {
+            inner: Cursor::new(rs_vault.clone()),
+            fail_at: 48 + 4 * RS_BLOCK_WIRE_SIZE as u64,
+            armed: true,
+            saw_rewind: false,
+        };
+        let rep = check_integrity_reader_with_threads(&mut faulty, threads).unwrap();
+        assert!(!rep.ok);
+        assert!(
+            rep.message.contains("simulated_transient_eio_fault"),
+            "OS EIO was overwritten for threads={threads}: {}",
+            rep.message
+        );
+        assert!(
+            !rep.message
+                .contains("invalid or uncorrectable Reed-Solomon block"),
+            "misaligned RS InvalidData leaked into report: {}",
+            rep.message
+        );
+    }
+
+    // 2. Cooperative cancellation during check_integrity (RS, Standard, Stealth) and inspect.
+    struct TripCancelReader<'a> {
+        inner: Cursor<&'a [u8]>,
+        cancel: &'a AtomicBool,
+        reads: usize,
+        trip_at: usize,
+    }
+    impl Read for TripCancelReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads >= self.trip_at {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            self.inner.read(buf)
+        }
+    }
+    impl Seek for TripCancelReader<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    for (label, bytes) in [
+        ("rs", rs_vault.as_slice()),
+        ("std", std_vault.as_slice()),
+        ("stealth", stealth_vault.as_slice()),
+    ] {
+        // Pre-cancelled
+        let pre = AtomicBool::new(true);
+        let res =
+            check_integrity_reader_with_threads_and_cancel(&mut Cursor::new(bytes), 4, Some(&pre));
+        assert!(
+            matches!(res, Err(CryptoError::Cancelled)),
+            "{label} pre-cancel integrity: {res:?}"
+        );
+
+        // Mid-stream cancelled
+        let mid = AtomicBool::new(false);
+        let mut reader = TripCancelReader {
+            inner: Cursor::new(bytes),
+            cancel: &mid,
+            reads: 0,
+            trip_at: 4,
+        };
+        let res_mid = check_integrity_reader_with_threads_and_cancel(&mut reader, 4, Some(&mid));
+        assert!(
+            matches!(res_mid, Err(CryptoError::Cancelled)),
+            "{label} mid-stream cancel integrity: {res_mid:?}"
+        );
+
+        // Inspect pre-cancelled
+        let ins_res = inspect_header_seekable_with_kdf_threads_and_cancel(
+            &mut Cursor::new(bytes),
+            auth(b"EioPw!1"),
+            &KdfParams::fast_test(),
+            4,
+            Some(&pre),
+        );
+        assert!(
+            matches!(ins_res, Err(CryptoError::Cancelled)),
+            "{label} pre-cancel inspect: {ins_res:?}"
+        );
+    }
+}
+
+#[test]
+fn decrypt_padded_rs_cancel_during_skip_exact_returns_cancelled_not_io_error() {
+    let payload = vec![0x6Bu8; 4096];
+    let mut padded_rs = Vec::new();
+    encrypt_stream_with_threads(
+        &mut Cursor::new(&payload),
+        &mut padded_rs,
+        &meta("padded_rs.bin", payload.len()),
+        b"PadCancel!1",
+        &EncryptOptions {
+            reed_solomon: true,
+            kdf: KdfParams::fast_test(),
+            chunk_size: MIN_CHUNK_SIZE,
+            compressed: false,
+            container_size_bytes: Some(512 * 1024),
+            ..Default::default()
+        },
+        4,
+        |_| {},
+        None,
+    )
+    .unwrap();
+
+    // Trip cancel right inside `RsSeekableInner::load_window` while `skip_exact`
+    // is reading RS blocks of container padding past block 10.
+    struct TripAtOffsetReader<'a> {
+        inner: Cursor<&'a [u8]>,
+        cancel: &'a AtomicBool,
+        trip_offset: u64,
+        tripped: bool,
+    }
+    impl Read for TripAtOffsetReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let pos = self.inner.position();
+            let n = self.inner.read(buf)?;
+            if !self.tripped && pos >= self.trip_offset && pos < self.trip_offset + 64 * 1024 {
+                self.tripped = true;
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+    }
+    impl Seek for TripAtOffsetReader<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    let cancel = AtomicBool::new(false);
+    let mut reader = TripAtOffsetReader {
+        inner: Cursor::new(&padded_rs),
+        cancel: &cancel,
+        trip_offset: 48 + 10 * RS_BLOCK_WIRE_SIZE as u64,
+        tripped: false,
+    };
+    let res = decrypt_stream_seekable_with_kdf_and_threads(
+        &mut reader,
+        &mut Vec::new(),
+        auth(b"PadCancel!1"),
+        &KdfParams::fast_test(),
+        4,
+        |_| {},
+        Some(&cancel),
+    );
+    assert!(
+        reader.tripped,
+        "expected reader to trip cancel during skip_exact"
+    );
+    assert!(
+        matches!(res, Err(CryptoError::Cancelled)),
+        "expected CryptoError::Cancelled when RS load_window aborts during skip_exact, got {res:?}"
+    );
 }

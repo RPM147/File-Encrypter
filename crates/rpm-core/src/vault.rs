@@ -161,7 +161,13 @@ pub(crate) fn write_random_padding(
         }
         let want = (buf.len() as u64).min(remaining) as usize;
         OsRng.fill_bytes(&mut buf[..want]);
-        writer.write_all(&buf[..want])?;
+        writer.write_all(&buf[..want]).map_err(|e| {
+            if is_cancelled(cancel) {
+                CryptoError::Cancelled
+            } else {
+                e.into()
+            }
+        })?;
         remaining -= want as u64;
     }
     Ok(())
@@ -369,20 +375,34 @@ pub fn encrypt_stream_with_threads(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<EncryptSummary, CryptoError> {
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     if opts.reed_solomon {
         crate::rs::validate_mode(opts.stealth)?;
-        let mut rs = crate::RsEncoderWriter::with_threads(writer, threads)?;
+        let (aead_threads, rs_threads) =
+            crate::pipeline::split_nested_threads(threads, opts.chunk_size);
+        let mut rs = crate::RsEncoderWriter::with_threads(writer, rs_threads)?;
         let summary = encrypt_inner(
             reader,
             &mut rs,
             metadata,
             password,
             opts,
-            threads,
+            aead_threads,
             progress_cb,
             cancel,
         )?;
-        rs.finish()?;
+        if is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
+        rs.finish().map_err(|e| {
+            if is_cancelled(cancel) {
+                CryptoError::Cancelled
+            } else {
+                e.into()
+            }
+        })?;
         Ok(summary)
     } else {
         encrypt_inner(
@@ -457,8 +477,17 @@ pub fn decrypt_stream_with_threads(
     progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<VaultMetadata, CryptoError> {
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let (header, enc_meta, hdr_len) = read_header_and_meta(reader)?;
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let dek = crate::header::unlock_dek(&header, auth)?;
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let metadata = decrypt_metadata(&dek, &header, &enc_meta)?;
     decrypt_outer_chunks(
         reader,
@@ -565,12 +594,24 @@ pub(crate) fn decrypt_outer_chunks(
         }
         skip_exact(reader, target_size - total_consumed, cancel)?;
     }
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let mut trailing = [0u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        return Err(CryptoError::AuthenticationFailed);
+    match reader.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(_) => return Err(CryptoError::AuthenticationFailed),
+        Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+        Err(e) => return Err(e.into()),
     }
 
-    writer.flush()?;
+    writer.flush().map_err(|e| {
+        if is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            e.into()
+        }
+    })?;
     Ok(total_bytes)
 }
 
@@ -612,10 +653,17 @@ impl<R: Read> HashingReader<R> {
         }
     }
 
-    fn drain_and_finalize(mut self) -> io::Result<String> {
+    fn drain_and_finalize(mut self, cancel: Option<&AtomicBool>) -> Result<String, CryptoError> {
         let mut buf = [0u8; 64 * 1024];
         loop {
-            let n = self.inner.read(&mut buf)?;
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
+            let n = match self.inner.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 break;
             }
@@ -651,7 +699,11 @@ fn skip_exact(
             return Err(CryptoError::Cancelled);
         }
         let want = (scratch.len() as u64).min(remaining) as usize;
-        let n = reader.read(&mut scratch[..want])?;
+        let n = match reader.read(&mut scratch[..want]) {
+            Ok(n) => n,
+            Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             return Err(CryptoError::AuthenticationFailed);
         }
@@ -665,10 +717,14 @@ fn scan_chunk_frames(
     max_chunk_size: u32,
     hdr_bytes_read: u64,
     container_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<u32, String> {
     let mut chunk_count: u32 = 0;
     let mut payload_bytes_read: u64 = 0;
     loop {
+        if is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled.to_string());
+        }
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -705,7 +761,7 @@ fn scan_chunk_frames(
         payload_bytes_read = payload_bytes_read
             .checked_add(5 + payload_len)
             .ok_or_else(|| "Payload byte offset overflow".to_string())?;
-        if let Err(err) = skip_exact(reader, payload_len, None) {
+        if let Err(err) = skip_exact(reader, payload_len, cancel) {
             return Err(match err {
                 CryptoError::AuthenticationFailed => "Truncated chunk ciphertext/tag bytes".into(),
                 other => other.to_string(),
@@ -724,7 +780,7 @@ fn scan_chunk_frames(
                 if total_consumed > target_size {
                     return Err("Payload exceeds declared container_size".into());
                 }
-                if let Err(err) = skip_exact(reader, target_size - total_consumed, None) {
+                if let Err(err) = skip_exact(reader, target_size - total_consumed, cancel) {
                     return Err(match err {
                         CryptoError::AuthenticationFailed => {
                             "Truncated padded container (file shorter than container_size)".into()
@@ -732,6 +788,9 @@ fn scan_chunk_frames(
                         other => other.to_string(),
                     });
                 }
+            }
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled.to_string());
             }
             let mut trailing = [0u8; 1];
             match reader.read(&mut trailing) {
@@ -759,7 +818,19 @@ pub fn check_integrity_with_threads(
     path: &Path,
     threads: usize,
 ) -> Result<IntegrityReport, CryptoError> {
-    check_integrity_reader_with_threads(&mut File::open(path)?, threads)
+    check_integrity_with_threads_and_cancel(path, threads, None)
+}
+
+/// Passwordless single-pass structural check with cooperative cancellation.
+pub fn check_integrity_with_threads_and_cancel(
+    path: &Path,
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<IntegrityReport, CryptoError> {
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
+    check_integrity_reader_with_threads_and_cancel(&mut File::open(path)?, threads, cancel)
 }
 
 /// Stream the on-disk digest and structural checks from any seekable source.
@@ -775,25 +846,58 @@ pub fn check_integrity_reader_with_threads(
     f: &mut (impl Read + std::io::Seek),
     threads: usize,
 ) -> Result<IntegrityReport, CryptoError> {
+    check_integrity_reader_with_threads_and_cancel(f, threads, None)
+}
+
+/// Stream the on-disk digest and structural checks from any seekable source
+/// using `threads` Reed-Solomon workers (`0` = auto) and cooperative cancellation.
+pub fn check_integrity_reader_with_threads_and_cancel(
+    f: &mut (impl Read + std::io::Seek),
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<IntegrityReport, CryptoError> {
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     let file_size = f.seek(std::io::SeekFrom::End(0))?;
-    let rs = crate::rs::probe_rs_header(f)?;
+    let rs = match crate::rs::probe_rs_header(f) {
+        Ok(rs) => rs,
+        Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+        Err(e) => return Err(e.into()),
+    };
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
     f.rewind()?;
     let mut hr = HashingReader::new(f);
     if rs {
         let mut repaired = 0;
         let fields =
-            match crate::rs::Scan::new_with_options(&mut hr, file_size, threads, false, None) {
+            match crate::rs::Scan::new_with_options(&mut hr, file_size, threads, false, cancel) {
                 Ok(mut scan) => {
-                    let mut fields = scan_structure(&mut scan);
-                    loop {
-                        match scan.next_block() {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(e) => {
-                                fields.0 = false;
-                                fields.2 = e.to_string();
-                                if e.kind() != io::ErrorKind::InvalidData {
-                                    break;
+                    let mut fields = scan_structure(&mut scan, cancel);
+                    if is_cancelled(cancel) {
+                        return Err(CryptoError::Cancelled);
+                    }
+                    // If `scan` already aborted on an OS I/O error during `scan_structure`,
+                    // do not read further misaligned bytes or overwrite the original OS error.
+                    if !scan.has_io_error() {
+                        loop {
+                            if is_cancelled(cancel) {
+                                return Err(CryptoError::Cancelled);
+                            }
+                            match scan.next_block() {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(_) if is_cancelled(cancel) => {
+                                    return Err(CryptoError::Cancelled);
+                                }
+                                Err(e) => {
+                                    fields.0 = false;
+                                    fields.2 = e.to_string();
+                                    if e.kind() != io::ErrorKind::InvalidData {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -801,10 +905,11 @@ pub fn check_integrity_reader_with_threads(
                     repaired = scan.report.repaired_bytes;
                     fields
                 }
+                Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
                 Err(e) => (false, 0, e.to_string(), false, false, 0),
             };
         let (ok, version, msg, has_keyfile, has_recovery, chunk_count) = fields;
-        let sha256_hex = hr.drain_and_finalize()?;
+        let sha256_hex = hr.drain_and_finalize(cancel)?;
         return Ok(IntegrityReport {
             ok,
             version,
@@ -823,11 +928,12 @@ pub fn check_integrity_reader_with_threads(
     let mut magic = [0; 4];
     let sha256_only = match hr.read_exact(&mut magic) {
         Ok(()) => magic != crate::VAULT_MAGIC,
+        Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => true,
         Err(e) => return Err(e.into()),
     };
     if sha256_only {
-        let sha256_hex = hr.drain_and_finalize()?;
+        let sha256_hex = hr.drain_and_finalize(cancel)?;
         return Ok(IntegrityReport {
             ok: true,
             has_reed_solomon: false,
@@ -844,9 +950,12 @@ pub fn check_integrity_reader_with_threads(
     }
 
     let (ok, version, summary_msg, has_keyfile, has_recovery, chunk_count) =
-        scan_structure(&mut magic.as_slice().chain(&mut hr));
+        scan_structure(&mut magic.as_slice().chain(&mut hr), cancel);
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
 
-    let sha256_hex = hr.drain_and_finalize()?;
+    let sha256_hex = hr.drain_and_finalize(cancel)?;
     let full_message = format!("{summary_msg}\nSHA-256: {sha256_hex}");
 
     Ok(IntegrityReport {
@@ -864,10 +973,23 @@ pub fn check_integrity_reader_with_threads(
     })
 }
 
-pub(crate) fn scan_structure(reader: &mut impl Read) -> (bool, u8, String, bool, bool, u32) {
+pub(crate) fn scan_structure(
+    reader: &mut impl Read,
+    cancel: Option<&AtomicBool>,
+) -> (bool, u8, String, bool, bool, u32) {
+    if is_cancelled(cancel) {
+        return (
+            false,
+            0,
+            CryptoError::Cancelled.to_string(),
+            false,
+            false,
+            0,
+        );
+    }
     match read_header_and_meta(reader) {
         Ok((hdr, _, hdr_len)) => {
-            match scan_chunk_frames(reader, hdr.chunk_size, hdr_len, hdr.container_size) {
+            match scan_chunk_frames(reader, hdr.chunk_size, hdr_len, hdr.container_size, cancel) {
                 Ok(chunks) => {
                     let container_note = match hdr.container_size {
                         Some(sz) => format!(", {} B container", sz),
@@ -973,6 +1095,10 @@ pub fn rekey_stream(
         &payload_ctx,
     )?;
 
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
+
     header.kdf = hdr_kdf;
     header.password_slot = new_slot;
     if opts.new_keyfile_hash.is_some() {
@@ -996,7 +1122,9 @@ pub fn rekey_stream(
         }
         let mut frame = [0u8; 5];
         reader.read_exact(&mut frame).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
+            if is_cancelled(cancel) {
+                CryptoError::Cancelled
+            } else if e.kind() == io::ErrorKind::UnexpectedEof {
                 CryptoError::InvalidFormat("truncated chunk payload (missing final chunk)".into())
             } else {
                 CryptoError::Io(e)
@@ -1019,7 +1147,13 @@ pub fn rekey_stream(
                 "empty non-final chunk frame".into(),
             ));
         }
-        writer.write_all(&frame)?;
+        writer.write_all(&frame).map_err(|e| {
+            if is_cancelled(cancel) {
+                CryptoError::Cancelled
+            } else {
+                CryptoError::Io(e)
+            }
+        })?;
 
         let mut remaining = (plain_len as u64) + (AES_TAG_SIZE as u64);
         while remaining > 0 {
@@ -1031,6 +1165,7 @@ pub fn rekey_stream(
                 match reader.read(&mut buf[..want]) {
                     Ok(n) => break n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
                     Err(e) => return Err(CryptoError::Io(e)),
                 }
             };
@@ -1039,16 +1174,26 @@ pub fn rekey_stream(
                     "truncated chunk ciphertext/tag bytes".into(),
                 ));
             }
-            writer.write_all(&buf[..n])?;
+            writer.write_all(&buf[..n]).map_err(|e| {
+                if is_cancelled(cancel) {
+                    CryptoError::Cancelled
+                } else {
+                    CryptoError::Io(e)
+                }
+            })?;
             remaining -= n as u64;
         }
 
         if final_flag == 1 {
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
             let mut trailing = [0u8; 1];
             let extra = loop {
                 match reader.read(&mut trailing) {
                     Ok(n) => break n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
                     Err(e) => return Err(CryptoError::Io(e)),
                 }
             };
@@ -1064,6 +1209,15 @@ pub fn rekey_stream(
             .checked_add(1)
             .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
     }
-    writer.flush()?;
+    if is_cancelled(cancel) {
+        return Err(CryptoError::Cancelled);
+    }
+    writer.flush().map_err(|e| {
+        if is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            CryptoError::Io(e)
+        }
+    })?;
     Ok(())
 }

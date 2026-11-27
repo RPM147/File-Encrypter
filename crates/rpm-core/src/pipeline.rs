@@ -39,6 +39,11 @@ pub(crate) const AEAD_PIPELINE_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
+thread_local! {
+    static LAST_SPAWNED_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Resolve a requested pipeline thread count (`0` = auto-detect logical CPUs),
 /// clamped to `1..=MAX_PIPELINE_THREADS`.
 pub fn resolve_pipeline_threads(requested: usize) -> usize {
@@ -55,6 +60,24 @@ pub fn resolve_pipeline_threads(requested: usize) -> usize {
 /// Default auto-detected pipeline thread count on this machine.
 pub fn default_pipeline_threads() -> usize {
     resolve_pipeline_threads(0)
+}
+
+/// Partition a user thread budget between nested AEAD and Reed-Solomon stages so
+/// total live threads (`1 coordinator + aead_workers + (rs_threads - 1)`) never
+/// exceed `resolve_pipeline_threads(requested_threads)`.
+pub(crate) fn split_nested_threads(requested_threads: usize, chunk_size: u32) -> (usize, usize) {
+    let budget = resolve_pipeline_threads(requested_threads);
+    if budget <= 1 {
+        return (1, 1);
+    }
+    let aead_mem_cap = (AEAD_PIPELINE_MEMORY_BUDGET / (chunk_size as usize).max(1)).max(1);
+    if aead_mem_cap <= 1 {
+        return (1, budget);
+    }
+    let aead_threads = (budget / 2).min(aead_mem_cap).max(1);
+    let aead_spawned = if aead_threads <= 1 { 0 } else { aead_threads };
+    let rs_threads = budget.saturating_sub(aead_spawned).max(1);
+    (aead_threads, rs_threads)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +202,19 @@ impl<W, D> SharedState<W, D> {
     }
 }
 
+/// Explicitly joins every spawned `ScopedJoinHandle` AFTER `ShutdownGuard` drops
+/// so worker panics in unwind builds do not cause `thread::scope` to re-panic and
+/// clobber `Err(CryptoError::CryptoFailure)`.
+struct JoinWorkersGuard<'scope>(Vec<thread::ScopedJoinHandle<'scope, ()>>);
+
+impl Drop for JoinWorkersGuard<'_> {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Ensures workers are signalled to exit and queued/buffered secrets are dropped
 /// promptly on every return or unwind path.
 struct ShutdownGuard<'a, W, D> {
@@ -217,6 +253,20 @@ impl<W, D> Drop for WorkerExitGuard<'_, W, D> {
         drop(st);
         self.done_cv.notify_all();
     }
+}
+
+fn write_all_cancellable(
+    writer: &mut (impl Write + ?Sized),
+    data: &[u8],
+    cancel: Option<&AtomicBool>,
+) -> Result<(), CryptoError> {
+    writer.write_all(data).map_err(|e| {
+        if is_cancelled(cancel) {
+            CryptoError::Cancelled
+        } else {
+            CryptoError::Io(e)
+        }
+    })
 }
 
 fn wait_for_slot<W, D>(
@@ -296,21 +346,24 @@ fn encrypt_chunks_sequential(
             &mut buf,
         )?;
         let wire_len = 5 + len + AES_TAG_SIZE;
-        writer.write_all(&buf[..wire_len])?;
+        write_all_cancellable(writer, &buf[..wire_len], cancel)?;
         total_bytes += len as u64;
         progress_cb(total_bytes);
 
         chunk_idx = chunk_idx
             .checked_add(1)
             .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
-        if is_final {
-            return Ok((total_bytes, chunk_idx));
-        }
-
         if is_cancelled(cancel) {
             return Err(CryptoError::Cancelled);
         }
-        let next = read_chunk_with_eof(reader, &mut buf[5..5 + chunk_cap], pending)?;
+        if is_final {
+            return Ok((total_bytes, chunk_idx));
+        }
+        let next = match read_chunk_with_eof(reader, &mut buf[5..5 + chunk_cap], pending) {
+            Ok(pair) => pair,
+            Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e.into()),
+        };
         len = next.0;
         is_final = next.1;
         let wire_len_u64 = 5u64 + (len as u64) + (AES_TAG_SIZE as u64);
@@ -321,6 +374,101 @@ fn encrypt_chunks_sequential(
                 )));
             }
             projected_wire += wire_len_u64;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_encrypt_worker<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    handles: &mut JoinWorkersGuard<'scope>,
+    spawn_exhausted: &mut bool,
+    workers: usize,
+    max_slots: usize,
+    shared: &'env Mutex<SharedState<EncryptWork, EncryptDone>>,
+    work_cv: &'env Condvar,
+    done_cv: &'env Condvar,
+    abort: &'env AtomicBool,
+    cipher: &'env Aes256Gcm,
+    dek: &'env SecretKey,
+    payload_ctx: &'env [u8; 32],
+    prefix: &'env [u8; 7],
+    mask_mode: FrameMaskMode,
+    cancel: Option<&'env AtomicBool>,
+) {
+    if *spawn_exhausted || handles.0.len() >= workers {
+        return;
+    }
+    {
+        let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if st.shutdown || st.worker_failed {
+            return;
+        }
+        st.active_workers += 1;
+    }
+    match thread::Builder::new().spawn_scoped(scope, move || {
+        let _exit = WorkerExitGuard { shared, done_cv };
+        loop {
+            let job = {
+                let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if st.shutdown {
+                        return;
+                    }
+                    if let Some(item) = st.queue.pop_front() {
+                        break item;
+                    }
+                    st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+
+            let EncryptWork {
+                seq,
+                chunk_idx,
+                plain_len,
+                is_final,
+                mut buf,
+            } = job;
+
+            let result = if abort.load(Ordering::Acquire) || is_cancelled(cancel) {
+                Err(CryptoError::Cancelled)
+            } else {
+                encrypt_chunk_in_place(
+                    cipher,
+                    dek,
+                    payload_ctx,
+                    prefix,
+                    mask_mode,
+                    chunk_idx,
+                    plain_len,
+                    is_final,
+                    &mut buf,
+                )
+                .map(|()| buf)
+            };
+
+            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if st.shutdown {
+                return;
+            }
+            st.ready[(seq as usize) % max_slots] = Some(EncryptDone {
+                plain_len,
+                is_final,
+                result,
+            });
+            drop(st);
+            done_cv.notify_one();
+        }
+    }) {
+        Ok(handle) => {
+            handles.0.push(handle);
+            #[cfg(test)]
+            LAST_SPAWNED_WORKERS.with(|c| c.set(handles.0.len()));
+        }
+        Err(_) => {
+            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+            st.active_workers = st.active_workers.saturating_sub(1);
+            *spawn_exhausted = true;
         }
     }
 }
@@ -344,6 +492,9 @@ pub(crate) fn encrypt_chunks_pipeline(
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<(u64, u32), CryptoError> {
+    #[cfg(test)]
+    LAST_SPAWNED_WORKERS.with(|c| c.set(0));
+
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
     let (workers, max_slots) = aead_geometry(chunk_size, threads);
@@ -360,7 +511,11 @@ pub(crate) fn encrypt_chunks_pipeline(
     // Read chunk 0 first: single-chunk and single-thread streams skip thread spawning entirely.
     let mut first_buf = Zeroizing::new(vec![0u8; buf_cap]);
     let (first_len, first_final) =
-        read_chunk_with_eof(reader, &mut first_buf[5..5 + chunk_cap], &mut pending)?;
+        match read_chunk_with_eof(reader, &mut first_buf[5..5 + chunk_cap], &mut pending) {
+            Ok(pair) => pair,
+            Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e.into()),
+        };
     let first_wire_len = 5u64 + (first_len as u64) + (AES_TAG_SIZE as u64);
     if let Some((limit, container_size)) = hidden_capacity {
         if projected_wire.saturating_add(first_wire_len) > limit {
@@ -392,100 +547,44 @@ pub(crate) fn encrypt_chunks_pipeline(
         );
     }
 
-    // Multi-chunk parallel sliding-window pipeline.
-    let shared = Mutex::new(SharedState::<EncryptWork, EncryptDone>::new(
-        max_slots, workers,
-    ));
+    // Multi-chunk parallel sliding-window pipeline with on-demand worker spawning.
+    let shared = Mutex::new(SharedState::<EncryptWork, EncryptDone>::new(max_slots, 0));
     let work_cv = Condvar::new();
     let done_cv = Condvar::new();
     let abort = AtomicBool::new(false);
 
     thread::scope(|scope| {
-        // Construct ShutdownGuard BEFORE spawning workers so any unexpected unwind during
-        // setup still signals already-spawned workers to exit cleanly without deadlocking.
+        // Declare `handles` BEFORE `_shutdown` so drop order is strictly:
+        // 1. `_shutdown` signals all workers to exit and wakes them.
+        // 2. `handles` explicitly `.join()`s every ScopedJoinHandle (preventing
+        //    `thread::scope` from re-panicking on worker panics in unwind builds).
+        let mut handles = JoinWorkersGuard(Vec::with_capacity(workers));
         let _shutdown = ShutdownGuard {
             shared: &shared,
             work_cv: &work_cv,
             abort: &abort,
         };
+        let mut spawn_exhausted = false;
 
-        let mut spawned = 0usize;
-        for _ in 0..workers {
-            let shared = &shared;
-            let work_cv = &work_cv;
-            let done_cv = &done_cv;
-            let abort = &abort;
-            let cipher = &cipher;
-
-            if thread::Builder::new()
-                .spawn_scoped(scope, move || {
-                    let _exit = WorkerExitGuard { shared, done_cv };
-                    loop {
-                        let job = {
-                            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                if st.shutdown {
-                                    return;
-                                }
-                                if let Some(item) = st.queue.pop_front() {
-                                    break item;
-                                }
-                                st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
-                            }
-                        };
-
-                        let EncryptWork {
-                            seq,
-                            chunk_idx,
-                            plain_len,
-                            is_final,
-                            mut buf,
-                        } = job;
-
-                        let result = if abort.load(Ordering::Acquire) || is_cancelled(cancel) {
-                            Err(CryptoError::Cancelled)
-                        } else {
-                            encrypt_chunk_in_place(
-                                cipher,
-                                dek,
-                                payload_ctx,
-                                prefix,
-                                mask_mode,
-                                chunk_idx,
-                                plain_len,
-                                is_final,
-                                &mut buf,
-                            )
-                            .map(|()| buf)
-                        };
-
-                        let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.shutdown {
-                            return;
-                        }
-                        st.ready[(seq as usize) % max_slots] = Some(EncryptDone {
-                            plain_len,
-                            is_final,
-                            result,
-                        });
-                        drop(st);
-                        done_cv.notify_one();
-                    }
-                })
-                .is_ok()
-            {
-                spawned += 1;
-            } else {
-                break;
-            }
-        }
-
-        let failed_spawns = workers - spawned;
-        if failed_spawns > 0 {
-            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-            st.active_workers = st.active_workers.saturating_sub(failed_spawns);
-        }
-        if spawned == 0 {
+        // Spawn Worker 0 on demand for chunk 0; fall back to sequential if OS refuses threads.
+        try_spawn_encrypt_worker(
+            scope,
+            &mut handles,
+            &mut spawn_exhausted,
+            workers,
+            max_slots,
+            &shared,
+            &work_cv,
+            &done_cv,
+            &abort,
+            &cipher,
+            dek,
+            payload_ctx,
+            prefix,
+            mask_mode,
+            cancel,
+        );
+        if handles.0.is_empty() {
             return encrypt_chunks_sequential(
                 reader,
                 writer,
@@ -513,7 +612,6 @@ pub(crate) fn encrypt_chunks_pipeline(
         let mut read_done = false;
         let mut total_bytes: u64 = 0;
 
-        // Enqueue chunk 0 immediately so Worker 0 begins encrypting while we read chunk 1.
         {
             let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
             st.queue.push_back(EncryptWork {
@@ -541,10 +639,13 @@ pub(crate) fn encrypt_chunks_pipeline(
                 };
                 let buf = done.result?;
                 let wire_len = 5 + done.plain_len + AES_TAG_SIZE;
-                writer.write_all(&buf[..wire_len])?;
+                write_all_cancellable(writer, &buf[..wire_len], cancel)?;
                 total_bytes += done.plain_len as u64;
                 progress_cb(total_bytes);
                 next_write += 1;
+                if is_cancelled(cancel) {
+                    return Err(CryptoError::Cancelled);
+                }
                 if done.is_final {
                     let chunks_written = u32::try_from(next_write)
                         .map_err(|_| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
@@ -565,7 +666,11 @@ pub(crate) fn encrypt_chunks_pipeline(
                     .pop()
                     .unwrap_or_else(|| Zeroizing::new(vec![0u8; buf_cap]));
                 let (len, is_final) =
-                    read_chunk_with_eof(reader, &mut buf[5..5 + chunk_cap], &mut pending)?;
+                    match read_chunk_with_eof(reader, &mut buf[5..5 + chunk_cap], &mut pending) {
+                        Ok(pair) => pair,
+                        Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+                        Err(e) => return Err(e.into()),
+                    };
                 let wire_len = 5u64 + (len as u64) + (AES_TAG_SIZE as u64);
                 if let Some((limit, container_size)) = hidden_capacity {
                     if projected_wire.saturating_add(wire_len) > limit {
@@ -590,6 +695,26 @@ pub(crate) fn encrypt_chunks_pipeline(
                         buf,
                     });
                 }
+                let in_flight = (next_submit + 1 - next_write) as usize;
+                if handles.0.len() < workers && in_flight > handles.0.len() {
+                    try_spawn_encrypt_worker(
+                        scope,
+                        &mut handles,
+                        &mut spawn_exhausted,
+                        workers,
+                        max_slots,
+                        &shared,
+                        &work_cv,
+                        &done_cv,
+                        &abort,
+                        &cipher,
+                        dek,
+                        payload_ctx,
+                        prefix,
+                        mask_mode,
+                        cancel,
+                    );
+                }
                 work_cv.notify_one();
                 next_submit += 1;
                 continue;
@@ -599,10 +724,13 @@ pub(crate) fn encrypt_chunks_pipeline(
             let done = wait_for_slot(&shared, &done_cv, (next_write as usize) % max_slots, cancel)?;
             let buf = done.result?;
             let wire_len = 5 + done.plain_len + AES_TAG_SIZE;
-            writer.write_all(&buf[..wire_len])?;
+            write_all_cancellable(writer, &buf[..wire_len], cancel)?;
             total_bytes += done.plain_len as u64;
             progress_cb(total_bytes);
             next_write += 1;
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
             if done.is_final {
                 let chunks_written = u32::try_from(next_write)
                     .map_err(|_| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
@@ -755,12 +883,15 @@ fn decrypt_chunks_sequential(
         }
 
         if frame.plain_len > 0 {
-            writer.write_all(&buf[..frame.plain_len])?;
+            write_all_cancellable(writer, &buf[..frame.plain_len], cancel)?;
             buf[..frame.plain_len].zeroize();
         }
         total_bytes += frame.plain_len as u64;
         progress_cb(total_bytes);
 
+        if is_cancelled(cancel) {
+            return Err(CryptoError::Cancelled);
+        }
         if frame.final_flag == 1 {
             return Ok((total_bytes, payload_bytes_read));
         }
@@ -768,10 +899,7 @@ fn decrypt_chunks_sequential(
         chunk_idx = chunk_idx
             .checked_add(1)
             .ok_or_else(|| CryptoError::InvalidFormat("chunk counter overflow".into()))?;
-        if is_cancelled(cancel) {
-            return Err(CryptoError::Cancelled);
-        }
-        frame = read_encrypted_frame(
+        frame = match read_encrypted_frame(
             reader,
             dek,
             payload_ctx,
@@ -781,10 +909,105 @@ fn decrypt_chunks_sequential(
             payload_bytes_read,
             exact_payload_len,
             &mut buf,
-        )?;
+        ) {
+            Ok(f) => f,
+            Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+            Err(e) => return Err(e),
+        };
         payload_bytes_read = payload_bytes_read
             .checked_add(frame.wire_bytes)
             .ok_or(CryptoError::AuthenticationFailed)?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_decrypt_worker<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    handles: &mut JoinWorkersGuard<'scope>,
+    spawn_exhausted: &mut bool,
+    workers: usize,
+    max_slots: usize,
+    shared: &'env Mutex<SharedState<DecryptWork, DecryptDone>>,
+    work_cv: &'env Condvar,
+    done_cv: &'env Condvar,
+    abort: &'env AtomicBool,
+    cipher: &'env Aes256Gcm,
+    payload_ctx: &'env [u8; 32],
+    prefix: &'env [u8; 7],
+    cancel: Option<&'env AtomicBool>,
+) {
+    if *spawn_exhausted || handles.0.len() >= workers {
+        return;
+    }
+    {
+        let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if st.shutdown || st.worker_failed {
+            return;
+        }
+        st.active_workers += 1;
+    }
+    match thread::Builder::new().spawn_scoped(scope, move || {
+        let _exit = WorkerExitGuard { shared, done_cv };
+        loop {
+            let job = {
+                let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if st.shutdown {
+                        return;
+                    }
+                    if let Some(item) = st.queue.pop_front() {
+                        break item;
+                    }
+                    st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+
+            let DecryptWork {
+                seq,
+                chunk_idx,
+                plain_len,
+                final_flag,
+                mut buf,
+            } = job;
+
+            let result = if abort.load(Ordering::Acquire) || is_cancelled(cancel) {
+                Err(CryptoError::Cancelled)
+            } else {
+                decrypt_chunk_in_place(
+                    cipher,
+                    payload_ctx,
+                    prefix,
+                    chunk_idx,
+                    plain_len,
+                    final_flag,
+                    &mut buf,
+                )
+                .map(|()| buf)
+            };
+
+            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if st.shutdown {
+                return;
+            }
+            st.ready[(seq as usize) % max_slots] = Some(DecryptDone {
+                plain_len,
+                final_flag,
+                result,
+            });
+            drop(st);
+            done_cv.notify_one();
+        }
+    }) {
+        Ok(handle) => {
+            handles.0.push(handle);
+            #[cfg(test)]
+            LAST_SPAWNED_WORKERS.with(|c| c.set(handles.0.len()));
+        }
+        Err(_) => {
+            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+            st.active_workers = st.active_workers.saturating_sub(1);
+            *spawn_exhausted = true;
+        }
     }
 }
 
@@ -813,6 +1036,9 @@ pub(crate) fn decrypt_chunks_pipeline(
     mut progress_cb: impl FnMut(u64),
     cancel: Option<&AtomicBool>,
 ) -> Result<(u64, u64), CryptoError> {
+    #[cfg(test)]
+    LAST_SPAWNED_WORKERS.with(|c| c.set(0));
+
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_bytes()).map_err(|_| CryptoError::CryptoFailure)?;
     let (workers, max_slots) = aead_geometry(chunk_size, threads);
@@ -824,7 +1050,7 @@ pub(crate) fn decrypt_chunks_pipeline(
 
     // Read chunk 0 first: single-chunk and single-thread streams skip thread spawning entirely.
     let mut first_buf = Zeroizing::new(Vec::new());
-    let first_frame = read_encrypted_frame(
+    let first_frame = match read_encrypted_frame(
         reader,
         dek,
         payload_ctx,
@@ -834,7 +1060,11 @@ pub(crate) fn decrypt_chunks_pipeline(
         0,
         exact_payload_len,
         &mut first_buf,
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(_) if is_cancelled(cancel) => return Err(CryptoError::Cancelled),
+        Err(e) => return Err(e),
+    };
     let mut payload_bytes_read = first_frame.wire_bytes;
 
     if first_frame.final_flag == 1 || workers <= 1 {
@@ -856,98 +1086,42 @@ pub(crate) fn decrypt_chunks_pipeline(
         );
     }
 
-    // Multi-chunk parallel sliding-window decrypt pipeline.
-    let shared = Mutex::new(SharedState::<DecryptWork, DecryptDone>::new(
-        max_slots, workers,
-    ));
+    // Multi-chunk parallel sliding-window decrypt pipeline with on-demand worker spawning.
+    let shared = Mutex::new(SharedState::<DecryptWork, DecryptDone>::new(max_slots, 0));
     let work_cv = Condvar::new();
     let done_cv = Condvar::new();
     let abort = AtomicBool::new(false);
 
     thread::scope(|scope| {
-        // Construct ShutdownGuard BEFORE spawning workers so any unexpected unwind during
-        // setup still signals already-spawned workers to exit cleanly without deadlocking.
+        // Declare `handles` BEFORE `_shutdown` so drop order is strictly:
+        // 1. `_shutdown` signals all workers to exit and wakes them.
+        // 2. `handles` explicitly `.join()`s every ScopedJoinHandle (preventing
+        //    `thread::scope` from re-panicking on worker panics in unwind builds).
+        let mut handles = JoinWorkersGuard(Vec::with_capacity(workers));
         let _shutdown = ShutdownGuard {
             shared: &shared,
             work_cv: &work_cv,
             abort: &abort,
         };
+        let mut spawn_exhausted = false;
 
-        let mut spawned = 0usize;
-        for _ in 0..workers {
-            let shared = &shared;
-            let work_cv = &work_cv;
-            let done_cv = &done_cv;
-            let abort = &abort;
-            let cipher = &cipher;
-
-            if thread::Builder::new()
-                .spawn_scoped(scope, move || {
-                    let _exit = WorkerExitGuard { shared, done_cv };
-                    loop {
-                        let job = {
-                            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                if st.shutdown {
-                                    return;
-                                }
-                                if let Some(item) = st.queue.pop_front() {
-                                    break item;
-                                }
-                                st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
-                            }
-                        };
-
-                        let DecryptWork {
-                            seq,
-                            chunk_idx,
-                            plain_len,
-                            final_flag,
-                            mut buf,
-                        } = job;
-
-                        let result = if abort.load(Ordering::Acquire) || is_cancelled(cancel) {
-                            Err(CryptoError::Cancelled)
-                        } else {
-                            decrypt_chunk_in_place(
-                                cipher,
-                                payload_ctx,
-                                prefix,
-                                chunk_idx,
-                                plain_len,
-                                final_flag,
-                                &mut buf,
-                            )
-                            .map(|()| buf)
-                        };
-
-                        let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.shutdown {
-                            return;
-                        }
-                        st.ready[(seq as usize) % max_slots] = Some(DecryptDone {
-                            plain_len,
-                            final_flag,
-                            result,
-                        });
-                        drop(st);
-                        done_cv.notify_one();
-                    }
-                })
-                .is_ok()
-            {
-                spawned += 1;
-            } else {
-                break;
-            }
-        }
-
-        let failed_spawns = workers - spawned;
-        if failed_spawns > 0 {
-            let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
-            st.active_workers = st.active_workers.saturating_sub(failed_spawns);
-        }
-        if spawned == 0 {
+        // Spawn Worker 0 on demand for chunk 0; fall back to sequential if OS refuses threads.
+        try_spawn_decrypt_worker(
+            scope,
+            &mut handles,
+            &mut spawn_exhausted,
+            workers,
+            max_slots,
+            &shared,
+            &work_cv,
+            &done_cv,
+            &abort,
+            &cipher,
+            payload_ctx,
+            prefix,
+            cancel,
+        );
+        if handles.0.is_empty() {
             return decrypt_chunks_sequential(
                 reader,
                 writer,
@@ -1004,11 +1178,14 @@ pub(crate) fn decrypt_chunks_pipeline(
                 }
             }
             if done.plain_len > 0 {
-                writer.write_all(&buf[..done.plain_len])?;
+                write_all_cancellable(writer, &buf[..done.plain_len], cancel)?;
                 buf[..done.plain_len].zeroize();
             }
             *total_bytes += done.plain_len as u64;
             progress_cb(*total_bytes);
+            if is_cancelled(cancel) {
+                return Err(CryptoError::Cancelled);
+            }
             if done.final_flag == 1 {
                 return Ok(true);
             }
@@ -1109,8 +1286,29 @@ pub(crate) fn decrypt_chunks_pipeline(
                                 buf,
                             });
                         }
+                        let in_flight = (next_submit + 1 - next_write) as usize;
+                        if handles.0.len() < workers && in_flight > handles.0.len() {
+                            try_spawn_decrypt_worker(
+                                scope,
+                                &mut handles,
+                                &mut spawn_exhausted,
+                                workers,
+                                max_slots,
+                                &shared,
+                                &work_cv,
+                                &done_cv,
+                                &abort,
+                                &cipher,
+                                payload_ctx,
+                                prefix,
+                                cancel,
+                            );
+                        }
                         work_cv.notify_one();
                         next_submit += 1;
+                    }
+                    Err(_) if is_cancelled(cancel) => {
+                        return Err(CryptoError::Cancelled);
                     }
                     Err(err) => {
                         // Preserve ordered delivery of already-submitted chunks `0..next_submit`
@@ -1284,5 +1482,172 @@ mod tests {
         let st = shared.lock().unwrap();
         assert_eq!(st.active_workers, 3);
         assert!(st.worker_failed);
+    }
+
+    #[test]
+    fn split_nested_threads_respects_budget_across_chunk_sizes_and_thread_counts() {
+        use crate::constants::{DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE};
+
+        for chunk_size in [
+            MIN_CHUNK_SIZE,
+            64 * 1024,
+            DEFAULT_CHUNK_SIZE,
+            4 * 1024 * 1024,
+            MAX_CHUNK_SIZE,
+        ] {
+            for requested in [1usize, 2, 3, 4, 8, 16, 17, 32, 48, 63, 64] {
+                let (aead_t, rs_t) = split_nested_threads(requested, chunk_size);
+                let (aead_workers, _) = aead_geometry(chunk_size, aead_t);
+                let aead_spawned = if aead_workers <= 1 { 0 } else { aead_workers };
+                let rs_helpers = rs_t.saturating_sub(1);
+                let total_live = 1 + aead_spawned + rs_helpers;
+                assert!(
+                    total_live <= requested,
+                    "oversubscribed for requested={requested} chunk={chunk_size}: aead={aead_t} (spawned={aead_spawned}), rs={rs_t} (helpers={rs_helpers}), total={total_live}"
+                );
+                assert!(aead_t >= 1 && rs_t >= 1);
+            }
+        }
+        // Explicitly verify the audited 64-thread cases never spawn 73 or 130 threads.
+        assert_eq!(split_nested_threads(64, DEFAULT_CHUNK_SIZE), (8, 56));
+        assert_eq!(split_nested_threads(64, MIN_CHUNK_SIZE), (32, 32));
+        assert_eq!(split_nested_threads(64, MAX_CHUNK_SIZE), (1, 64));
+    }
+
+    #[test]
+    fn lazy_worker_spawning_caps_threads_on_two_chunk_streams() {
+        let dek = SecretKey::new([0x33u8; 32]);
+        let ctx = [0x44u8; 32];
+        let prefix = [0x55u8; 7];
+        let chunk = MIN_CHUNK_SIZE;
+
+        // 1-chunk stream spawns 0 workers even at threads = 64.
+        let one_chunk = vec![0xAAu8; 1024];
+        let mut wire1 = Vec::new();
+        encrypt_chunks_pipeline(
+            &mut Cursor::new(&one_chunk),
+            &mut wire1,
+            &dek,
+            &ctx,
+            &prefix,
+            chunk,
+            FrameMaskMode::None,
+            None,
+            MAX_PIPELINE_THREADS,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(LAST_SPAWNED_WORKERS.with(|c| c.get()), 0);
+
+        let mut out1 = Vec::new();
+        decrypt_chunks_pipeline(
+            &mut Cursor::new(&wire1),
+            &mut out1,
+            &dek,
+            &ctx,
+            &prefix,
+            chunk,
+            FrameMaskMode::None,
+            None,
+            MAX_PIPELINE_THREADS,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(LAST_SPAWNED_WORKERS.with(|c| c.get()), 0);
+        assert_eq!(out1, one_chunk);
+
+        // 2-chunk stream spawns at most 2 workers (never 8 or 64).
+        let two_chunks = vec![0xBBu8; chunk as usize + 512];
+        let mut wire2 = Vec::new();
+        encrypt_chunks_pipeline(
+            &mut Cursor::new(&two_chunks),
+            &mut wire2,
+            &dek,
+            &ctx,
+            &prefix,
+            chunk,
+            FrameMaskMode::None,
+            None,
+            MAX_PIPELINE_THREADS,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        let enc_spawned = LAST_SPAWNED_WORKERS.with(|c| c.get());
+        assert!(
+            (1..=2).contains(&enc_spawned),
+            "2-chunk encrypt spawned {enc_spawned} workers (expected 1..=2)"
+        );
+
+        let mut out2 = Vec::new();
+        decrypt_chunks_pipeline(
+            &mut Cursor::new(&wire2),
+            &mut out2,
+            &dek,
+            &ctx,
+            &prefix,
+            chunk,
+            FrameMaskMode::None,
+            None,
+            MAX_PIPELINE_THREADS,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        let dec_spawned = LAST_SPAWNED_WORKERS.with(|c| c.get());
+        assert!(
+            (1..=2).contains(&dec_spawned),
+            "2-chunk decrypt spawned {dec_spawned} workers (expected 1..=2)"
+        );
+        assert_eq!(out2, two_chunks);
+    }
+
+    #[test]
+    fn join_workers_guard_preserves_crypto_failure_when_scoped_worker_panics() {
+        let shared = Mutex::new(SharedState::<u32, u32>::new(4, 2));
+        let work_cv = Condvar::new();
+        let done_cv = Condvar::new();
+        let abort = AtomicBool::new(false);
+
+        let outcome: Result<u32, CryptoError> = thread::scope(|scope| {
+            let mut handles = JoinWorkersGuard(Vec::with_capacity(2));
+            let _shutdown = ShutdownGuard {
+                shared: &shared,
+                work_cv: &work_cv,
+                abort: &abort,
+            };
+
+            let shared_ref = &shared;
+            let work_cv_ref = &work_cv;
+            let done_cv_ref = &done_cv;
+            // Healthy worker waits on work_cv until ShutdownGuard wakes it.
+            handles.0.push(scope.spawn(move || {
+                let _exit = WorkerExitGuard {
+                    shared: shared_ref,
+                    done_cv: done_cv_ref,
+                };
+                let mut st = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                while !st.shutdown {
+                    st = work_cv_ref.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            }));
+
+            // Second worker panics before publishing slot 0. Without JoinWorkersGuard
+            // explicitly joining handles after ShutdownGuard drop, `thread::scope`
+            // would resume unwinding and clobber `Err(CryptoError::CryptoFailure)`.
+            handles.0.push(scope.spawn(move || {
+                let _exit = WorkerExitGuard {
+                    shared: shared_ref,
+                    done_cv: done_cv_ref,
+                };
+                panic!("injected scoped worker panic");
+            }));
+
+            wait_for_slot(&shared, &done_cv, 0, None)
+        });
+
+        assert!(matches!(outcome, Err(CryptoError::CryptoFailure)));
     }
 }

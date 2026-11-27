@@ -754,9 +754,26 @@ pub fn check_vault_integrity_with_parts_and_threads(
     path: &Path,
     threads: usize,
 ) -> Result<(IntegrityReport, Option<usize>), StorageError> {
+    check_vault_integrity_with_parts_threads_and_cancel(path, threads, None)
+}
+
+/// Passwordless structural integrity check using `threads` RS pipeline workers (`0` = auto)
+/// and cooperative cancellation.
+pub fn check_vault_integrity_with_parts_threads_and_cancel(
+    path: &Path,
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<(IntegrityReport, Option<usize>), StorageError> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(StorageError::Cancelled);
+    }
     let mut reader = open_vault_reader(path)?;
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(StorageError::Cancelled);
+    }
     let split_parts = reader.is_split().then_some(reader.part_count());
-    let report = rpm_core::check_integrity_reader_with_threads(&mut reader, threads)?;
+    let report =
+        rpm_core::check_integrity_reader_with_threads_and_cancel(&mut reader, threads, cancel)?;
     Ok((report, split_parts))
 }
 
@@ -1099,6 +1116,9 @@ pub fn split_vault_file(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<PathBuf>, StorageError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     if !src_vault.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "vault file not found: {}",
@@ -1174,6 +1194,9 @@ pub fn join_vault_parts(
     progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(PathBuf, u64), StorageError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     if !any_part_path.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "split part not found: {}",

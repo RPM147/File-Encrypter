@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rpm_core::{
     decrypt_unlocked_stream_with_threads, encrypt_hidden_stream_with_threads,
-    encrypt_stream_with_threads, rekey_stream, unlock_seekable_with_kdf_and_threads, Auth,
+    encrypt_stream_with_threads, rekey_stream, unlock_seekable_with_kdf_threads_and_cancel, Auth,
     CryptoError, EncryptOptions, EncryptSummary, HiddenEncryptOptions, HiddenEncryptSummary,
     KdfParams, RekeyOptions, SecretKey, VaultMetadata,
 };
@@ -161,6 +161,9 @@ where
         &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
     ) -> Result<(), StorageError>,
 {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     if let Some(part_size) = split_part_bytes {
         validate_split_bounds(part_size, opts.container_size_bytes, opts.reed_solomon)?;
     }
@@ -216,6 +219,9 @@ where
         let pack_attempt = packer_handle
             .join()
             .map_err(|_| StorageError::Io(std::io::Error::other("packer thread panicked")))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
         let summary = enc_attempt?;
         pack_attempt?;
         summary_out = Some(summary);
@@ -350,6 +356,9 @@ where
         &mut dyn FnMut(&mut dyn Write) -> Result<(), StorageError>,
     ) -> Result<(), StorageError>,
 {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     if let Some(part_size) = split_part_bytes {
         validate_split_bounds(
             part_size,
@@ -462,6 +471,9 @@ where
         let hidden_pack = hidden_handle
             .join()
             .map_err(|_| StorageError::Io(std::io::Error::other("hidden packer panicked")))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(StorageError::Cancelled);
+        }
 
         let summary = enc_attempt?;
         decoy_pack?;
@@ -712,8 +724,20 @@ pub fn decrypt_vault_v5_with_stealth_kdf_and_threads(
         None => None,
     };
 
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     let mut reader = open_vault_reader(vault_path)?;
-    let unlocked = unlock_seekable_with_kdf_and_threads(&mut reader, auth, stealth_kdf, threads)?;
+    let unlocked = unlock_seekable_with_kdf_threads_and_cancel(
+        &mut reader,
+        auth,
+        stealth_kdf,
+        threads,
+        Some(&cancel),
+    )?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     let metadata = unlocked.metadata().clone();
 
     let total_expected = metadata.original_size;
@@ -774,6 +798,14 @@ pub fn decrypt_vault_v5_with_stealth_kdf_and_threads(
         .join()
         .map_err(|_| StorageError::Io(io::Error::other("unpacker thread panicked")))?;
 
+    if cancel.load(Ordering::Relaxed) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        if created_root {
+            let _ = fs::remove_dir(output_root);
+        }
+        return Err(StorageError::Cancelled);
+    }
+
     let verified_count = match (dec_res, unpack_res) {
         // Early archive/path/limit rejection closes the pipe while the decryptor is writing.
         (Err(CryptoError::Io(io_err)), Err(unpack_err))
@@ -801,14 +833,6 @@ pub fn decrypt_vault_v5_with_stealth_kdf_and_threads(
         }
         (Ok(_), Ok(count)) => count,
     };
-
-    if cancel.load(Ordering::Relaxed) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        if created_root {
-            let _ = fs::remove_dir(output_root);
-        }
-        return Err(StorageError::Cancelled);
-    }
 
     let promote = (|| -> Result<PathBuf, StorageError> {
         let mut top_entries = Vec::new();
@@ -865,6 +889,9 @@ pub fn rekey_vault_v5(
     new_kdf: Option<KdfParams>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), StorageError> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(StorageError::Cancelled);
+    }
     if !vault_path.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "vault file not found: {}",
@@ -926,6 +953,9 @@ pub fn repair_vault_v5_with_threads(
     threads: usize,
     cancel: Arc<AtomicBool>,
 ) -> Result<rpm_core::RepairReport, StorageError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(StorageError::Cancelled);
+    }
     if !vault_path.is_file() {
         return Err(StorageError::InvalidPath(format!(
             "vault file not found: {}",
