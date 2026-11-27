@@ -1,12 +1,12 @@
-# v4.7.0 Release Checklist
+# v4.7.1 Release Checklist
 
 > **English** (default) · [Türkçe](RELEASE_CHECKLIST.tr.md)
 
 ## Before tagging
 
 - [ ] **CI.** On the candidate commit, Windows and Ubuntu CI jobs plus the `dependency-audit` job (`cargo-deny` RustSec, license, and source checks) are green. [CI workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/ci.yml)
-- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.7.0-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.7.0` in Properties → Details.
-- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.7.0` heading with non-empty English release notes underneath.
+- [ ] **ZIP & SHA-256.** From the repository root on the candidate commit, run `.\scripts\package-release.ps1`. Compare `Get-FileHash .\dist\rpm-encrypter-4.7.1-windows-x86_64.zip -Algorithm SHA256` against `dist\SHA256SUMS.txt` (case-insensitive match). Extract the ZIP into an empty folder and confirm both executables plus `README.md`, `SECURITY.md`, `LICENSE`, `docs/USER_GUIDE.md`, and `docs/USER_GUIDE.tr.md` are present. Verify the `rpm-encrypter.exe` icon in Explorer and file/product version `4.7.1` in Properties → Details.
+- [ ] **Changelog heading.** `CHANGELOG.md` at the tagged commit has a single `## v4.7.1` heading with non-empty English release notes underneath.
 - [ ] **Turkish glyphs & i18n.** Open `rpm-encrypter.exe` from the ZIP; verify it starts in Turkish and `TR / EN` switching updates tabs and buttons cleanly (`Şifrele`, `Çöz`, `İncele`). Confirm `Iğdır-ölçü.txt` renders without missing-glyph boxes.
 - [ ] **Drag-and-drop round-trip.** Drop a folder with two test files onto the window to encrypt, then drop the resulting `.vault` onto the window, verify **Decrypt** opens, and confirm extracted file bytes match originals.
 - [ ] **Selective extraction & RAM-only preview.** Unlock the same vault on **Inspect**, click **Preview** on a UTF-8 text file and an image (verify no temp files are written and closing/`Esc` dismisses cleanly), then check one of the two files and click **Extract Selected** into an empty folder; confirm only that file is written with exact contents.
@@ -23,5 +23,5 @@
 
 ## After publishing
 
-- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.7.0` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
-- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.7.0` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)
+- [ ] **Release notes.** Confirm the GitHub Release body matches the `## v4.7.1` section of `CHANGELOG.md`. [Release workflow](https://github.com/RPM147/File-Encrypter/actions/workflows/release.yml)
+- [ ] **Build provenance.** Run `gh attestation verify <archive> --repo RPM147/File-Encrypter --signer-workflow RPM147/File-Encrypter/.github/workflows/release.yml --source-ref refs/tags/v4.7.1` for both the Windows ZIP and Linux TAR.GZ artifacts and confirm both succeed. [GitHub CLI docs](https://cli.github.com/manual/gh_attestation_verify)

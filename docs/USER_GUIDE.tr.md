@@ -139,11 +139,11 @@ Bu işlem yalnızca standart (dolgusuz) kasalarda kasa anahtarını yeni parolay
 
 ## Windows için WinGet manifesti oluşturma
 
-Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.7.0/` klasörüne yazar.
+Windows ZIP paketini ve `SHA256SUMS.txt` dosyasını `dist/` klasörüne koyun. Proje kökünde PowerShell ile aşağıdaki komutları çalıştırın. Betik, manifestleri `dist/winget/RPM147.RPMEncrypter/4.7.1/` klasörüne yazar.
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.7.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.7.1
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.1
 ```
 
 WinGet’e gönderim adımları için paketleme belgesine bakın. [WinGet paketleme belgesi](../packaging/winget/README.tr.md)

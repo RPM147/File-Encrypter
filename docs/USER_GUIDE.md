@@ -136,11 +136,11 @@ For `encrypt`, `decrypt`, `inspect`, `repair`, and `diff`, `--threads <0..=64>` 
 
 ## Generating WinGet manifests (Windows)
 
-Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.7.0/`:
+Place the Windows ZIP package and `SHA256SUMS.txt` into `dist/`, then run from the repository root in PowerShell to emit manifests under `dist/winget/RPM147.RPMEncrypter/4.7.1/`:
 
 ```powershell
-.\packaging\winget\generate-manifests.ps1 -Version 4.7.0
-winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.0
+.\packaging\winget\generate-manifests.ps1 -Version 4.7.1
+winget validate --manifest .\dist\winget\RPM147.RPMEncrypter\4.7.1
 ```
 
 See [WinGet packaging guide](../packaging/winget/README.md) for submission details.
